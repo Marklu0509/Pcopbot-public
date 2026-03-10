@@ -124,6 +124,8 @@ def execute_copy_trade(
         original_trade_id=trade["trade_id"],
         original_market=trade["market"],
         original_token_id=trade["token_id"],
+        market_title=trade.get("market_title", ""),
+        outcome=trade.get("outcome", ""),
         original_side=trade["side"],
         original_size=trade["size"],
         original_price=trade["price"],

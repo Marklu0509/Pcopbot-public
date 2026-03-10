@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from db.database import get_session_factory, init_db
-from db.models import CopyTrade, Trader
+from db.models import CopyTrade, Position, Trader
 from bot.watermark import set_watermark
 
 init_db()
@@ -50,8 +50,8 @@ def _load_trader_trades(trader_id: int) -> pd.DataFrame:
             session.query(
                 CopyTrade.id,
                 CopyTrade.executed_at,
-                CopyTrade.original_market,
-                CopyTrade.original_token_id,
+                CopyTrade.market_title,
+                CopyTrade.outcome,
                 CopyTrade.original_side,
                 CopyTrade.original_size,
                 CopyTrade.original_price,
@@ -71,7 +71,7 @@ def _load_trader_trades(trader_id: int) -> pd.DataFrame:
     df = pd.DataFrame(
         rows,
         columns=[
-            "ID", "Time", "Market", "Token ID", "Side",
+            "ID", "Time", "Market", "Outcome", "Side",
             "Orig Size", "Orig Price", "Copy Size", "Copy Price",
             "Status", "PnL", "Error", "Order ID",
         ],
@@ -85,8 +85,8 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
     with _SessionLocal() as session:
         rows = (
             session.query(
-                CopyTrade.original_market,
-                CopyTrade.original_token_id,
+                CopyTrade.market_title,
+                CopyTrade.outcome,
                 CopyTrade.original_side,
                 CopyTrade.copy_size,
                 CopyTrade.copy_price,
@@ -101,10 +101,10 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=["Market", "Token ID", "Side", "Size", "Price", "PnL"])
+    df = pd.DataFrame(rows, columns=["Market", "Outcome", "Side", "Size", "Price", "PnL"])
 
     holdings: list[dict] = []
-    for (market, token_id), group in df.groupby(["Market", "Token ID"]):
+    for (market, outcome), group in df.groupby(["Market", "Outcome"]):
         buy_size = group.loc[group["Side"] == "BUY", "Size"].sum()
         sell_size = group.loc[group["Side"] == "SELL", "Size"].sum()
         net_size = buy_size - sell_size
@@ -116,7 +116,7 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
         trade_count = len(group)
         holdings.append({
             "Market": market,
-            "Token ID": token_id,
+            "Outcome": outcome,
             "Buy Size": round(buy_size, 4),
             "Sell Size": round(sell_size, 4),
             "Net Position": round(net_size, 4),
@@ -126,6 +126,32 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
         })
 
     return pd.DataFrame(holdings)
+
+
+def _load_trader_positions(trader_id: int) -> pd.DataFrame:
+    """Load pre-existing positions (fetched on startup) for a trader."""
+    with _SessionLocal() as session:
+        rows = (
+            session.query(
+                Position.market_title,
+                Position.outcome,
+                Position.size,
+                Position.avg_price,
+                Position.current_value,
+                Position.pnl,
+                Position.pnl_pct,
+                Position.cur_price,
+                Position.fetched_at,
+            )
+            .filter(Position.trader_id == trader_id)
+            .order_by(Position.current_value.desc())
+            .all()
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, columns=[
+        "Market", "Outcome", "Size", "Avg Price", "Value", "PnL", "PnL %", "Cur Price", "Fetched",
+    ])
 
 
 def _render_trader_detail(t) -> None:
@@ -233,17 +259,30 @@ def _render_trader_detail(t) -> None:
 
     st.divider()
 
-    # ── Holdings ──
-    st.subheader("📊 Holdings")
+    # ── Pre-existing Positions ──
+    st.subheader("📌 Pre-existing Positions")
+    pos_df = _load_trader_positions(t.id)
+    if pos_df.empty:
+        st.info("No pre-existing positions found.")
+    else:
+        st.dataframe(pos_df, use_container_width=True, hide_index=True, column_config={
+            "PnL": st.column_config.NumberColumn(format="$%.2f"),
+            "Value": st.column_config.NumberColumn(format="$%.2f"),
+        })
+
+    st.divider()
+
+    # ── Copy-Trade Holdings ──
+    st.subheader("📊 Copy-Trade Holdings")
     holdings_df = _load_trader_holdings(t.id)
     if holdings_df.empty:
-        st.info("No holdings yet.")
+        st.info("No copy-trade holdings yet.")
     else:
         total_net = holdings_df["Net Position"].sum()
         total_pnl = holdings_df["Total PnL"].sum()
         num_tokens = len(holdings_df)
         mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Tokens Held", num_tokens)
+        mc1.metric("Markets", num_tokens)
         mc2.metric("Net Exposure", f"{total_net:.4f}")
         mc3.metric("Total PnL", f"${total_pnl:.2f}")
         st.dataframe(

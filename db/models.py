@@ -87,8 +87,10 @@ class CopyTrade(Base):
 
     # Original trade info
     original_trade_id = Column(String)
-    original_market = Column(String)
-    original_token_id = Column(String)
+    original_market = Column(String)       # conditionId
+    original_token_id = Column(String)     # asset id
+    market_title = Column(String, default="")  # human-readable market name
+    outcome = Column(String, default="")       # e.g. "Yes" / "No" / "Up" / "Down"
     original_side = Column(String)
     original_size = Column(Float)
     original_price = Column(Float)
@@ -111,7 +113,36 @@ class CopyTrade(Base):
     trader = relationship("Trader", back_populates="copy_trades")
 
     def __repr__(self) -> str:
-        return f"<CopyTrade id={self.id} status={self.status} market={self.original_market!r}>"
+        return f"<CopyTrade id={self.id} status={self.status} market={self.market_title or self.original_market!r}>"
+
+
+class Position(Base):
+    """Pre-existing positions fetched from Polymarket on bot startup.
+
+    These are NOT copy-traded — they represent what the target trader
+    already held before the bot started tracking them.
+    """
+    __tablename__ = "positions"
+
+    id = Column(Integer, primary_key=True)
+    trader_id = Column(Integer, ForeignKey("traders.id"))
+
+    condition_id = Column(String)
+    asset_id = Column(String)
+    market_title = Column(String, default="")
+    outcome = Column(String, default="")
+
+    size = Column(Float, default=0.0)
+    avg_price = Column(Float, default=0.0)
+    initial_value = Column(Float, default=0.0)
+    current_value = Column(Float, default=0.0)
+    pnl = Column(Float, default=0.0)
+    pnl_pct = Column(Float, default=0.0)
+    cur_price = Column(Float, default=0.0)
+
+    fetched_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
+    trader = relationship("Trader")
 
 
 class BotLog(Base):

@@ -5,7 +5,7 @@ import signal
 import time
 
 from db.database import get_session_factory, init_db
-from db.models import BotLog, BotSetting, Trader
+from db.models import BotLog, BotSetting, Position, Trader
 from bot import tracker, watermark
 from bot.executor import execute_copy_trade
 from config import settings
@@ -67,6 +67,37 @@ def _init_watermarks(session) -> None:
             watermark.set_watermark(session, t)
 
 
+def _sync_positions(session) -> None:
+    """Fetch pre-existing positions for every active trader and save to DB."""
+    traders = session.query(Trader).filter(Trader.is_active == True).all()
+    for t in traders:
+        label = t.label or t.wallet_address[:12]
+        try:
+            positions = tracker.fetch_positions(t.wallet_address)
+        except Exception as exc:
+            logger.error("[%s] Error fetching positions: %s", label, exc)
+            continue
+        # Replace old position rows for this trader
+        session.query(Position).filter(Position.trader_id == t.id).delete()
+        for p in positions:
+            session.add(Position(
+                trader_id=t.id,
+                condition_id=p["condition_id"],
+                asset_id=p["asset_id"],
+                market_title=p["market_title"],
+                outcome=p["outcome"],
+                size=p["size"],
+                avg_price=p["avg_price"],
+                initial_value=p["initial_value"],
+                current_value=p["current_value"],
+                pnl=p["pnl"],
+                pnl_pct=p["pnl_pct"],
+                cur_price=p["cur_price"],
+            ))
+        session.commit()
+        logger.info("[%s] Synced %d pre-existing position(s).", label, len(positions))
+
+
 def _poll_once(session) -> None:
     """One iteration: poll all active traders and copy new trades."""
     traders = session.query(Trader).filter(Trader.is_active == True).all()
@@ -123,6 +154,7 @@ def run() -> None:
 
     with SessionLocal() as session:
         _init_watermarks(session)
+        _sync_positions(session)
 
     while _running:
         poll_interval = _get_poll_interval(SessionLocal)

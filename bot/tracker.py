@@ -73,7 +73,8 @@ def parse_trade(raw: dict) -> dict[str, Any]:
     """Normalise a raw trade dict from the Data API ``/activity`` endpoint.
 
     Returned keys:
-        trade_id, market, token_id, side, size, price, timestamp (datetime UTC)
+        trade_id, market, token_id, side, size, price, timestamp (datetime UTC),
+        market_title, outcome
     """
     # /activity uses transactionHash as unique identifier
     trade_id = raw.get("transactionHash") or raw.get("id") or raw.get("tradeId") or ""
@@ -82,6 +83,8 @@ def parse_trade(raw: dict) -> dict[str, Any]:
     side = (raw.get("side") or raw.get("type") or "BUY").upper()
     size = float(raw.get("size", 0) or raw.get("shares", 0) or 0)
     price = float(raw.get("price", 0) or 0)
+    market_title = raw.get("title") or ""
+    outcome = raw.get("outcome") or ""
 
     ts_raw = raw.get("timestamp") or raw.get("createdAt") or raw.get("created_at") or 0
     if isinstance(ts_raw, (int, float)):
@@ -100,6 +103,8 @@ def parse_trade(raw: dict) -> dict[str, Any]:
         "size": size,
         "price": price,
         "timestamp": timestamp,
+        "market_title": market_title,
+        "outcome": outcome,
     }
 
 
@@ -118,3 +123,43 @@ def get_new_trades(wallet_address: str, watermark: datetime) -> list[dict[str, A
     ]
     new.sort(key=lambda t: t["timestamp"])
     return new
+
+
+def fetch_positions(wallet_address: str) -> list[dict[str, Any]]:
+    """Fetch current open positions for *wallet_address* from the Data API.
+
+    Returns a list of dicts with keys:
+        condition_id, asset_id, market_title, outcome, size, avg_price,
+        initial_value, current_value, pnl, pnl_pct, cur_price
+    """
+    url = f"{settings.DATA_API_BASE}/positions"
+    params = {"user": wallet_address}
+    try:
+        resp = _http.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            data = data.get("data", [])
+    except requests.RequestException as exc:
+        logger.error("Failed to fetch positions for %s: %s", wallet_address, exc)
+        return []
+
+    positions = []
+    for raw in data:
+        size = float(raw.get("size", 0) or 0)
+        if size <= 0:
+            continue  # skip closed / zero positions
+        positions.append({
+            "condition_id": raw.get("conditionId", ""),
+            "asset_id": raw.get("asset", ""),
+            "market_title": raw.get("title", ""),
+            "outcome": raw.get("outcome", ""),
+            "size": size,
+            "avg_price": float(raw.get("avgPrice", 0) or 0),
+            "initial_value": float(raw.get("initialValue", 0) or 0),
+            "current_value": float(raw.get("currentValue", 0) or 0),
+            "pnl": float(raw.get("cashPnl", 0) or 0),
+            "pnl_pct": float(raw.get("percentPnl", 0) or 0),
+            "cur_price": float(raw.get("curPrice", 0) or 0),
+        })
+    return positions
