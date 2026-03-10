@@ -1,5 +1,7 @@
 """Polls Polymarket Data API for new trades per tracked trader."""
 
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone
 from typing import Any

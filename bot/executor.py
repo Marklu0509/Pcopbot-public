@@ -1,5 +1,7 @@
 """Executes copy trades via py_clob_client (or logs them in dry-run mode)."""
 
+from __future__ import annotations
+
 import logging
 from datetime import datetime, timezone
 from typing import Any
