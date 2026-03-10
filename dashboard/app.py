@@ -21,7 +21,7 @@ st.set_page_config(
 st.sidebar.title("Pcopbot 🤖")
 page = st.sidebar.radio(
     "Navigate",
-    ["Traders", "History", "PnL"],
+    ["Traders", "History", "PnL", "Logs", "Settings"],
 )
 
 _pages_dir = Path(__file__).resolve().parent / "pages"
@@ -41,3 +41,7 @@ elif page == "History":
     _load_page("history").render()
 elif page == "PnL":
     _load_page("pnl").render()
+elif page == "Logs":
+    _load_page("logs").render()
+elif page == "Settings":
+    _load_page("settings").render()

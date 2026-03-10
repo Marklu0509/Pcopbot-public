@@ -81,3 +81,22 @@ class CopyTrade(Base):
 
     def __repr__(self) -> str:
         return f"<CopyTrade id={self.id} status={self.status} market={self.original_market!r}>"
+
+
+class BotLog(Base):
+    __tablename__ = "bot_logs"
+
+    id = Column(Integer, primary_key=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+    level = Column(String)       # DEBUG, INFO, WARNING, ERROR
+    logger_name = Column(String)
+    message = Column(String)
+
+
+class BotSetting(Base):
+    __tablename__ = "bot_settings"
+
+    key = Column(String, primary_key=True)
+    value = Column(String, nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+                        onupdate=lambda: datetime.now(timezone.utc).replace(tzinfo=None))

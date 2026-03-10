@@ -5,10 +5,44 @@ import signal
 import time
 
 from db.database import get_session_factory, init_db
-from db.models import Trader
+from db.models import BotLog, BotSetting, Trader
 from bot import tracker, watermark
 from bot.executor import execute_copy_trade
 from config import settings
+
+
+class _DBLogHandler(logging.Handler):
+    """Logging handler that writes log records into the bot_logs table."""
+
+    def __init__(self, session_factory):
+        super().__init__()
+        self._session_factory = session_factory
+
+    def emit(self, record):
+        try:
+            with self._session_factory() as session:
+                entry = BotLog(
+                    level=record.levelname,
+                    logger_name=record.name,
+                    message=self.format(record),
+                )
+                session.add(entry)
+                session.commit()
+        except Exception:
+            self.handleError(record)
+
+
+def _get_poll_interval(session_factory) -> int:
+    """Read poll interval from DB settings, falling back to env/config."""
+    try:
+        with session_factory() as session:
+            row = session.query(BotSetting).filter(BotSetting.key == "poll_interval_seconds").first()
+            if row:
+                return max(1, int(row.value))
+    except Exception:
+        pass
+    return settings.POLL_INTERVAL_SECONDS
+
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
@@ -69,17 +103,24 @@ def run() -> None:
 
     SessionLocal = get_session_factory()
 
+    # Attach DB log handler so logs are visible in the dashboard
+    db_handler = _DBLogHandler(SessionLocal)
+    db_handler.setLevel(logging.INFO)
+    db_handler.setFormatter(logging.Formatter("%(message)s"))
+    logging.getLogger().addHandler(db_handler)
+
     with SessionLocal() as session:
         _init_watermarks(session)
 
     while _running:
+        poll_interval = _get_poll_interval(SessionLocal)
         with SessionLocal() as session:
             try:
                 _poll_once(session)
             except Exception as exc:
                 logger.error("Unhandled error in poll loop: %s", exc)
-        logger.debug("Sleeping %s seconds…", settings.POLL_INTERVAL_SECONDS)
-        time.sleep(settings.POLL_INTERVAL_SECONDS)
+        logger.debug("Sleeping %s seconds…", poll_interval)
+        time.sleep(poll_interval)
 
     logger.info("Pcopbot stopped.")
 
