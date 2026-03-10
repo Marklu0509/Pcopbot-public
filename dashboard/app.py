@@ -2,6 +2,7 @@
 
 import importlib
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure the project root is on sys.path so that `db`, `bot`, `config`,
@@ -18,10 +19,17 @@ st.set_page_config(
     layout="wide",
 )
 
+# ── Live clock in sidebar (UTC, matching trading system) ──
+_now_utc = datetime.now(timezone.utc)
+st.sidebar.markdown(
+    f"🕐 **{_now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC**"
+)
+st.sidebar.divider()
+
 st.sidebar.title("Pcopbot 🤖")
 page = st.sidebar.radio(
     "Navigate",
-    ["Traders", "History", "PnL", "Logs", "Settings"],
+    ["Traders", "Add Trader", "History", "PnL", "Logs", "Settings", "Wallet / API"],
 )
 
 _pages_dir = Path(__file__).resolve().parent / "_pages"
@@ -37,6 +45,8 @@ def _load_page(name: str):
 
 if page == "Traders":
     _load_page("traders").render()
+elif page == "Add Trader":
+    _load_page("add_trader").render()
 elif page == "History":
     _load_page("history").render()
 elif page == "PnL":
@@ -45,3 +55,5 @@ elif page == "Logs":
     _load_page("logs").render()
 elif page == "Settings":
     _load_page("settings").render()
+elif page == "Wallet / API":
+    _load_page("wallet").render()

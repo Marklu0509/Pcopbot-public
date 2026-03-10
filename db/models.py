@@ -26,15 +26,46 @@ class Trader(Base):
     label = Column(String, default="")
     is_active = Column(Boolean, default=True)
 
-    # Sizing mode: "fixed" or "proportional"
+    # Sizing — "fixed" or "proportional"
     sizing_mode = Column(String, default="fixed")
     fixed_amount = Column(Float, default=50.0)
-    proportional_pct = Column(Float, default=10.0)
+    proportional_pct = Column(Float, default=100.0)
 
-    # Risk parameters
+    # Buy-side slippage for market orders
+    buy_slippage = Column(Float, default=30.0)
+
+    # Take-profit / Stop-loss (0 = disabled)
+    tp_pct = Column(Float, default=0.0)
+    sl_pct = Column(Float, default=0.0)
+
+    # "Below Min Limit, Buy at Min" toggle
+    buy_at_min = Column(Boolean, default=True)
+
+    # Ignore target wallet trades under this USD value
+    ignore_trades_under = Column(Float, default=0.0)
+
+    # Price filters (0 = no limit)
+    min_price = Column(Float, default=0.0)
+    max_price = Column(Float, default=0.0)
+
+    # Spending / position limits (0 = no limit)
+    total_spend_limit = Column(Float, default=0.0)
+    min_per_trade = Column(Float, default=0.0)
+    max_per_yes_no = Column(Float, default=0.0)
+    max_per_trade = Column(Float, default=0.0)
+    max_per_market = Column(Float, default=0.0)
+
+    # Max number of markets with holders
+    max_holder_market_number = Column(Integer, default=0)
+
+    # Sell settings
+    sell_order_type = Column(String, default="market")  # market | limit
+    sell_slippage = Column(Float, default=30.0)
+
+    # Legacy / convenience aliases
     max_position_limit = Column(Float, default=500.0)
-    max_slippage = Column(Float, default=2.0)
-    min_trade_threshold = Column(Float, default=5.0)
+    max_slippage = Column(Float, default=30.0)
+    min_trade_threshold = Column(Float, default=0.0)
 
     # Watermark — set on startup / when trader is added
     watermark_timestamp = Column(DateTime, nullable=True)
