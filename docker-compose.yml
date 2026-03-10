@@ -1,0 +1,27 @@
+services:
+  bot:
+    build: .
+    container_name: pcopbot-bot
+    command: python -m bot.main
+    env_file: .env
+    volumes:
+      - db-data:/app/data
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: pcopbot-dashboard
+    command: >
+      streamlit run dashboard/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+    env_file: .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - db-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  db-data:
