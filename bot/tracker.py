@@ -38,17 +38,19 @@ _http = _make_session()
 def fetch_trades(wallet_address: str) -> list[dict]:
     """Fetch recent trades for *wallet_address* from the Polymarket Data API.
 
-    Returns a list of raw trade dicts, newest-first.
+    Uses the ``/activity`` endpoint with ``user`` param, which correctly
+    filters by wallet.  Returns a list of raw trade dicts, newest-first.
     """
-    url = f"{settings.DATA_API_BASE}/trades"
-    params = {"wallet": wallet_address, "limit": 100}
+    url = f"{settings.DATA_API_BASE}/activity"
+    params = {"user": wallet_address, "limit": 100}
     try:
         resp = _http.get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, list):
-            return data
-        # Some endpoints wrap in {"data": [...]}
+            # Only keep actual TRADE entries (the endpoint may also
+            # return other activity types such as REDEEM, DEPOSIT, etc.)
+            return [d for d in data if d.get("type", "").upper() == "TRADE"]
         return data.get("data", [])
     except requests.RequestException as exc:
         logger.error("Failed to fetch trades for %s: %s", wallet_address, exc)
@@ -68,15 +70,15 @@ def fetch_market(condition_id: str) -> dict:
 
 
 def parse_trade(raw: dict) -> dict[str, Any]:
-    """Normalise a raw trade dict from the Data API into a consistent shape.
+    """Normalise a raw trade dict from the Data API ``/activity`` endpoint.
 
     Returned keys:
         trade_id, market, token_id, side, size, price, timestamp (datetime UTC)
     """
-    # The Data API uses camelCase; handle both styles defensively.
-    trade_id = raw.get("id") or raw.get("tradeId") or ""
-    market = raw.get("market") or raw.get("conditionId") or ""
-    token_id = raw.get("asset_id") or raw.get("tokenId") or raw.get("assetId") or ""
+    # /activity uses transactionHash as unique identifier
+    trade_id = raw.get("transactionHash") or raw.get("id") or raw.get("tradeId") or ""
+    market = raw.get("conditionId") or raw.get("market") or ""
+    token_id = raw.get("asset") or raw.get("asset_id") or raw.get("tokenId") or raw.get("assetId") or ""
     side = (raw.get("side") or raw.get("type") or "BUY").upper()
     size = float(raw.get("size", 0) or raw.get("shares", 0) or 0)
     price = float(raw.get("price", 0) or 0)

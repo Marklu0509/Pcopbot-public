@@ -70,23 +70,35 @@ def _init_watermarks(session) -> None:
 def _poll_once(session) -> None:
     """One iteration: poll all active traders and copy new trades."""
     traders = session.query(Trader).filter(Trader.is_active == True).all()
+    if not traders:
+        logger.info("No active traders configured — nothing to poll.")
+        return
+
     for t in traders:
+        label = t.label or t.wallet_address[:12]
         if t.watermark_timestamp is None:
             watermark.set_watermark(session, t)
-            continue  # Skip this round — watermark just set
+            logger.info("[%s] Watermark initialised — will start polling next cycle.", label)
+            continue
         try:
+            logger.info("[%s] Polling for new trades (watermark=%s)…", label, t.watermark_timestamp.isoformat())
             new_trades = tracker.get_new_trades(t.wallet_address, t.watermark_timestamp)
         except Exception as exc:
-            logger.error("Error fetching trades for %s: %s", t.wallet_address, exc)
+            logger.error("[%s] Error fetching trades: %s", label, exc)
             continue
+
+        if not new_trades:
+            logger.info("[%s] No new trades found.", label)
+        else:
+            logger.info("[%s] Found %d new trade(s).", label, len(new_trades))
 
         for trade in new_trades:
             try:
                 execute_copy_trade(session, t, trade)
             except Exception as exc:
                 logger.error(
-                    "Unexpected error executing copy trade for %s: %s",
-                    t.wallet_address,
+                    "[%s] Unexpected error executing copy trade: %s",
+                    label,
                     exc,
                 )
             # Advance watermark regardless of execution outcome
@@ -114,6 +126,7 @@ def run() -> None:
 
     while _running:
         poll_interval = _get_poll_interval(SessionLocal)
+        logger.debug("Poll interval: %ss", poll_interval)
         with SessionLocal() as session:
             try:
                 _poll_once(session)
