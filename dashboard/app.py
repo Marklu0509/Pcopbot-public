@@ -1,5 +1,12 @@
 """Streamlit entry point — multi-page app."""
 
+import sys
+from pathlib import Path
+
+# Ensure the project root is on sys.path so that `db`, `bot`, `config`,
+# and `dashboard` packages are importable regardless of cwd.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import streamlit as st
 
 st.set_page_config(
