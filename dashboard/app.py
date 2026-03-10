@@ -24,7 +24,7 @@ page = st.sidebar.radio(
     ["Traders", "History", "PnL", "Logs", "Settings"],
 )
 
-_pages_dir = Path(__file__).resolve().parent / "pages"
+_pages_dir = Path(__file__).resolve().parent / "_pages"
 
 
 def _load_page(name: str):
