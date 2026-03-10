@@ -1,11 +1,14 @@
 """Streamlit entry point — multi-page app."""
 
+import importlib
 import sys
 from pathlib import Path
 
 # Ensure the project root is on sys.path so that `db`, `bot`, `config`,
 # and `dashboard` packages are importable regardless of cwd.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 import streamlit as st
 
@@ -21,12 +24,20 @@ page = st.sidebar.radio(
     ["Traders", "History", "PnL"],
 )
 
+_pages_dir = Path(__file__).resolve().parent / "pages"
+
+
+def _load_page(name: str):
+    """Import a page module by file path to avoid package-level import issues."""
+    spec = importlib.util.spec_from_file_location(name, _pages_dir / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 if page == "Traders":
-    from dashboard.pages import traders
-    traders.render()
+    _load_page("traders").render()
 elif page == "History":
-    from dashboard.pages import history
-    history.render()
+    _load_page("history").render()
 elif page == "PnL":
-    from dashboard.pages import pnl
-    pnl.render()
+    _load_page("pnl").render()
