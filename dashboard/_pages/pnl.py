@@ -19,6 +19,11 @@ def _load_pnl_data():
                 CopyTrade.pnl,
                 CopyTrade.status,
                 CopyTrade.trader_id,
+                CopyTrade.copy_size,
+                CopyTrade.copy_price,
+                CopyTrade.original_side,
+                CopyTrade.market_title,
+                CopyTrade.outcome,
                 Trader.label,
                 Trader.wallet_address,
             )
@@ -30,9 +35,11 @@ def _load_pnl_data():
         return pd.DataFrame()
     df = pd.DataFrame(
         rows,
-        columns=["executed_at", "pnl", "status", "trader_id", "label", "wallet_address"],
+        columns=["executed_at", "pnl", "status", "trader_id", "copy_size",
+                 "copy_price", "side", "market", "outcome", "label", "wallet_address"],
     )
     df["trader_name"] = df["label"].where(df["label"] != "", df["wallet_address"])
+    df["cost"] = df["copy_size"] * df["copy_price"].fillna(0)
     return df
 
 
@@ -49,13 +56,35 @@ def render() -> None:
 
     total_pnl = df["pnl"].sum()
     total_trades = len(df)
-    success_count = (df["status"].isin(["success", "dry_run"])).sum()
+    executed = df[df["status"].isin(["success", "dry_run"])]
+    success_count = len(executed)
     success_rate = success_count / total_trades * 100 if total_trades else 0.0
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Total PnL", f"${total_pnl:.2f}")
-    col2.metric("Total Trades", total_trades)
-    col3.metric("Success Rate", f"{success_rate:.1f}%")
+    # Investment metrics (buys only)
+    buys = executed[executed["side"] == "BUY"]
+    total_invested = buys["cost"].sum()
+    total_revenue = executed[executed["side"] == "SELL"]["cost"].sum()
+    net_pnl = total_pnl
+    roi = (net_pnl / total_invested * 100) if total_invested > 0 else 0
+
+    # Win rate per market
+    market_pnl = executed.groupby(["market", "outcome"])["pnl"].sum()
+    wins = (market_pnl > 0).sum()
+    total_markets = len(market_pnl)
+    win_rate = (wins / total_markets * 100) if total_markets > 0 else 0
+
+    st.subheader("📈 Overall Summary")
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1.metric("Total Invested", f"${total_invested:,.2f}")
+    r1c2.metric("Total PnL", f"${net_pnl:+,.2f}")
+    r1c3.metric("ROI", f"{roi:+.1f}%")
+    r1c4.metric("Total Trades", total_trades)
+
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("Buy Volume", f"${total_invested:,.2f}")
+    r2c2.metric("Sell Revenue", f"${total_revenue:,.2f}")
+    r2c3.metric("Execution Rate", f"{success_rate:.1f}%")
+    r2c4.metric("Win Rate (by market)", f"{win_rate:.0f}% ({wins}/{total_markets})")
 
     st.divider()
     st.subheader("PnL Over Time")
@@ -66,18 +95,32 @@ def render() -> None:
 
     st.divider()
     st.subheader("Per-Trader PnL Breakdown")
-    breakdown = (
-        df.groupby("trader_name")
-        .agg(
-            total_pnl=("pnl", "sum"),
-            trades=("pnl", "count"),
-            successes=("status", lambda s: s.isin(["success", "dry_run"]).sum()),
-        )
-        .reset_index()
-    )
-    breakdown["success_rate"] = (breakdown["successes"] / breakdown["trades"] * 100).round(1)
-    breakdown["total_pnl"] = breakdown["total_pnl"].map(lambda x: f"${x:.2f}")
-    st.dataframe(breakdown, use_container_width=True)
+    breakdown_data = []
+    for name, grp in df.groupby("trader_name"):
+        grp_exec = grp[grp["status"].isin(["success", "dry_run"])]
+        grp_buys = grp_exec[grp_exec["side"] == "BUY"]
+        invested = grp_buys["cost"].sum()
+        pnl_sum = grp["pnl"].sum()
+        trader_roi = (pnl_sum / invested * 100) if invested > 0 else 0
+        mkt_pnl = grp_exec.groupby(["market", "outcome"])["pnl"].sum()
+        w = (mkt_pnl > 0).sum()
+        m = len(mkt_pnl)
+        wr = (w / m * 100) if m > 0 else 0
+        breakdown_data.append({
+            "Trader": name,
+            "Invested": round(invested, 2),
+            "PnL": round(pnl_sum, 2),
+            "ROI %": round(trader_roi, 1),
+            "Trades": len(grp),
+            "Executed": len(grp_exec),
+            "Win Rate": f"{wr:.0f}% ({w}/{m})",
+        })
+    breakdown = pd.DataFrame(breakdown_data)
+    st.dataframe(breakdown, use_container_width=True, hide_index=True, column_config={
+        "Invested": st.column_config.NumberColumn(format="$%.2f"),
+        "PnL": st.column_config.NumberColumn(format="$%.2f"),
+        "ROI %": st.column_config.NumberColumn(format="%.1f%%"),
+    })
 
     if st.button("🔄 Refresh"):
         st.rerun()

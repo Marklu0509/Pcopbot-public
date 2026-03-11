@@ -81,12 +81,13 @@ def _load_trader_trades(trader_id: int) -> pd.DataFrame:
 
 
 def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
-    """Aggregate current holdings per token for a trader."""
+    """Aggregate current holdings per token for a trader, with current price."""
     with _SessionLocal() as session:
         rows = (
             session.query(
                 CopyTrade.market_title,
                 CopyTrade.outcome,
+                CopyTrade.original_market,
                 CopyTrade.original_side,
                 CopyTrade.copy_size,
                 CopyTrade.copy_price,
@@ -98,31 +99,45 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
             )
             .all()
         )
+        # Build a lookup for current prices from Position table
+        pos_rows = (
+            session.query(Position.condition_id, Position.outcome, Position.cur_price)
+            .filter(Position.trader_id == trader_id)
+            .all()
+        )
+    price_lookup = {(r[0], r[1]): r[2] for r in pos_rows}
+
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=["Market", "Outcome", "Side", "Size", "Price", "PnL"])
+    df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "Side", "Size", "Price", "PnL"])
 
     holdings: list[dict] = []
-    for (market, outcome), group in df.groupby(["Market", "Outcome"]):
+    for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
         buy_size = group.loc[group["Side"] == "BUY", "Size"].sum()
         sell_size = group.loc[group["Side"] == "SELL", "Size"].sum()
         net_size = buy_size - sell_size
+        buy_rows = group[group["Side"] == "BUY"]
         avg_price = (
-            (group["Price"] * group["Size"]).sum() / group["Size"].sum()
-            if group["Size"].sum() > 0 else 0
+            (buy_rows["Price"] * buy_rows["Size"]).sum() / buy_rows["Size"].sum()
+            if buy_rows["Size"].sum() > 0 else 0
         )
         total_pnl = group["PnL"].sum()
-        trade_count = len(group)
+        cur_price = price_lookup.get((cid, outcome), 0.0)
+        cost_basis = avg_price * net_size
+        current_value = cur_price * net_size
+        unrealized = current_value - cost_basis if cur_price > 0 else 0.0
+        change_pct = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 and cur_price > 0 else 0.0
         holdings.append({
             "Market": market,
             "Outcome": outcome,
-            "Buy Size": round(buy_size, 4),
-            "Sell Size": round(sell_size, 4),
-            "Net Position": round(net_size, 4),
+            "Shares": round(net_size, 4),
             "Avg Price": round(avg_price, 4),
-            "Total PnL": round(total_pnl, 2),
-            "Trades": trade_count,
+            "Cur Price": round(cur_price, 4),
+            "Value": round(current_value, 2),
+            "Unrealized": round(unrealized, 2),
+            "Change %": round(change_pct, 1),
+            "Trades": len(group),
         })
 
     return pd.DataFrame(holdings)
@@ -172,8 +187,10 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
             )
             .all()
         )
+    empty_cols = ["Market", "Outcome", "Sold Shares", "Avg Buy Price", "Avg Sell Price",
+                  "Total Cost", "Revenue", "Realized PnL", "ROI %"]
     if not rows:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=empty_cols)
 
     df = pd.DataFrame(rows, columns=["Market", "Outcome", "Side", "Size", "Price", "PnL"])
     realized: list[dict] = []
@@ -190,6 +207,7 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
         avg_sell = sell_value / sell_size if sell_size > 0 else 0
         total_cost = avg_buy * sell_size
         realized_pnl = sell_value - total_cost
+        roi = (realized_pnl / total_cost * 100) if total_cost > 0 else 0
         realized.append({
             "Market": market,
             "Outcome": outcome,
@@ -197,8 +215,12 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
             "Avg Buy Price": round(avg_buy, 4),
             "Avg Sell Price": round(avg_sell, 4),
             "Total Cost": round(total_cost, 2),
+            "Revenue": round(sell_value, 2),
             "Realized PnL": round(realized_pnl, 2),
+            "ROI %": round(roi, 1),
         })
+    if not realized:
+        return pd.DataFrame(columns=empty_cols)
     return pd.DataFrame(realized)
 
 
@@ -334,20 +356,25 @@ def _render_trader_detail(t) -> None:
     if holdings_df.empty:
         st.info("No copy-trade holdings yet.")
     else:
-        total_net = holdings_df["Net Position"].sum()
-        total_pnl = holdings_df["Total PnL"].sum()
-        num_tokens = len(holdings_df)
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Markets", num_tokens)
-        mc2.metric("Net Exposure", f"{total_net:.4f}")
-        mc3.metric("Total PnL", f"${total_pnl:.2f}")
+        total_value = holdings_df["Value"].sum()
+        total_unrealized = holdings_df["Unrealized"].sum()
+        total_cost = (holdings_df["Avg Price"] * holdings_df["Shares"]).sum()
+        pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Markets", len(holdings_df))
+        mc2.metric("Total Value", f"${total_value:,.2f}")
+        mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
+        mc4.metric("Change %", f"{pct:+.1f}%")
         st.dataframe(
             holdings_df,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Total PnL": st.column_config.NumberColumn(format="$%.2f"),
                 "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+                "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
+                "Value": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
+                "Change %": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
 
@@ -356,15 +383,29 @@ def _render_trader_detail(t) -> None:
     # ── Realized PnL (closed / sold trades) ──
     st.subheader("💰 Realized PnL")
     realized_df = _load_realized_pnl(t.id)
-    if realized_df.empty:
-        st.info("No realized PnL yet.")
+    if realized_df.empty or len(realized_df) == 0:
+        # Show summary row of zeros
+        rm1, rm2, rm3, rm4 = st.columns(4)
+        rm1.metric("Closed Markets", 0)
+        rm2.metric("Total Invested", "$0.00")
+        rm3.metric("Total Realized", "$0.00")
+        rm4.metric("Win Rate", "—")
+        st.dataframe(realized_df, use_container_width=True, hide_index=True)
     else:
-        rm1, rm2, rm3 = st.columns(3)
-        rm1.metric("Closed Markets", len(realized_df))
-        rm2.metric("Total Realized", f"${realized_df['Realized PnL'].sum():,.2f}")
-        total_cost = realized_df['Total Cost'].sum()
-        total_realized = realized_df['Realized PnL'].sum()
-        rm3.metric("ROI", f"{(total_realized / total_cost * 100):.1f}%" if total_cost else "—")
+        total_cost = realized_df["Total Cost"].sum()
+        total_realized = realized_df["Realized PnL"].sum()
+        total_revenue = realized_df["Revenue"].sum()
+        roi = (total_realized / total_cost * 100) if total_cost > 0 else 0
+        wins = (realized_df["Realized PnL"] > 0).sum()
+        total_markets = len(realized_df)
+        win_rate = (wins / total_markets * 100) if total_markets > 0 else 0
+
+        rm1, rm2, rm3, rm4, rm5 = st.columns(5)
+        rm1.metric("Closed Markets", total_markets)
+        rm2.metric("Total Invested", f"${total_cost:,.2f}")
+        rm3.metric("Total Realized", f"${total_realized:+,.2f}")
+        rm4.metric("ROI", f"{roi:+.1f}%")
+        rm5.metric("Win Rate", f"{win_rate:.0f}% ({wins}/{total_markets})")
         st.dataframe(
             realized_df,
             use_container_width=True,
@@ -372,8 +413,10 @@ def _render_trader_detail(t) -> None:
             column_config={
                 "Realized PnL": st.column_config.NumberColumn(format="$%.2f"),
                 "Total Cost": st.column_config.NumberColumn(format="$%.2f"),
+                "Revenue": st.column_config.NumberColumn(format="$%.2f"),
                 "Avg Buy Price": st.column_config.NumberColumn(format="$%.4f"),
                 "Avg Sell Price": st.column_config.NumberColumn(format="$%.4f"),
+                "ROI %": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
 
