@@ -72,11 +72,18 @@ def _load_trader_trades(trader_id: int) -> pd.DataFrame:
         rows,
         columns=[
             "ID", "Time", "Market", "Outcome", "Side",
-            "Orig Size", "Orig Price", "Copy Size", "Copy Price",
+            "Orig Position", "Orig Price", "Copy Position", "Copy Price",
             "Status", "PnL", "Error", "Order ID",
         ],
     )
+    df["Orig Value"] = (df["Orig Position"] * df["Orig Price"]).round(2)
+    df["Copy Value"] = (df["Copy Position"] * df["Copy Price"].fillna(0)).round(2)
     df["Status"] = df["Status"].map(lambda s: f"{STATUS_ICONS.get(s, '')} {s}")
+    # Reorder columns
+    df = df[["ID", "Time", "Market", "Outcome", "Side",
+             "Orig Position", "Orig Price", "Orig Value",
+             "Copy Position", "Copy Price", "Copy Value",
+             "Status", "PnL", "Error", "Order ID"]]
     return df
 
 
@@ -131,7 +138,7 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
         holdings.append({
             "Market": market,
             "Outcome": outcome,
-            "Shares": round(net_size, 4),
+            "Position": round(net_size, 4),
             "Avg Price": round(avg_price, 4),
             "Cur Price": round(cur_price, 4),
             "Value": round(current_value, 2),
@@ -165,7 +172,7 @@ def _load_trader_positions(trader_id: int) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=[
-        "Market", "Outcome", "Size", "Avg Price", "Value", "PnL", "PnL %", "Cur Price", "Fetched",
+        "Market", "Outcome", "Position", "Avg Price", "Value", "PnL", "PnL %", "Cur Price", "Fetched",
     ])
 
 
@@ -187,7 +194,7 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
             )
             .all()
         )
-    empty_cols = ["Market", "Outcome", "Sold Shares", "Avg Buy Price", "Avg Sell Price",
+    empty_cols = ["Market", "Outcome", "Sold Position", "Avg Buy Price", "Avg Sell Price",
                   "Total Cost", "Revenue", "Realized PnL", "ROI %"]
     if not rows:
         return pd.DataFrame(columns=empty_cols)
@@ -211,7 +218,7 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
         realized.append({
             "Market": market,
             "Outcome": outcome,
-            "Sold Shares": round(sell_size, 4),
+            "Sold Position": round(sell_size, 4),
             "Avg Buy Price": round(avg_buy, 4),
             "Avg Sell Price": round(avg_sell, 4),
             "Total Cost": round(total_cost, 2),
@@ -337,7 +344,7 @@ def _render_trader_detail(t) -> None:
     else:
         pm1, pm2, pm3, pm4 = st.columns(4)
         pm1.metric("Markets", len(pos_df))
-        pm2.metric("Total Shares", f"{pos_df['Size'].sum():,.2f}")
+        pm2.metric("Total Position", f"{pos_df['Position'].sum():,.2f}")
         pm3.metric("Total Value", f"${pos_df['Value'].sum():,.2f}")
         pm4.metric("Unrealized PnL", f"${pos_df['PnL'].sum():,.2f}")
         st.dataframe(pos_df, use_container_width=True, hide_index=True, column_config={
@@ -358,7 +365,7 @@ def _render_trader_detail(t) -> None:
     else:
         total_value = holdings_df["Value"].sum()
         total_unrealized = holdings_df["Unrealized"].sum()
-        total_cost = (holdings_df["Avg Price"] * holdings_df["Shares"]).sum()
+        total_cost = (holdings_df["Avg Price"] * holdings_df["Position"]).sum()
         pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
         mc1, mc2, mc3, mc4 = st.columns(4)
         mc1.metric("Markets", len(holdings_df))
@@ -434,9 +441,13 @@ def _render_trader_detail(t) -> None:
             use_container_width=True,
             hide_index=True,
             column_config={
+                "Orig Position": st.column_config.NumberColumn(format="%.4f"),
+                "Orig Price": st.column_config.NumberColumn(format="$%.4f"),
+                "Orig Value": st.column_config.NumberColumn(format="$%.2f"),
+                "Copy Position": st.column_config.NumberColumn(format="%.4f"),
+                "Copy Price": st.column_config.NumberColumn(format="$%.4f"),
+                "Copy Value": st.column_config.NumberColumn(format="$%.2f"),
                 "PnL": st.column_config.NumberColumn(format="$%.2f"),
-                "Orig Price": st.column_config.NumberColumn(format="%.4f"),
-                "Copy Price": st.column_config.NumberColumn(format="%.4f"),
             },
         )
 

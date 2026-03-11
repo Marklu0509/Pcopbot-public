@@ -39,8 +39,10 @@ def _load_history(
                 CopyTrade.outcome,
                 CopyTrade.original_side,
                 CopyTrade.original_size,
+                CopyTrade.original_price,
                 CopyTrade.copy_size,
                 CopyTrade.copy_price,
+                CopyTrade.pnl,
                 CopyTrade.status,
                 CopyTrade.error_message,
                 CopyTrade.order_id,
@@ -72,15 +74,24 @@ def _load_history(
             "Market",
             "Outcome",
             "Side",
-            "Orig Size",
-            "Copy Size",
+            "Orig Position",
+            "Orig Price",
+            "Copy Position",
             "Copy Price",
+            "PnL",
             "Status",
             "Error",
             "Order ID",
         ],
     )
+    df["Orig Value"] = (df["Orig Position"] * df["Orig Price"]).round(2)
+    df["Copy Value"] = (df["Copy Position"] * df["Copy Price"].fillna(0)).round(2)
     df["Status"] = df["Status"].map(lambda s: f"{STATUS_COLORS.get(s, '')} {s}")
+    # Reorder columns
+    df = df[["ID", "Executed At", "Label", "Wallet", "Market", "Outcome", "Side",
+             "Orig Position", "Orig Price", "Orig Value",
+             "Copy Position", "Copy Price", "Copy Value",
+             "PnL", "Status", "Error", "Order ID"]]
     return df, total
 
 
@@ -111,7 +122,15 @@ def render() -> None:
     if df.empty:
         st.info("No trades found for the selected filters.")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, hide_index=True, column_config={
+            "Orig Position": st.column_config.NumberColumn(format="%.4f"),
+            "Orig Price": st.column_config.NumberColumn(format="$%.4f"),
+            "Orig Value": st.column_config.NumberColumn(format="$%.2f"),
+            "Copy Position": st.column_config.NumberColumn(format="%.4f"),
+            "Copy Price": st.column_config.NumberColumn(format="$%.4f"),
+            "Copy Value": st.column_config.NumberColumn(format="$%.2f"),
+            "PnL": st.column_config.NumberColumn(format="$%.2f"),
+        })
 
     if st.button("🔄 Refresh"):
         st.rerun()
