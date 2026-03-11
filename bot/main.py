@@ -5,7 +5,7 @@ import signal
 import time
 
 from db.database import get_session_factory, init_db
-from db.models import BotLog, BotSetting, Position, Trader
+from db.models import BotLog, BotSetting, CopyTrade, Position, Trader
 from bot import tracker, watermark
 from bot.executor import execute_copy_trade
 from config import settings
@@ -98,6 +98,42 @@ def _sync_positions(session) -> None:
         logger.info("[%s] Synced %d pre-existing position(s).", label, len(positions))
 
 
+def _update_pnl(session) -> None:
+    """Update PnL on open copy-trade positions using current prices from Position table.
+
+    For each BUY copy trade that hasn't been offset by a SELL, compute
+    unrealized PnL = (cur_price - copy_price) * copy_size.
+    For SELL copy trades, PnL = (copy_price - avg_buy_price) * copy_size.
+    """
+    # Build a price lookup from Position table: (condition_id, outcome) -> cur_price
+    positions = session.query(Position.condition_id, Position.outcome, Position.cur_price).all()
+    price_map = {(r[0], r[1]): r[2] for r in positions}
+
+    if not price_map:
+        return
+
+    # Update all open copy trades
+    open_trades = (
+        session.query(CopyTrade)
+        .filter(CopyTrade.status.in_(["success", "dry_run"]))
+        .all()
+    )
+    updated = 0
+    for ct in open_trades:
+        cur_price = price_map.get((ct.original_market, ct.outcome))
+        if cur_price is None:
+            continue
+        if ct.original_side == "BUY":
+            ct.pnl = round((cur_price - (ct.copy_price or 0)) * ct.copy_size, 4)
+        else:
+            ct.pnl = round(((ct.copy_price or 0) - cur_price) * ct.copy_size, 4)
+        updated += 1
+
+    if updated:
+        session.commit()
+        logger.info("Updated PnL on %d copy trade(s).", updated)
+
+
 def _poll_once(session) -> None:
     """One iteration: poll all active traders and copy new trades."""
     traders = session.query(Trader).filter(Trader.is_active == True).all()
@@ -156,6 +192,8 @@ def run() -> None:
         _init_watermarks(session)
         _sync_positions(session)
 
+    _poll_count = 0
+
     while _running:
         poll_interval = _get_poll_interval(SessionLocal)
         logger.debug("Poll interval: %ss", poll_interval)
@@ -164,6 +202,16 @@ def run() -> None:
                 _poll_once(session)
             except Exception as exc:
                 logger.error("Unhandled error in poll loop: %s", exc)
+
+            # Sync positions & update PnL every 10 poll cycles
+            _poll_count += 1
+            if _poll_count % 10 == 0:
+                try:
+                    _sync_positions(session)
+                    _update_pnl(session)
+                except Exception as exc:
+                    logger.error("Error syncing positions/PnL: %s", exc)
+
         logger.debug("Sleeping %s seconds…", poll_interval)
         time.sleep(poll_interval)
 

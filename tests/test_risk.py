@@ -12,6 +12,12 @@ from bot.risk import (
     check_min_threshold,
     check_position_limit,
     check_slippage,
+    check_ignore_trades_under,
+    check_price_filter,
+    check_per_trade_limit,
+    check_total_spend_limit,
+    check_max_per_market,
+    check_max_per_yes_no,
     run_all_checks,
 )
 
@@ -49,59 +55,159 @@ class TestMinThreshold:
         assert check_min_threshold(100.0, trader) is None
 
 
+class TestIgnoreTradesUnder:
+    def test_below_threshold_rejected(self, trader):
+        trader.ignore_trades_under = 10.0
+        assert check_ignore_trades_under(5.0, 1.0, trader) == STATUS_BELOW_THRESHOLD
+
+    def test_above_threshold_accepted(self, trader):
+        trader.ignore_trades_under = 10.0
+        assert check_ignore_trades_under(100.0, 0.5, trader) is None
+
+    def test_disabled_when_zero(self, trader):
+        trader.ignore_trades_under = 0.0
+        assert check_ignore_trades_under(1.0, 0.01, trader) is None
+
+
+class TestPriceFilter:
+    def test_below_min_rejected(self, trader):
+        trader.min_price = 0.10
+        assert check_price_filter(0.05, trader) == STATUS_BELOW_THRESHOLD
+
+    def test_above_max_rejected(self, trader):
+        trader.max_price = 0.90
+        assert check_price_filter(0.95, trader) == STATUS_BELOW_THRESHOLD
+
+    def test_within_range_accepted(self, trader):
+        trader.min_price = 0.10
+        trader.max_price = 0.90
+        assert check_price_filter(0.50, trader) is None
+
+    def test_disabled_when_zero(self, trader):
+        trader.min_price = 0.0
+        trader.max_price = 0.0
+        assert check_price_filter(0.50, trader) is None
+
+
+class TestPerTradeLimit:
+    def test_below_min_rejected(self, trader):
+        trader.min_per_trade = 10.0
+        assert check_per_trade_limit(5.0, 1.0, trader) == STATUS_BELOW_THRESHOLD
+
+    def test_above_max_rejected(self, trader):
+        trader.max_per_trade = 100.0
+        assert check_per_trade_limit(200.0, 1.0, trader) == STATUS_POSITION_LIMIT
+
+    def test_within_range_accepted(self, trader):
+        trader.min_per_trade = 10.0
+        trader.max_per_trade = 100.0
+        assert check_per_trade_limit(50.0, 1.0, trader) is None
+
+
+class TestTotalSpendLimit:
+    def test_exceeds_limit_rejected(self, session, trader):
+        trader.total_spend_limit = 100.0
+        session.commit()
+        existing = CopyTrade(
+            trader_id=trader.id, original_trade_id="t1", original_market="mkt",
+            original_token_id="tok", original_side="BUY", original_size=80.0,
+            original_price=1.0, copy_size=80.0, copy_price=1.0, status="success",
+        )
+        session.add(existing)
+        session.commit()
+        assert check_total_spend_limit(session, trader, 30.0, 1.0) == STATUS_POSITION_LIMIT
+
+    def test_within_limit_accepted(self, session, trader):
+        trader.total_spend_limit = 100.0
+        session.commit()
+        assert check_total_spend_limit(session, trader, 50.0, 1.0) is None
+
+    def test_disabled_when_zero(self, session, trader):
+        trader.total_spend_limit = 0.0
+        assert check_total_spend_limit(session, trader, 9999.0, 1.0) is None
+
+
+class TestMaxPerMarket:
+    def test_exceeds_rejected(self, session, trader):
+        trader.max_per_market = 100.0
+        session.commit()
+        existing = CopyTrade(
+            trader_id=trader.id, original_trade_id="t1", original_market="mkt-A",
+            original_token_id="tok", original_side="BUY", original_size=80.0,
+            original_price=1.0, copy_size=80.0, copy_price=1.0, status="success",
+        )
+        session.add(existing)
+        session.commit()
+        assert check_max_per_market(session, trader, "mkt-A", 30.0, 1.0) == STATUS_POSITION_LIMIT
+
+    def test_different_market_accepted(self, session, trader):
+        trader.max_per_market = 100.0
+        session.commit()
+        existing = CopyTrade(
+            trader_id=trader.id, original_trade_id="t1", original_market="mkt-A",
+            original_token_id="tok", original_side="BUY", original_size=80.0,
+            original_price=1.0, copy_size=80.0, copy_price=1.0, status="success",
+        )
+        session.add(existing)
+        session.commit()
+        assert check_max_per_market(session, trader, "mkt-B", 80.0, 1.0) is None
+
+
+class TestMaxPerYesNo:
+    def test_exceeds_rejected(self, session, trader):
+        trader.max_per_yes_no = 50.0
+        session.commit()
+        existing = CopyTrade(
+            trader_id=trader.id, original_trade_id="t1", original_market="mkt",
+            original_token_id="tok-yes", original_side="BUY", original_size=40.0,
+            original_price=1.0, copy_size=40.0, copy_price=1.0, status="success",
+        )
+        session.add(existing)
+        session.commit()
+        assert check_max_per_yes_no(session, trader, "tok-yes", 20.0, 1.0) == STATUS_POSITION_LIMIT
+
+
 class TestPositionLimit:
     def test_no_existing_exposure_accepted(self, session, trader):
-        assert check_position_limit(session, trader, "token-1", 100.0) is None
+        assert check_position_limit(session, trader, "token-1", 100.0, 1.0) is None
 
     def test_would_exceed_limit_rejected(self, session, trader):
-        # Add existing exposure of 450
         existing = CopyTrade(
-            trader_id=trader.id,
-            original_trade_id="t1",
-            original_market="mkt",
-            original_token_id="token-1",
-            original_side="BUY",
-            original_size=450.0,
-            original_price=0.5,
-            copy_size=450.0,
-            status="success",
+            trader_id=trader.id, original_trade_id="t1", original_market="mkt",
+            original_token_id="token-1", original_side="BUY", original_size=450.0,
+            original_price=1.0, copy_size=450.0, copy_price=1.0, status="success",
         )
         session.add(existing)
         session.commit()
-        # Adding 100 would exceed 500 limit
-        assert check_position_limit(session, trader, "token-1", 100.0) == STATUS_POSITION_LIMIT
+        assert check_position_limit(session, trader, "token-1", 100.0, 1.0) == STATUS_POSITION_LIMIT
 
-    def test_exactly_at_limit_accepted(self, session, trader):
-        existing = CopyTrade(
-            trader_id=trader.id,
-            original_trade_id="t2",
-            original_market="mkt",
-            original_token_id="token-2",
-            original_side="BUY",
-            original_size=400.0,
-            original_price=0.5,
-            copy_size=400.0,
-            status="success",
+    def test_sells_reduce_exposure(self, session, trader):
+        """SELL trades should offset BUY exposure."""
+        buy = CopyTrade(
+            trader_id=trader.id, original_trade_id="t1", original_market="mkt",
+            original_token_id="token-1", original_side="BUY", original_size=400.0,
+            original_price=1.0, copy_size=400.0, copy_price=1.0, status="success",
         )
-        session.add(existing)
+        sell = CopyTrade(
+            trader_id=trader.id, original_trade_id="t2", original_market="mkt",
+            original_token_id="token-1", original_side="SELL", original_size=300.0,
+            original_price=1.0, copy_size=300.0, copy_price=1.0, status="success",
+        )
+        session.add(buy)
+        session.add(sell)
         session.commit()
-        assert check_position_limit(session, trader, "token-2", 100.0) is None
+        # Net = 400-300 = $100 exposure, adding $100 = $200 < $500 limit
+        assert check_position_limit(session, trader, "token-1", 100.0, 1.0) is None
 
     def test_failed_trades_not_counted(self, session, trader):
         existing = CopyTrade(
-            trader_id=trader.id,
-            original_trade_id="t3",
-            original_market="mkt",
-            original_token_id="token-3",
-            original_side="BUY",
-            original_size=450.0,
-            original_price=0.5,
-            copy_size=450.0,
-            status="failed",
+            trader_id=trader.id, original_trade_id="t3", original_market="mkt",
+            original_token_id="token-3", original_side="BUY", original_size=450.0,
+            original_price=1.0, copy_size=450.0, copy_price=1.0, status="failed",
         )
         session.add(existing)
         session.commit()
-        assert check_position_limit(session, trader, "token-3", 100.0) is None
+        assert check_position_limit(session, trader, "token-3", 100.0, 1.0) is None
 
 
 class TestSlippageCheck:
@@ -116,13 +222,29 @@ class TestSlippageCheck:
 
 
 class TestRunAllChecks:
+    def _call(self, session, trader, **kw):
+        defaults = {
+            "token_id": "tok", "market": "mkt",
+            "copy_size": 10.0, "best_price": 0.5, "expected_price": 0.5,
+            "original_size": 100.0, "original_price": 0.5, "side": "BUY",
+        }
+        defaults.update(kw)
+        return run_all_checks(session, trader, **defaults)
+
     def test_all_pass(self, session, trader):
-        assert run_all_checks(session, trader, "tok", 10.0, 0.5, 0.5) is None
+        assert self._call(session, trader) is None
 
     def test_threshold_fails_first(self, session, trader):
-        result = run_all_checks(session, trader, "tok", 1.0, 0.5, 0.5)
+        result = self._call(session, trader, copy_size=1.0)
         assert result == STATUS_BELOW_THRESHOLD
 
     def test_slippage_checked_after_threshold(self, session, trader):
-        result = run_all_checks(session, trader, "tok", 10.0, 0.55, 0.5)  # 10% slippage
+        result = self._call(session, trader, best_price=0.55)  # 10% slippage
         assert result == STATUS_SLIPPAGE_EXCEEDED
+
+    def test_sell_skips_buy_checks(self, session, trader):
+        """SELL side should only check slippage, not buy-side limits."""
+        trader.ignore_trades_under = 9999.0  # Would reject BUY
+        session.commit()
+        result = self._call(session, trader, side="SELL")
+        assert result is None

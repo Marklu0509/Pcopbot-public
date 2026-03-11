@@ -64,9 +64,13 @@ def execute_copy_trade(
         session=session,
         trader=trader,
         token_id=trade["token_id"],
+        market=trade["market"],
         copy_size=copy_size,
         best_price=best_price,
         expected_price=expected_price,
+        original_size=trade["size"],
+        original_price=trade["price"],
+        side=trade["side"],
     )
 
     status = rejection or ("dry_run" if settings.DRY_RUN else "pending")
