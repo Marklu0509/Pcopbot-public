@@ -12,12 +12,29 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import streamlit as st
+from config import settings as _settings
 
 st.set_page_config(
     page_title="Pcopbot Dashboard",
     page_icon="🤖",
     layout="wide",
 )
+
+# ── Password gate ──
+_pw = _settings.DASHBOARD_PASSWORD
+if _pw:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if not st.session_state.authenticated:
+        st.title("🔒 Login")
+        entered = st.text_input("Password", type="password")
+        if st.button("Login"):
+            if entered == _pw:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("密碼錯誤")
+        st.stop()
 
 # ── Live clock in sidebar (UTC, matching trading system) ──
 _now_utc = datetime.now(timezone.utc)

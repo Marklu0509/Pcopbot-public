@@ -5,8 +5,9 @@ from __future__ import annotations
 import streamlit as st
 
 from db.database import get_session_factory, init_db
-from db.models import Trader
+from db.models import Position, Trader
 from bot.watermark import set_watermark
+from bot import tracker
 
 init_db()
 _SessionLocal = get_session_factory()
@@ -26,6 +27,28 @@ def _add_trader(data: dict) -> str | None:
         session.commit()
         session.refresh(trader)
         set_watermark(session, trader)
+
+        # Fetch pre-existing positions for the new trader
+        try:
+            positions = tracker.fetch_positions(trader.wallet_address)
+            for p in positions:
+                session.add(Position(
+                    trader_id=trader.id,
+                    condition_id=p["condition_id"],
+                    asset_id=p["asset_id"],
+                    market_title=p["market_title"],
+                    outcome=p["outcome"],
+                    size=p["size"],
+                    avg_price=p["avg_price"],
+                    initial_value=p["initial_value"],
+                    current_value=p["current_value"],
+                    pnl=p["pnl"],
+                    pnl_pct=p["pnl_pct"],
+                    cur_price=p["cur_price"],
+                ))
+            session.commit()
+        except Exception:
+            pass  # non-critical — positions will be fetched on next bot startup
     return None
 
 

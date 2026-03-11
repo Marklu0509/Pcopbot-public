@@ -40,6 +40,7 @@ LOG_LEVEL: str = _get("LOG_LEVEL", "INFO")
 
 # Streamlit
 STREAMLIT_PORT: int = _get_int("STREAMLIT_PORT", 8501)
+DASHBOARD_PASSWORD: str = _get("DASHBOARD_PASSWORD")
 
 # External API base URLs
 GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"

@@ -154,6 +154,54 @@ def _load_trader_positions(trader_id: int) -> pd.DataFrame:
     ])
 
 
+def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
+    """Compute realized PnL per market/outcome from SELL copy trades."""
+    with _SessionLocal() as session:
+        rows = (
+            session.query(
+                CopyTrade.market_title,
+                CopyTrade.outcome,
+                CopyTrade.original_side,
+                CopyTrade.copy_size,
+                CopyTrade.copy_price,
+                CopyTrade.pnl,
+            )
+            .filter(
+                CopyTrade.trader_id == trader_id,
+                CopyTrade.status.in_(["success", "dry_run"]),
+            )
+            .all()
+        )
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["Market", "Outcome", "Side", "Size", "Price", "PnL"])
+    realized: list[dict] = []
+    for (market, outcome), group in df.groupby(["Market", "Outcome"]):
+        buys = group[group["Side"] == "BUY"]
+        sells = group[group["Side"] == "SELL"]
+        if sells.empty:
+            continue
+        sell_size = sells["Size"].sum()
+        sell_value = (sells["Price"] * sells["Size"]).sum()
+        buy_value = (buys["Price"] * buys["Size"]).sum()
+        buy_size = buys["Size"].sum()
+        avg_buy = buy_value / buy_size if buy_size > 0 else 0
+        avg_sell = sell_value / sell_size if sell_size > 0 else 0
+        total_cost = avg_buy * sell_size
+        realized_pnl = sell_value - total_cost
+        realized.append({
+            "Market": market,
+            "Outcome": outcome,
+            "Sold Shares": round(sell_size, 4),
+            "Avg Buy Price": round(avg_buy, 4),
+            "Avg Sell Price": round(avg_sell, 4),
+            "Total Cost": round(total_cost, 2),
+            "Realized PnL": round(realized_pnl, 2),
+        })
+    return pd.DataFrame(realized)
+
+
 def _render_trader_detail(t) -> None:
     """Render the detail view for a single trader inside its tab."""
     # ── Info card ──
@@ -259,20 +307,28 @@ def _render_trader_detail(t) -> None:
 
     st.divider()
 
-    # ── Pre-existing Positions ──
-    st.subheader("📌 Pre-existing Positions")
+    # ── Pre-existing Positions (target trader's own holdings) ──
+    st.subheader("📌 Trader's Current Positions")
     pos_df = _load_trader_positions(t.id)
     if pos_df.empty:
         st.info("No pre-existing positions found.")
     else:
+        pm1, pm2, pm3, pm4 = st.columns(4)
+        pm1.metric("Markets", len(pos_df))
+        pm2.metric("Total Shares", f"{pos_df['Size'].sum():,.2f}")
+        pm3.metric("Total Value", f"${pos_df['Value'].sum():,.2f}")
+        pm4.metric("Unrealized PnL", f"${pos_df['PnL'].sum():,.2f}")
         st.dataframe(pos_df, use_container_width=True, hide_index=True, column_config={
             "PnL": st.column_config.NumberColumn(format="$%.2f"),
             "Value": st.column_config.NumberColumn(format="$%.2f"),
+            "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+            "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
+            "PnL %": st.column_config.NumberColumn(format="%.1f%%"),
         })
 
     st.divider()
 
-    # ── Copy-Trade Holdings ──
+    # ── Copy-Trade Holdings (our positions) ──
     st.subheader("📊 Copy-Trade Holdings")
     holdings_df = _load_trader_holdings(t.id)
     if holdings_df.empty:
@@ -291,6 +347,33 @@ def _render_trader_detail(t) -> None:
             hide_index=True,
             column_config={
                 "Total PnL": st.column_config.NumberColumn(format="$%.2f"),
+                "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+            },
+        )
+
+    st.divider()
+
+    # ── Realized PnL (closed / sold trades) ──
+    st.subheader("💰 Realized PnL")
+    realized_df = _load_realized_pnl(t.id)
+    if realized_df.empty:
+        st.info("No realized PnL yet.")
+    else:
+        rm1, rm2, rm3 = st.columns(3)
+        rm1.metric("Closed Markets", len(realized_df))
+        rm2.metric("Total Realized", f"${realized_df['Realized PnL'].sum():,.2f}")
+        total_cost = realized_df['Total Cost'].sum()
+        total_realized = realized_df['Realized PnL'].sum()
+        rm3.metric("ROI", f"{(total_realized / total_cost * 100):.1f}%" if total_cost else "—")
+        st.dataframe(
+            realized_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Realized PnL": st.column_config.NumberColumn(format="$%.2f"),
+                "Total Cost": st.column_config.NumberColumn(format="$%.2f"),
+                "Avg Buy Price": st.column_config.NumberColumn(format="$%.4f"),
+                "Avg Sell Price": st.column_config.NumberColumn(format="$%.4f"),
             },
         )
 
