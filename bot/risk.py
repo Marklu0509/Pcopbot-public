@@ -211,16 +211,17 @@ def run_all_checks(
     side: str,
 ) -> Optional[str]:
     """Run all risk checks in order and return the first rejection status, or None if OK."""
-    # Only apply buy-side limits on BUY trades
+    # ── Filters that apply to ALL trades (BUY and SELL) ──
+    rejection = check_ignore_trades_under(original_size, original_price, trader)
+    if rejection:
+        return rejection
+
+    rejection = check_price_filter(expected_price, trader)
+    if rejection:
+        return rejection
+
+    # ── Buy-side spending / position limits (only on BUY) ──
     if side == "BUY":
-        rejection = check_ignore_trades_under(original_size, original_price, trader)
-        if rejection:
-            return rejection
-
-        rejection = check_price_filter(expected_price, trader)
-        if rejection:
-            return rejection
-
         rejection = check_min_threshold(copy_size, trader)
         if rejection:
             return rejection
@@ -245,6 +246,7 @@ def run_all_checks(
         if rejection:
             return rejection
 
+    # ── Slippage (applies to all) ──
     rejection = check_slippage(best_price, expected_price, trader)
     if rejection:
         return rejection

@@ -242,9 +242,17 @@ class TestRunAllChecks:
         result = self._call(session, trader, best_price=0.55)  # 10% slippage
         assert result == STATUS_SLIPPAGE_EXCEEDED
 
-    def test_sell_skips_buy_checks(self, session, trader):
-        """SELL side should only check slippage, not buy-side limits."""
-        trader.ignore_trades_under = 9999.0  # Would reject BUY
+    def test_sell_skips_buy_spending_limits(self, session, trader):
+        """SELL side should skip spending/position limits but still check filters."""
+        trader.max_per_trade = 1.0  # Would reject BUY due to spending limit
         session.commit()
+        # SELL should pass — max_per_trade only applies to BUY
         result = self._call(session, trader, side="SELL")
         assert result is None
+
+    def test_sell_still_checks_ignore_trades_under(self, session, trader):
+        """SELL side should still apply ignore_trades_under filter."""
+        trader.ignore_trades_under = 9999.0
+        session.commit()
+        result = self._call(session, trader, side="SELL")
+        assert result == STATUS_BELOW_THRESHOLD
