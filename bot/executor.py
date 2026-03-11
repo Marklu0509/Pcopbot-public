@@ -15,6 +15,32 @@ from db.models import CopyTrade, Trader
 logger = logging.getLogger(__name__)
 
 
+def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
+    """Return net share holdings for a trader+token from successful/dry_run copy trades."""
+    from sqlalchemy import func
+    buy_total = (
+        session.query(func.coalesce(func.sum(CopyTrade.copy_size), 0.0))
+        .filter(
+            CopyTrade.trader_id == trader_id,
+            CopyTrade.original_token_id == token_id,
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .scalar()
+    )
+    sell_total = (
+        session.query(func.coalesce(func.sum(CopyTrade.copy_size), 0.0))
+        .filter(
+            CopyTrade.trader_id == trader_id,
+            CopyTrade.original_token_id == token_id,
+            CopyTrade.original_side == "SELL",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .scalar()
+    )
+    return max(buy_total - sell_total, 0.0)
+
+
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
     """Determine the copy trade size (in shares) based on the trader's sizing mode.
 
@@ -60,6 +86,43 @@ def execute_copy_trade(
 
     expected_price = trade["price"]
     copy_size = _calculate_copy_size(trader, trade["size"], expected_price)
+
+    # For SELL trades, cap the size at what we actually hold to avoid
+    # selling more shares than we own (can happen when some BUYs were
+    # filtered out by risk checks).
+    if trade["side"] == "SELL":
+        holdings = _get_net_holdings(session, trader.id, trade["token_id"])
+        if holdings <= 0:
+            logger.info(
+                "SELL skipped for trader %s token %s: no holdings to sell.",
+                trader.wallet_address, trade["token_id"],
+            )
+            copy_trade = CopyTrade(
+                trader_id=trader.id,
+                original_trade_id=trade["trade_id"],
+                original_market=trade["market"],
+                original_token_id=trade["token_id"],
+                market_title=trade.get("market_title", ""),
+                outcome=trade.get("outcome", ""),
+                original_side=trade["side"],
+                original_size=trade["size"],
+                original_price=trade["price"],
+                original_timestamp=trade["timestamp"].replace(tzinfo=None),
+                copy_size=0.0,
+                copy_price=expected_price,
+                status="below_threshold",
+                error_message="No holdings to sell",
+                executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(copy_trade)
+            session.commit()
+            return copy_trade
+        if copy_size > holdings:
+            logger.info(
+                "SELL capped for trader %s token %s: wanted %.4f but only hold %.4f",
+                trader.wallet_address, trade["token_id"], copy_size, holdings,
+            )
+            copy_size = holdings
 
     # For slippage check we use the expected price as the "best price" proxy.
     # In production this could query the orderbook; here we use a 0% slippage

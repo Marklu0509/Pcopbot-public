@@ -118,3 +118,49 @@ class TestLiveExecution:
 
         assert ct.status == "success"
         assert ct.order_id == "order-999"
+
+
+class TestSellCap:
+    """SELL orders should be capped at actual holdings."""
+
+    def test_sell_no_holdings_skipped(self, session, trader):
+        """Selling with zero holdings should be skipped."""
+        with patch("bot.executor.settings") as mock_settings:
+            mock_settings.DRY_RUN = True
+            ct = execute_copy_trade(session, trader, _sample_trade(side="SELL"))
+        assert ct.status == "below_threshold"
+        assert ct.copy_size == 0.0
+
+    def test_sell_capped_at_holdings(self, session, trader):
+        """Sell size should be capped to what we actually hold."""
+        # First, create a BUY record of 30 shares
+        buy = CopyTrade(
+            trader_id=trader.id, original_trade_id="buy-1", original_market="market-abc",
+            original_token_id="token-xyz", original_side="BUY", original_size=100.0,
+            original_price=0.5, copy_size=30.0, copy_price=0.5, status="dry_run",
+        )
+        session.add(buy)
+        session.commit()
+        with patch("bot.executor.settings") as mock_settings:
+            mock_settings.DRY_RUN = True
+            # Try to sell 100 shares (proportional would be more than 30)
+            ct = execute_copy_trade(session, trader, _sample_trade(side="SELL", size=1000.0))
+        # Should be capped at 30 (our holdings), not the calculated copy_size
+        assert ct.copy_size <= 30.0
+        assert ct.status == "dry_run"
+
+    def test_sell_within_holdings_not_capped(self, session, trader):
+        """If sell size <= holdings, it should proceed normally."""
+        buy = CopyTrade(
+            trader_id=trader.id, original_trade_id="buy-1", original_market="market-abc",
+            original_token_id="token-xyz", original_side="BUY", original_size=200.0,
+            original_price=0.5, copy_size=200.0, copy_price=0.5, status="dry_run",
+        )
+        session.add(buy)
+        session.commit()
+        with patch("bot.executor.settings") as mock_settings:
+            mock_settings.DRY_RUN = True
+            # fixed_amount=50 / price=0.5 = 100 shares, well within 200 holdings
+            ct = execute_copy_trade(session, trader, _sample_trade(side="SELL"))
+        assert ct.copy_size == pytest.approx(100.0)
+        assert ct.status == "dry_run"
