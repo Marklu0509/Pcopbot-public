@@ -15,11 +15,17 @@ from db.models import CopyTrade, Trader
 logger = logging.getLogger(__name__)
 
 
-def _calculate_copy_size(trader: Trader, original_size: float) -> float:
-    """Determine the copy trade size based on the trader's sizing mode."""
+def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
+    """Determine the copy trade size (in shares) based on the trader's sizing mode.
+
+    Fixed mode:  user sets a dollar budget → convert to shares (budget / price).
+    Proportional mode: percentage of the original trade's share count.
+    """
     if trader.sizing_mode == "proportional":
         return original_size * (trader.proportional_pct / 100.0)
-    # Default: fixed amount
+    # Fixed mode: convert dollar amount to shares
+    if price > 0:
+        return trader.fixed_amount / price
     return trader.fixed_amount
 
 
@@ -52,8 +58,8 @@ def execute_copy_trade(
     from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
     from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
 
-    copy_size = _calculate_copy_size(trader, trade["size"])
     expected_price = trade["price"]
+    copy_size = _calculate_copy_size(trader, trade["size"], expected_price)
 
     # For slippage check we use the expected price as the "best price" proxy.
     # In production this could query the orderbook; here we use a 0% slippage

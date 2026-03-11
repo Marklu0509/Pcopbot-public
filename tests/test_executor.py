@@ -51,18 +51,19 @@ def _sample_trade(**kwargs):
 
 
 class TestCalculateCopySize:
-    def test_fixed_mode_ignores_original_size(self):
+    def test_fixed_mode_converts_dollars_to_shares(self):
         t = Trader(sizing_mode="fixed", fixed_amount=50.0)
-        assert _calculate_copy_size(t, 1000.0) == 50.0
+        # $50 at $0.50/share = 100 shares
+        assert _calculate_copy_size(t, 1000.0, 0.5) == pytest.approx(100.0)
 
     def test_proportional_mode(self):
         t = Trader(sizing_mode="proportional", proportional_pct=10.0)
-        assert _calculate_copy_size(t, 200.0) == pytest.approx(20.0)
+        assert _calculate_copy_size(t, 200.0, 0.5) == pytest.approx(20.0)
 
-    def test_default_mode_is_fixed(self):
-        t = Trader(fixed_amount=75.0)
-        t.sizing_mode = "fixed"
-        assert _calculate_copy_size(t, 999.0) == 75.0
+    def test_fixed_mode_zero_price_fallback(self):
+        t = Trader(sizing_mode="fixed", fixed_amount=75.0)
+        # price=0 edge case: falls back to raw fixed_amount
+        assert _calculate_copy_size(t, 999.0, 0.0) == 75.0
 
 
 class TestDryRun:
@@ -90,12 +91,13 @@ class TestDryRun:
 
 class TestBelowThreshold:
     def test_below_threshold_skipped(self, session, trader):
-        trader.min_trade_threshold = 100.0
+        trader.min_per_trade = 100.0  # min $100 per trade
         session.commit()
         with patch("bot.executor.settings") as mock_settings:
             mock_settings.DRY_RUN = False
-            # fixed_amount=50 < min_threshold=100
+            # fixed_amount=50 / price=0.5 = 100 shares, trade_value = 100*0.5 = $50 < $100 min
             ct = execute_copy_trade(session, trader, _sample_trade())
+        assert ct.status == "below_threshold"
         assert ct.status == "below_threshold"
 
 

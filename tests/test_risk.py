@@ -234,11 +234,14 @@ class TestRunAllChecks:
     def test_all_pass(self, session, trader):
         assert self._call(session, trader) is None
 
-    def test_threshold_fails_first(self, session, trader):
+    def test_per_trade_limit_rejects_small_trade(self, session, trader):
+        trader.min_per_trade = 10.0
+        session.commit()
+        # copy_size=1 * price=0.5 = $0.50 < $10 min
         result = self._call(session, trader, copy_size=1.0)
         assert result == STATUS_BELOW_THRESHOLD
 
-    def test_slippage_checked_after_threshold(self, session, trader):
+    def test_slippage_checked(self, session, trader):
         result = self._call(session, trader, best_price=0.55)  # 10% slippage
         assert result == STATUS_SLIPPAGE_EXCEEDED
 

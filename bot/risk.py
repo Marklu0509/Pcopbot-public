@@ -222,10 +222,6 @@ def run_all_checks(
 
     # ── Buy-side spending / position limits (only on BUY) ──
     if side == "BUY":
-        rejection = check_min_threshold(copy_size, trader)
-        if rejection:
-            return rejection
-
         rejection = check_per_trade_limit(copy_size, expected_price, trader)
         if rejection:
             return rejection
