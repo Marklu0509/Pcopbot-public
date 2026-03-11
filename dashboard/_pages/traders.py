@@ -240,7 +240,8 @@ def _render_trader_detail(t) -> None:
     # ── Summary metrics ──
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Copy %/$", f"{t.proportional_pct:.0f}%" if t.sizing_mode == "proportional" else f"${t.fixed_amount:.2f}")
-    c2.metric("Buy Slippage", f"{t.buy_slippage:.0f}%")
+    _buy_ot = getattr(t, 'buy_order_type', 'market') or 'market'
+    c2.metric("Buy Order", f"{_buy_ot.upper()} ({t.buy_slippage:.0f}%)")
     c3.metric("TP", f"{t.tp_pct:.1f}%" if t.tp_pct else "—")
     c4.metric("SL", f"{t.sl_pct:.1f}%" if t.sl_pct else "—")
 
@@ -248,7 +249,8 @@ def _render_trader_detail(t) -> None:
     c5.metric("Total Spend Limit", f"${t.total_spend_limit:.2f}" if t.total_spend_limit else "—")
     c6.metric("Max / Trade", f"${t.max_per_trade:.2f}" if t.max_per_trade else "—")
     c7.metric("Max / Market", f"${t.max_per_market:.2f}" if t.max_per_market else "—")
-    c8.metric("Sell Slippage", f"{t.sell_slippage:.0f}%")
+    _sell_ot = t.sell_order_type or 'market'
+    c8.metric("Sell Order", f"{_sell_ot.upper()} ({t.sell_slippage:.0f}%)")
 
     # ── Toggle active ──
     new_active = st.toggle("Active", value=t.is_active, key=f"toggle_{t.id}")
@@ -273,7 +275,14 @@ def _render_trader_detail(t) -> None:
             proportional_pct = st.number_input("Copy Percentage (%)", value=t.proportional_pct, min_value=0.0, max_value=100.0, key=f"pp_{t.id}")
 
             st.markdown("##### Buy Settings")
-            buy_slippage = st.number_input("Market Order Slippage (%)", value=t.buy_slippage, min_value=0.0, max_value=100.0, key=f"bs_{t.id}")
+            buy_order_type = st.selectbox(
+                "Buy Order Type",
+                ["market", "limit"],
+                index=0 if (getattr(t, 'buy_order_type', 'market') or 'market') == "market" else 1,
+                key=f"bot_{t.id}",
+                help="Market (FOK): fill immediately at current price or cancel. Limit (GTC): place limit order and wait.",
+            )
+            buy_slippage = st.number_input("Buy Slippage (%)", value=t.buy_slippage, min_value=0.0, max_value=100.0, key=f"bs_{t.id}")
             buy_at_min = st.checkbox("Below Min Limit, Buy at Min", value=t.buy_at_min, key=f"bam_{t.id}")
 
             st.markdown("##### Take-Profit / Stop-Loss")
@@ -325,6 +334,7 @@ def _render_trader_detail(t) -> None:
                         "max_per_market": max_per_market,
                         "max_position_limit": max_position_limit,
                         "max_holder_market_number": max_holder_market_number,
+                        "buy_order_type": buy_order_type,
                         "sell_order_type": sell_order_type,
                         "sell_slippage": sell_slippage,
                         "max_slippage": buy_slippage,

@@ -31,7 +31,8 @@ class Trader(Base):
     fixed_amount = Column(Float, default=50.0)
     proportional_pct = Column(Float, default=100.0)
 
-    # Buy-side slippage for market orders
+    # Buy settings
+    buy_order_type = Column(String, default="market")   # market (FOK) | limit (GTC)
     buy_slippage = Column(Float, default=30.0)
 
     # Take-profit / Stop-loss (0 = disabled)

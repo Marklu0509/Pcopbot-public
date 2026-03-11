@@ -8,7 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from db.models import Base, CopyTrade, Trader
-from bot.executor import _calculate_copy_size, execute_copy_trade
+from bot.executor import _apply_slippage, _calculate_copy_size, execute_copy_trade
 
 
 @pytest.fixture()
@@ -64,6 +64,26 @@ class TestCalculateCopySize:
         t = Trader(sizing_mode="fixed", fixed_amount=75.0)
         # price=0 edge case: falls back to raw fixed_amount
         assert _calculate_copy_size(t, 999.0, 0.0) == 75.0
+
+
+class TestApplySlippage:
+    def test_buy_increases_price(self):
+        assert _apply_slippage(0.50, "BUY", 30.0) == pytest.approx(0.65)
+
+    def test_sell_decreases_price(self):
+        assert _apply_slippage(0.50, "SELL", 30.0) == pytest.approx(0.35)
+
+    def test_buy_clamped_at_099(self):
+        # 0.90 * 1.30 = 1.17 → clamped to 0.99
+        assert _apply_slippage(0.90, "BUY", 30.0) == 0.99
+
+    def test_sell_clamped_at_001(self):
+        # 0.02 * 0.70 = 0.014 → but 0.01 * (1 - 99/100) = 0.0001 → clamped to 0.01
+        assert _apply_slippage(0.01, "SELL", 99.0) == 0.01
+
+    def test_zero_slippage_unchanged(self):
+        assert _apply_slippage(0.50, "BUY", 0.0) == pytest.approx(0.50)
+        assert _apply_slippage(0.50, "SELL", 0.0) == pytest.approx(0.50)
 
 
 class TestDryRun:

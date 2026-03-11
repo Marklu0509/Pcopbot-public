@@ -37,7 +37,18 @@ def get_session_factory():
 
 def init_db() -> None:
     """Create all tables if they don't exist."""
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    # Schema migration: add columns that may not exist in older databases
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        for stmt in [
+            "ALTER TABLE traders ADD COLUMN buy_order_type VARCHAR DEFAULT 'market'",
+        ]:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass  # Column already exists
 
 
 def get_db():

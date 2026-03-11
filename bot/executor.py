@@ -72,6 +72,48 @@ def _get_clob_client():
         raise
 
 
+def _apply_slippage(price: float, side: str, slippage_pct: float) -> float:
+    """Apply slippage tolerance to get the order price.
+
+    BUY:  increase price (willing to pay more to ensure fill).
+    SELL: decrease price (willing to accept less to ensure fill).
+    Result is clamped to [0.01, 0.99] (Polymarket price bounds).
+    """
+    if side == "BUY":
+        return min(price * (1 + slippage_pct / 100.0), 0.99)
+    return max(price * (1 - slippage_pct / 100.0), 0.01)
+
+
+def _extract_price(entry) -> float:
+    """Extract the price from an orderbook entry (dict or object)."""
+    if isinstance(entry, dict):
+        return float(entry.get("price", 0))
+    return float(getattr(entry, "price", 0))
+
+
+def _get_best_price(client, token_id: str, side: str) -> float | None:
+    """Query the CLOB orderbook for the current best available price.
+
+    Returns the best ask (for BUY) or best bid (for SELL), or None on failure.
+    """
+    try:
+        book = client.get_order_book(token_id)
+        if side == "BUY":
+            entries = getattr(book, "asks", None)
+            if entries is None and isinstance(book, dict):
+                entries = book.get("asks")
+        else:
+            entries = getattr(book, "bids", None)
+            if entries is None and isinstance(book, dict):
+                entries = book.get("bids")
+        if entries:
+            prices = [_extract_price(e) for e in entries]
+            return min(prices) if side == "BUY" else max(prices)
+    except Exception as exc:
+        logger.warning("Failed to query orderbook for %s: %s", token_id, exc)
+    return None
+
+
 def execute_copy_trade(
     session: Session,
     trader: Trader,
@@ -124,10 +166,28 @@ def execute_copy_trade(
             )
             copy_size = holdings
 
-    # For slippage check we use the expected price as the "best price" proxy.
-    # In production this could query the orderbook; here we use a 0% slippage
-    # baseline so the check can still be exercised via max_slippage config.
+    # Determine order type and slippage for this side
+    if trade["side"] == "BUY":
+        order_type_str = getattr(trader, "buy_order_type", None) or "market"
+        slippage_pct = trader.buy_slippage
+    else:
+        order_type_str = trader.sell_order_type or "market"
+        slippage_pct = trader.sell_slippage
+
+    # Apply slippage to get the actual order price
+    order_price = _apply_slippage(expected_price, trade["side"], slippage_pct)
+
+    # In live mode, query orderbook for real best price (for slippage risk check)
     best_price = expected_price
+    client = None
+    if not settings.DRY_RUN:
+        try:
+            client = _get_clob_client()
+            real_price = _get_best_price(client, trade["token_id"], trade["side"])
+            if real_price is not None:
+                best_price = real_price
+        except Exception as exc:
+            logger.warning("Could not query orderbook: %s", exc)
 
     rejection = risk.run_all_checks(
         session=session,
@@ -148,24 +208,30 @@ def execute_copy_trade(
 
     if rejection is None and not settings.DRY_RUN:
         try:
-            client = _get_clob_client()
+            if client is None:
+                client = _get_clob_client()
             side = BUY if trade["side"] == "BUY" else SELL
+            ot = OrderType.FOK if order_type_str == "market" else OrderType.GTC
             order_args = OrderArgs(
                 token_id=trade["token_id"],
-                price=round(expected_price, 4),
+                price=round(order_price, 4),
                 size=round(copy_size, 4),
                 side=side,
             )
-            resp = client.post_order(order_args, OrderType.GTC)
+            resp = client.post_order(order_args, ot)
             order_id = str(resp.get("orderID") or resp.get("order_id") or "")
             status = "success"
             logger.info(
-                "Copy trade executed for trader %s: market=%s side=%s size=%.4f price=%.4f order_id=%s",
+                "Copy trade executed for trader %s: market=%s side=%s size=%.4f "
+                "price=%.4f (orig=%.4f, slippage=%.1f%%) order_type=%s order_id=%s",
                 trader.wallet_address,
                 trade["market"],
                 trade["side"],
                 copy_size,
+                order_price,
                 expected_price,
+                slippage_pct,
+                order_type_str.upper(),
                 order_id,
             )
         except Exception as exc:  # pragma: no cover
@@ -178,12 +244,16 @@ def execute_copy_trade(
             )
     elif rejection is None and settings.DRY_RUN:
         logger.info(
-            "[DRY RUN] Would copy trade for trader %s: market=%s side=%s size=%.4f price=%.4f",
+            "[DRY RUN] Would copy trade for trader %s: market=%s side=%s size=%.4f "
+            "price=%.4f (orig=%.4f, slippage=%.1f%%) order_type=%s",
             trader.wallet_address,
             trade["market"],
             trade["side"],
             copy_size,
+            order_price,
             expected_price,
+            slippage_pct,
+            order_type_str.upper(),
         )
     else:
         logger.info(
@@ -204,7 +274,7 @@ def execute_copy_trade(
         original_price=trade["price"],
         original_timestamp=trade["timestamp"].replace(tzinfo=None),
         copy_size=copy_size,
-        copy_price=expected_price,
+        copy_price=order_price,
         status=status,
         error_message=error_msg,
         order_id=order_id,
