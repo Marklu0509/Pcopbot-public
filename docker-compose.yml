@@ -33,6 +33,7 @@ services:
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/http-only.conf:/etc/nginx/conf.d/http-only.conf:ro
       - ./nginx/entrypoint.sh:/entrypoint.sh:ro
       - letsencrypt:/etc/letsencrypt
       - certbot-www:/var/www/certbot
