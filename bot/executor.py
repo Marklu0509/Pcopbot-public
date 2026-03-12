@@ -57,16 +57,23 @@ def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> 
 
 
 def _get_clob_client():
-    """Lazily import and construct the CLOB client."""
+    """Lazily import and construct the CLOB client with Level 2 auth."""
     try:
         from py_clob_client.client import ClobClient  # type: ignore
+        from py_clob_client.clob_types import ApiCreds  # type: ignore
 
+        creds = ApiCreds(
+            api_key=settings.POLYMARKET_API_KEY,
+            api_secret=settings.POLYMARKET_API_SECRET,
+            api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
+        )
         return ClobClient(
             host="https://clob.polymarket.com",
             key=settings.POLYMARKET_PRIVATE_KEY,
             chain_id=settings.POLYMARKET_CHAIN_ID,
             signature_type=2,
             funder=settings.POLYMARKET_FUNDER_ADDRESS,
+            creds=creds,
         )
     except Exception as exc:  # pragma: no cover
         logger.error("Failed to initialise ClobClient: %s", exc)
@@ -244,7 +251,8 @@ def execute_copy_trade(
                 size=round(copy_size, 4),
                 side=side,
             )
-            resp = client.post_order(order_args, ot)
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, ot)
             order_id = str(resp.get("orderID") or resp.get("order_id") or "")
 
             if ot == OrderType.GTC and order_id:
@@ -271,7 +279,8 @@ def execute_copy_trade(
                                 size=round(copy_size, 4),
                                 side=side,
                             )
-                            fok_resp = client.post_order(fok_args, OrderType.FOK)
+                            signed_fok = client.create_order(fok_args)
+                            fok_resp = client.post_order(signed_fok, OrderType.FOK)
                             order_id = str(fok_resp.get("orderID") or fok_resp.get("order_id") or "")
                             status = "success"
                             logger.info("FOK fallback succeeded: order_id=%s", order_id)

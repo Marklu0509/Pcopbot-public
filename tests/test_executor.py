@@ -124,7 +124,9 @@ class TestBelowThreshold:
 class TestLiveExecution:
     def test_successful_order_sets_order_id(self, session, trader):
         mock_resp = {"orderID": "order-999"}
+        mock_signed_order = MagicMock()
         mock_clob = MagicMock()
+        mock_clob.create_order.return_value = mock_signed_order
         mock_clob.post_order.return_value = mock_resp
 
         with patch("bot.executor.settings") as mock_settings, \
@@ -138,6 +140,8 @@ class TestLiveExecution:
 
         assert ct.status == "success"
         assert ct.order_id == "order-999"
+        mock_clob.create_order.assert_called_once()
+        mock_clob.post_order.assert_called_once()
 
 
 class TestSellCap:

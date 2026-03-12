@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from db.models import Base, CopyTrade, Trader
 from bot.risk import (
     STATUS_BELOW_THRESHOLD,
+    STATUS_BELOW_MINIMUM_ORDER,
     STATUS_POSITION_LIMIT,
     STATUS_SLIPPAGE_EXCEEDED,
     check_min_threshold,
@@ -232,17 +233,19 @@ class TestRunAllChecks:
         return run_all_checks(session, trader, **defaults)
 
     def test_all_pass(self, session, trader):
-        assert self._call(session, trader) is None
+        # copy_size=10 * price=0.5 = $5, but minimum order is $15
+        # Use larger values to pass minimum order check
+        assert self._call(session, trader, copy_size=40.0) is None
 
     def test_per_trade_limit_rejects_small_trade(self, session, trader):
-        trader.min_per_trade = 10.0
-        session.commit()
-        # copy_size=1 * price=0.5 = $0.50 < $10 min
-        result = self._call(session, trader, copy_size=1.0)
+        trader.min_per_trade = 100.0
+        session.commit()        
+        # copy_size=40 * price=0.5 = $20 < $100 min
+        result = self._call(session, trader, copy_size=40.0)
         assert result == STATUS_BELOW_THRESHOLD
 
     def test_slippage_checked(self, session, trader):
-        result = self._call(session, trader, best_price=0.55)  # 10% slippage
+        result = self._call(session, trader, copy_size=40.0, best_price=0.55)  # 10% slippage
         assert result == STATUS_SLIPPAGE_EXCEEDED
 
     def test_sell_skips_buy_spending_limits(self, session, trader):
@@ -250,7 +253,7 @@ class TestRunAllChecks:
         trader.max_per_trade = 1.0  # Would reject BUY due to spending limit
         session.commit()
         # SELL should pass — max_per_trade only applies to BUY
-        result = self._call(session, trader, side="SELL")
+        result = self._call(session, trader, side="SELL", copy_size=40.0)
         assert result is None
 
     def test_sell_still_checks_ignore_trades_under(self, session, trader):
@@ -259,3 +262,9 @@ class TestRunAllChecks:
         session.commit()
         result = self._call(session, trader, side="SELL")
         assert result == STATUS_BELOW_THRESHOLD
+
+    def test_below_minimum_order_rejected(self, session, trader):
+        """Orders below Polymarket minimum ($15) should be rejected."""
+        # copy_size=10 * price=0.5 = $5 < $15 minimum
+        result = self._call(session, trader, copy_size=10.0)
+        assert result == STATUS_BELOW_MINIMUM_ORDER
