@@ -57,22 +57,34 @@ def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> 
 
 
 def _get_clob_client():
-    """Lazily import and construct the CLOB client with Level 2 auth."""
+    """Lazily import and construct the CLOB client with Level 2 auth.
+
+    Credentials are re-read each call so dashboard changes take effect
+    without restarting the bot.
+    """
     try:
         from py_clob_client.client import ClobClient  # type: ignore
         from py_clob_client.clob_types import ApiCreds  # type: ignore
+        from config.settings import _get_credential
+
+        api_key = _get_credential("POLYMARKET_API_KEY", "polymarket_api_key")
+        api_secret = _get_credential("POLYMARKET_API_SECRET", "polymarket_api_secret")
+        api_passphrase = _get_credential("POLYMARKET_API_PASSPHRASE", "polymarket_api_passphrase")
+        private_key = _get_credential("POLYMARKET_PRIVATE_KEY", "polymarket_private_key")
+        funder = _get_credential("POLYMARKET_FUNDER_ADDRESS", "polymarket_funder_address")
+        chain_id = int(_get_credential("POLYMARKET_CHAIN_ID", "polymarket_chain_id") or "137")
 
         creds = ApiCreds(
-            api_key=settings.POLYMARKET_API_KEY,
-            api_secret=settings.POLYMARKET_API_SECRET,
-            api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
         )
         return ClobClient(
             host="https://clob.polymarket.com",
-            key=settings.POLYMARKET_PRIVATE_KEY,
-            chain_id=settings.POLYMARKET_CHAIN_ID,
+            key=private_key,
+            chain_id=chain_id,
             signature_type=2,
-            funder=settings.POLYMARKET_FUNDER_ADDRESS,
+            funder=funder,
             creds=creds,
         )
     except Exception as exc:  # pragma: no cover
