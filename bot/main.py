@@ -99,39 +99,65 @@ def _sync_positions(session) -> None:
 
 
 def _update_pnl(session) -> None:
-    """Update PnL on open copy-trade positions using current prices from Position table.
+    """Update unrealized PnL on open BUY positions using current market prices.
 
-    For each BUY copy trade that hasn't been offset by a SELL, compute
-    unrealized PnL = (cur_price - copy_price) * copy_size.
-    For SELL copy trades, PnL = (copy_price - avg_buy_price) * copy_size.
+    - BUY trades: unrealized PnL = (cur_price - buy_price) * copy_size.
+      Only updated while we still hold shares for that token (net > 0).
+      Once fully sold, BUY pnl is set to 0 (the profit was captured
+      as realized PnL on the SELL record).
+    - SELL trades: pnl is the realized gain/loss, set at execution time
+      in executor.py.  NOT updated here.
     """
-    # Build a price lookup from Position table: (condition_id, outcome) -> cur_price
-    positions = session.query(Position.condition_id, Position.outcome, Position.cur_price).all()
-    price_map = {(r[0], r[1]): r[2] for r in positions}
+    from sqlalchemy import func, distinct
+    from bot.executor import _get_net_holdings
 
+    # 1. Find all tokens we have open BUY trades on
+    open_buys = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .all()
+    )
+    if not open_buys:
+        return
+
+    # 2. Collect unique (trader_id, token_id) pairs and condition_ids for price lookup
+    token_traders: dict[tuple[int, str], list[CopyTrade]] = {}
+    condition_ids: set[str] = set()
+    for ct in open_buys:
+        key = (ct.trader_id, ct.original_token_id)
+        token_traders.setdefault(key, []).append(ct)
+        condition_ids.add(ct.original_market)
+
+    # 3. Fetch current prices from Gamma API
+    price_map = tracker.fetch_token_prices(list(condition_ids))
     if not price_map:
         return
 
-    # Update all open copy trades
-    open_trades = (
-        session.query(CopyTrade)
-        .filter(CopyTrade.status.in_(["success", "dry_run"]))
-        .all()
-    )
+    # 4. Update unrealized PnL on BUY records
     updated = 0
-    for ct in open_trades:
-        cur_price = price_map.get((ct.original_market, ct.outcome))
+    for (trader_id, token_id), buys in token_traders.items():
+        cur_price = price_map.get(token_id)
         if cur_price is None:
             continue
-        if ct.original_side == "BUY":
-            ct.pnl = round((cur_price - (ct.copy_price or 0)) * ct.copy_size, 4)
-        else:
-            ct.pnl = round(((ct.copy_price or 0) - cur_price) * ct.copy_size, 4)
-        updated += 1
+
+        # Check if we still hold shares for this token
+        net = _get_net_holdings(session, trader_id, token_id)
+
+        for ct in buys:
+            if net > 0:
+                # Still holding — compute unrealized PnL
+                ct.pnl = round((cur_price - (ct.copy_price or 0)) * ct.copy_size, 4)
+            else:
+                # Fully sold — unrealized PnL is 0 (realized PnL is on SELL records)
+                ct.pnl = 0.0
+            updated += 1
 
     if updated:
         session.commit()
-        logger.info("Updated PnL on %d copy trade(s).", updated)
+        logger.info("Updated unrealized PnL on %d BUY trade(s).", updated)
 
 
 def _poll_once(session) -> None:

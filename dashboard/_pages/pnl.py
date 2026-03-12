@@ -60,11 +60,14 @@ def render() -> None:
     success_count = len(executed)
     success_rate = success_count / total_trades * 100 if total_trades else 0.0
 
-    # Investment metrics (buys only)
+    # Separate realized (SELL) and unrealized (BUY) PnL
     buys = executed[executed["side"] == "BUY"]
+    sells = executed[executed["side"] == "SELL"]
+    unrealized_pnl = buys["pnl"].sum()
+    realized_pnl = sells["pnl"].sum()
     total_invested = buys["cost"].sum()
-    total_revenue = executed[executed["side"] == "SELL"]["cost"].sum()
-    net_pnl = total_pnl
+    total_revenue = sells["cost"].sum()
+    net_pnl = realized_pnl + unrealized_pnl
     roi = (net_pnl / total_invested * 100) if total_invested > 0 else 0
 
     # Win rate per market
@@ -81,8 +84,8 @@ def render() -> None:
     r1c4.metric("Total Trades", total_trades)
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    r2c1.metric("Buy Volume", f"${total_invested:,.2f}")
-    r2c2.metric("Sell Revenue", f"${total_revenue:,.2f}")
+    r2c1.metric("Realized PnL", f"${realized_pnl:+,.2f}")
+    r2c2.metric("Unrealized PnL", f"${unrealized_pnl:+,.2f}")
     r2c3.metric("Execution Rate", f"{success_rate:.1f}%")
     r2c4.metric("Win Rate (by market)", f"{win_rate:.0f}% ({wins}/{total_markets})")
 

@@ -69,6 +69,38 @@ def fetch_market(condition_id: str) -> dict:
         return {}
 
 
+def fetch_token_prices(condition_ids: list[str]) -> dict[str, float]:
+    """Fetch current prices for tokens by their market condition_ids.
+
+    Queries the Gamma API and returns a mapping of
+    ``{token_id: current_price}`` for every token across the requested
+    markets.
+    """
+    price_map: dict[str, float] = {}
+    # Batch by condition_id (Gamma API handles one market per request)
+    for cid in condition_ids:
+        try:
+            data = fetch_market(cid)
+            if not data:
+                continue
+            token_ids = data.get("clobTokenIds", [])
+            outcome_prices = data.get("outcomePrices", [])
+            if isinstance(token_ids, str):
+                import json
+                token_ids = json.loads(token_ids)
+            if isinstance(outcome_prices, str):
+                import json
+                outcome_prices = json.loads(outcome_prices)
+            for tid, price_str in zip(token_ids, outcome_prices):
+                try:
+                    price_map[tid] = float(price_str)
+                except (ValueError, TypeError):
+                    pass
+        except Exception as exc:
+            logger.warning("Error fetching prices for market %s: %s", cid, exc)
+    return price_map
+
+
 def parse_trade(raw: dict) -> dict[str, Any]:
     """Normalise a raw trade dict from the Data API ``/activity`` endpoint.
 

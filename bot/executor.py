@@ -42,6 +42,33 @@ def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
     return max(buy_total - sell_total, 0.0)
 
 
+def _get_avg_buy_price(session: Session, trader_id: int, token_id: str) -> float:
+    """Return the weighted-average buy price for a trader+token.
+
+    Weighted average = SUM(copy_size * copy_price) / SUM(copy_size) across
+    all successful/dry_run BUY trades for that token.
+    """
+    from sqlalchemy import func
+    result = (
+        session.query(
+            func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0),
+            func.coalesce(func.sum(CopyTrade.copy_size), 0.0),
+        )
+        .filter(
+            CopyTrade.trader_id == trader_id,
+            CopyTrade.original_token_id == token_id,
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .first()
+    )
+    total_cost, total_size = result
+    if total_size > 0:
+        return total_cost / total_size
+    return 0.0
+    return max(buy_total - sell_total, 0.0)
+
+
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
     """Determine the copy trade size (in shares) based on the trader's sizing mode.
 
@@ -339,6 +366,12 @@ def execute_copy_trade(
     # in live mode, use the order limit price (actual fill may differ).
     recorded_price = expected_price if settings.DRY_RUN else order_price
 
+    # Calculate realized PnL for SELL trades at execution time
+    realized_pnl = 0.0
+    if trade["side"] == "SELL" and status in ("success", "dry_run") and copy_size > 0:
+        avg_buy = _get_avg_buy_price(session, trader.id, trade["token_id"])
+        realized_pnl = round((recorded_price - avg_buy) * copy_size, 4)
+
     copy_trade = CopyTrade(
         trader_id=trader.id,
         original_trade_id=trade["trade_id"],
@@ -355,6 +388,7 @@ def execute_copy_trade(
         status=status,
         error_message=error_msg,
         order_id=order_id,
+        pnl=realized_pnl,
         executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     session.add(copy_trade)
