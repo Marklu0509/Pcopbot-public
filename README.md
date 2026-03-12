@@ -60,10 +60,23 @@ streamlit run dashboard/app.py
 cp .env.example .env
 # Edit .env with your credentials and set DASHBOARD_PASSWORD
 
-# 2. Build and start
+# 2. Set your domain in nginx configs
+# Replace YOUR_DOMAIN in nginx/nginx.conf, nginx/http-only.conf,
+# and nginx/entrypoint.sh with your actual domain (e.g. bot.example.com)
+
+# 3. Build and start
 docker compose up -d --build
 
-# Dashboard available at http://<server-ip>:8501
+# 4. Obtain SSL certificate (first time only)
+docker compose run --rm --entrypoint "certbot" certbot certonly \
+  --webroot -w /var/www/certbot \
+  -d your-domain.com \
+  --agree-tos --no-eff-email -m your@email.com
+
+# 5. Restart nginx to load the certificate
+docker compose up -d --force-recreate nginx
+
+# Dashboard available at https://your-domain.com
 ```
 
 ## Project Structure

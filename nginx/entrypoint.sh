@@ -1,5 +1,5 @@
 #!/bin/sh
-CERT_DIR="/etc/letsencrypt/live/bot.marklu.page"
+CERT_DIR="/etc/letsencrypt/live/${DOMAIN:-YOUR_DOMAIN}"
 
 # Remove any default configs shipped with nginx:alpine
 rm -f /etc/nginx/conf.d/*.conf
