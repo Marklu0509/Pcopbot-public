@@ -58,22 +58,19 @@ streamlit run dashboard/app.py
 ```bash
 # 1. Configure environment
 cp .env.example .env
-# Edit .env with your credentials and set DASHBOARD_PASSWORD
+# Edit .env with your credentials, set DASHBOARD_PASSWORD and DOMAIN
+# Example: DOMAIN=bot.example.com
 
-# 2. Set your domain in nginx configs
-# Replace YOUR_DOMAIN in nginx/nginx.conf, nginx/http-only.conf,
-# and nginx/entrypoint.sh with your actual domain (e.g. bot.example.com)
-
-# 3. Build and start
+# 2. Build and start
 docker compose up -d --build
 
-# 4. Obtain SSL certificate (first time only)
+# 3. Obtain SSL certificate (first time only)
 docker compose run --rm --entrypoint "certbot" certbot certonly \
   --webroot -w /var/www/certbot \
   -d your-domain.com \
   --agree-tos --no-eff-email -m your@email.com
 
-# 5. Restart nginx to load the certificate
+# 4. Restart nginx to load the certificate
 docker compose up -d --force-recreate nginx
 
 # Dashboard available at https://your-domain.com
@@ -122,6 +119,7 @@ All configuration is via environment variables (or `.env` file):
 | `LOG_LEVEL` | `INFO` | Logging verbosity |
 | `STREAMLIT_PORT` | `8501` | Dashboard port |
 | `DASHBOARD_PASSWORD` | — | Password for dashboard login (empty = no auth) |
+| `DOMAIN` | — | Domain name for nginx (e.g. `bot.example.com`) |
 
 ## Per-Trader Settings (via Dashboard)
 
