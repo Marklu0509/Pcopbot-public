@@ -16,6 +16,9 @@ STATUS_POSITION_LIMIT = "position_limit"
 STATUS_SLIPPAGE_EXCEEDED = "slippage_exceeded"
 STATUS_BELOW_MINIMUM_ORDER = "below_minimum_order"
 
+# Hard floor: reject orders below $1 USD
+MINIMUM_ORDER_VALUE_USD = 1.0
+
 
 def check_min_threshold(copy_size: float, trader: Trader) -> Optional[str]:
     """Return a rejection status if copy_size is below trader's min threshold."""
@@ -210,7 +213,6 @@ def run_all_checks(
     original_size: float,
     original_price: float,
     side: str,
-    minimum_order_size: float = 0.0,
 ) -> Optional[str]:
     """Run all risk checks in order and return the first rejection status, or None if OK."""
     # ── Filters that apply to ALL trades (BUY and SELL) ──
@@ -244,11 +246,12 @@ def run_all_checks(
         if rejection:
             return rejection
 
-    # ── Minimum order size in shares (per-market CLOB requirement, applies to all) ──
-    if minimum_order_size > 0 and copy_size < minimum_order_size:
+    # ── Minimum order value $1 USD hard floor ──
+    order_value = copy_size * expected_price
+    if order_value < MINIMUM_ORDER_VALUE_USD:
         logger.info(
-            "Order size %.4f shares below market minimum %.1f shares for trader %s",
-            copy_size, minimum_order_size, trader.wallet_address,
+            "Order value $%.2f below $%.2f minimum for trader %s",
+            order_value, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
         )
         return STATUS_BELOW_MINIMUM_ORDER
 
