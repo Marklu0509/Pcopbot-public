@@ -16,9 +16,6 @@ STATUS_POSITION_LIMIT = "position_limit"
 STATUS_SLIPPAGE_EXCEEDED = "slippage_exceeded"
 STATUS_BELOW_MINIMUM_ORDER = "below_minimum_order"
 
-# Polymarket CLOB minimum order size in USD
-MINIMUM_ORDER_SIZE_USD = 15.0
-
 
 def check_min_threshold(copy_size: float, trader: Trader) -> Optional[str]:
     """Return a rejection status if copy_size is below trader's min threshold."""
@@ -213,6 +210,7 @@ def run_all_checks(
     original_size: float,
     original_price: float,
     side: str,
+    minimum_order_size: float = 0.0,
 ) -> Optional[str]:
     """Run all risk checks in order and return the first rejection status, or None if OK."""
     # ── Filters that apply to ALL trades (BUY and SELL) ──
@@ -246,14 +244,15 @@ def run_all_checks(
         if rejection:
             return rejection
 
-    # ── Minimum order size (Polymarket CLOB requirement, applies to all) ──
-    order_value = copy_size * expected_price
-    if order_value < MINIMUM_ORDER_SIZE_USD:
-        logger.info(
-            "Order value $%.2f below Polymarket minimum $%.2f for trader %s",
-            order_value, MINIMUM_ORDER_SIZE_USD, trader.wallet_address,
-        )
-        return STATUS_BELOW_MINIMUM_ORDER
+    # ── Minimum order size (per-market CLOB requirement, applies to all) ──
+    if minimum_order_size > 0:
+        order_value = copy_size * expected_price
+        if order_value < minimum_order_size:
+            logger.info(
+                "Order value $%.2f below market minimum $%.2f for trader %s",
+                order_value, minimum_order_size, trader.wallet_address,
+            )
+            return STATUS_BELOW_MINIMUM_ORDER
 
     # ── Slippage (applies to all) ──
     rejection = check_slippage(best_price, expected_price, trader)

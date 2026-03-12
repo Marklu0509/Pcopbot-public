@@ -213,12 +213,17 @@ def execute_copy_trade(
     # In live mode, query orderbook for real best price (for slippage risk check)
     best_price = expected_price
     client = None
+    minimum_order_size = 0.0
     if not settings.DRY_RUN:
         try:
             client = _get_clob_client()
             real_price = _get_best_price(client, trade["token_id"], trade["side"])
             if real_price is not None:
                 best_price = real_price
+            # Fetch per-market minimum order size
+            market_info = client.get_market(trade["market"])
+            if isinstance(market_info, dict):
+                minimum_order_size = float(market_info.get("minimum_order_size", 0) or 0)
         except Exception as exc:
             logger.warning("Could not query orderbook: %s", exc)
 
@@ -233,6 +238,7 @@ def execute_copy_trade(
         original_size=trade["size"],
         original_price=trade["price"],
         side=trade["side"],
+        minimum_order_size=minimum_order_size,
     )
 
     status = rejection or ("dry_run" if settings.DRY_RUN else "pending")
