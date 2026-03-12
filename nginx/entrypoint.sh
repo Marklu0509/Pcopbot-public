@@ -1,16 +1,12 @@
 #!/bin/sh
-# If Let's Encrypt cert doesn't exist yet, create a temporary self-signed
-# cert so Nginx can start (certbot needs Nginx running on port 80).
+# If SSL certs don't exist, start without SSL first.
+# After certbot runs, restart nginx to pick up the real certs.
 CERT_DIR="/etc/letsencrypt/live/bot.marklu.page"
 if [ ! -f "$CERT_DIR/fullchain.pem" ]; then
-    apk add --no-cache openssl
-    mkdir -p "$CERT_DIR"
-    openssl req -x509 -nodes -days 7 \
-        -newkey rsa:2048 \
-        -keyout "$CERT_DIR/privkey.pem" \
-        -out "$CERT_DIR/fullchain.pem" \
-        -subj "/CN=bot.marklu.page"
-    echo "Temporary self-signed cert created. Run certbot to get a real one."
+    echo "No SSL cert found. Starting nginx with HTTP only."
+    echo "Run certbot, then restart nginx to enable HTTPS."
+    # Use HTTP-only config (remove ssl server block if cert missing)
+    sed -i '/listen 443/,/^}/d' /etc/nginx/conf.d/default.conf
 fi
 
 exec nginx -g "daemon off;"
