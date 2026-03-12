@@ -67,7 +67,12 @@ def render() -> None:
         proportional_pct = st.number_input("Copy Percentage (%)", value=100.0, min_value=0.0, max_value=100.0)
 
         st.markdown("##### Buy Settings")
-        buy_slippage = st.number_input("Market Order Slippage (%)", value=30.0, min_value=0.0, max_value=100.0)
+        buy_order_type = st.selectbox(
+            "Buy Order Type",
+            ["market", "limit"],
+            help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at target's price ± slippage and wait.",
+        )
+        buy_slippage = st.number_input("Buy Slippage (%)", value=30.0, min_value=0.0, max_value=100.0)
         buy_at_min = st.checkbox("Below Min Limit, Buy at Min", value=True)
 
         st.markdown("##### Take-Profit / Stop-Loss")
@@ -89,8 +94,12 @@ def render() -> None:
         max_holder_market_number = st.number_input("Max Holder Market Number (0 = no limit)", value=0, min_value=0)
 
         st.markdown("##### Sell Settings")
-        sell_order_type = st.selectbox("Sell Order Type", ["market", "limit"])
-        sell_slippage = st.number_input("Sell Market Order Slippage (%)", value=30.0, min_value=0.0, max_value=100.0)
+        sell_order_type = st.selectbox(
+            "Sell Order Type",
+            ["market", "limit"],
+            help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at target's price ± slippage and wait.",
+        )
+        sell_slippage = st.number_input("Sell Slippage (%)", value=30.0, min_value=0.0, max_value=100.0)
 
         if st.form_submit_button("🚀 Add Trader"):
             if not wallet_address.strip():
@@ -117,6 +126,7 @@ def render() -> None:
                         "max_per_market": max_per_market,
                         "max_position_limit": max_position_limit,
                         "max_holder_market_number": max_holder_market_number,
+                        "buy_order_type": buy_order_type,
                         "sell_order_type": sell_order_type,
                         "sell_slippage": sell_slippage,
                         "max_slippage": buy_slippage,

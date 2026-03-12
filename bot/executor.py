@@ -245,13 +245,13 @@ def execute_copy_trade(
     elif rejection is None and settings.DRY_RUN:
         logger.info(
             "[DRY RUN] Would copy trade for trader %s: market=%s side=%s size=%.4f "
-            "price=%.4f (orig=%.4f, slippage=%.1f%%) order_type=%s",
+            "price=%.4f (limit=%.4f, slippage=%.1f%%) order_type=%s",
             trader.wallet_address,
             trade["market"],
             trade["side"],
             copy_size,
-            order_price,
             expected_price,
+            order_price,
             slippage_pct,
             order_type_str.upper(),
         )
@@ -261,6 +261,10 @@ def execute_copy_trade(
             trader.wallet_address,
             rejection,
         )
+
+    # copy_price: in dry run, use expected_price (simulated fill);
+    # in live mode, use the order limit price (actual fill may differ).
+    recorded_price = expected_price if settings.DRY_RUN else order_price
 
     copy_trade = CopyTrade(
         trader_id=trader.id,
@@ -274,7 +278,7 @@ def execute_copy_trade(
         original_price=trade["price"],
         original_timestamp=trade["timestamp"].replace(tzinfo=None),
         copy_size=copy_size,
-        copy_price=order_price,
+        copy_price=recorded_price,
         status=status,
         error_message=error_msg,
         order_id=order_id,

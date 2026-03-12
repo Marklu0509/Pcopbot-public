@@ -280,7 +280,7 @@ def _render_trader_detail(t) -> None:
                 ["market", "limit"],
                 index=0 if (getattr(t, 'buy_order_type', 'market') or 'market') == "market" else 1,
                 key=f"bot_{t.id}",
-                help="Market (FOK): fill immediately at current price or cancel. Limit (GTC): place limit order and wait.",
+                help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at target's price ± slippage and wait.",
             )
             buy_slippage = st.number_input("Buy Slippage (%)", value=t.buy_slippage, min_value=0.0, max_value=100.0, key=f"bs_{t.id}")
             buy_at_min = st.checkbox("Below Min Limit, Buy at Min", value=t.buy_at_min, key=f"bam_{t.id}")
@@ -304,13 +304,15 @@ def _render_trader_detail(t) -> None:
             max_holder_market_number = st.number_input("Max Holder Market Number (0 = no limit)", value=t.max_holder_market_number, min_value=0, key=f"mhm_{t.id}")
 
             st.markdown("##### Sell Settings")
+            _cur_sell_ot = t.sell_order_type or "market"
             sell_order_type = st.selectbox(
                 "Sell Order Type",
                 ["market", "limit"],
-                index=0 if t.sell_order_type == "market" else 1,
+                index=0 if _cur_sell_ot == "market" else 1,
                 key=f"sot_{t.id}",
+                help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at target's price ± slippage and wait.",
             )
-            sell_slippage = st.number_input("Sell Market Order Slippage (%)", value=t.sell_slippage, min_value=0.0, max_value=100.0, key=f"ss_{t.id}")
+            sell_slippage = st.number_input("Sell Slippage (%)", value=t.sell_slippage, min_value=0.0, max_value=100.0, key=f"ss_{t.id}")
 
             if st.form_submit_button("💾 Save"):
                 _update_trader(
