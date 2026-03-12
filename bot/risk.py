@@ -244,15 +244,13 @@ def run_all_checks(
         if rejection:
             return rejection
 
-    # ── Minimum order size (per-market CLOB requirement, applies to all) ──
-    if minimum_order_size > 0:
-        order_value = copy_size * expected_price
-        if order_value < minimum_order_size:
-            logger.info(
-                "Order value $%.2f below market minimum $%.2f for trader %s",
-                order_value, minimum_order_size, trader.wallet_address,
-            )
-            return STATUS_BELOW_MINIMUM_ORDER
+    # ── Minimum order size in shares (per-market CLOB requirement, applies to all) ──
+    if minimum_order_size > 0 and copy_size < minimum_order_size:
+        logger.info(
+            "Order size %.4f shares below market minimum %.1f shares for trader %s",
+            copy_size, minimum_order_size, trader.wallet_address,
+        )
+        return STATUS_BELOW_MINIMUM_ORDER
 
     # ── Slippage (applies to all) ──
     rejection = check_slippage(best_price, expected_price, trader)

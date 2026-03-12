@@ -262,10 +262,15 @@ class TestRunAllChecks:
         assert result == STATUS_BELOW_THRESHOLD
 
     def test_below_minimum_order_rejected(self, session, trader):
-        """Orders below per-market minimum should be rejected."""
-        # copy_size=10 * price=0.5 = $5 < $15 minimum
+        """Orders below per-market minimum shares should be rejected."""
+        # copy_size=10 shares < 15 share minimum
         result = self._call(session, trader, copy_size=10.0, minimum_order_size=15.0)
         assert result == STATUS_BELOW_MINIMUM_ORDER
+
+    def test_above_minimum_order_passes(self, session, trader):
+        """Orders at or above per-market minimum shares should pass."""
+        result = self._call(session, trader, copy_size=20.0, minimum_order_size=15.0)
+        assert result is None
 
     def test_no_minimum_order_size_allows_small_orders(self, session, trader):
         """When minimum_order_size is 0 (default), no minimum check applies."""
