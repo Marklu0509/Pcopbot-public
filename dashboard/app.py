@@ -46,7 +46,7 @@ st.sidebar.divider()
 st.sidebar.title("Pcopbot 🤖")
 page = st.sidebar.radio(
     "Navigate",
-    ["Traders", "Add Trader", "History", "PnL", "Logs", "Settings", "Wallet / API"],
+    ["Traders", "Add Trader", "History", "PnL", "Logs", "Settings"],
 )
 
 _pages_dir = Path(__file__).resolve().parent / "_pages"
@@ -72,5 +72,3 @@ elif page == "Logs":
     _load_page("logs").render()
 elif page == "Settings":
     _load_page("settings").render()
-elif page == "Wallet / API":
-    _load_page("wallet").render()
