@@ -34,12 +34,23 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/entrypoint.sh:/entrypoint.sh:ro
-      - nginx-certs:/etc/nginx/certs
+      - letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     depends_on:
       - dashboard
     restart: unless-stopped
 
+  certbot:
+    image: certbot/certbot
+    container_name: pcopbot-certbot
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: /bin/true
+    # Run manually: docker compose run --rm certbot certonly ...
+
 volumes:
   db-data:
-  nginx-certs:
+  letsencrypt:
+  certbot-www:

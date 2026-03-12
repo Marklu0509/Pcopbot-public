@@ -1,16 +1,15 @@
 #!/bin/sh
-# Generate self-signed certificate if it doesn't exist
-CERT_DIR="/etc/nginx/certs"
-if [ ! -f "$CERT_DIR/selfsigned.crt" ]; then
+# If Let's Encrypt cert doesn't exist yet, create a temporary self-signed
+# cert so Nginx can start (certbot needs Nginx running on port 80).
+CERT_DIR="/etc/letsencrypt/live/marklu.page"
+if [ ! -f "$CERT_DIR/fullchain.pem" ]; then
     mkdir -p "$CERT_DIR"
-    openssl req -x509 -nodes -days 365 \
+    openssl req -x509 -nodes -days 7 \
         -newkey rsa:2048 \
-        -keyout "$CERT_DIR/selfsigned.key" \
-        -out "$CERT_DIR/selfsigned.crt" \
-        -subj "/CN=pcopbot/O=Pcopbot/C=US"
-    echo "Self-signed certificate generated."
-else
-    echo "Certificate already exists, skipping generation."
+        -keyout "$CERT_DIR/privkey.pem" \
+        -out "$CERT_DIR/fullchain.pem" \
+        -subj "/CN=marklu.page"
+    echo "Temporary self-signed cert created. Run certbot to get a real one."
 fi
 
 exec nginx -g "daemon off;"
