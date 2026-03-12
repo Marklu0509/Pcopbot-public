@@ -3,6 +3,7 @@
 # cert so Nginx can start (certbot needs Nginx running on port 80).
 CERT_DIR="/etc/letsencrypt/live/bot.marklu.page"
 if [ ! -f "$CERT_DIR/fullchain.pem" ]; then
+    apk add --no-cache openssl
     mkdir -p "$CERT_DIR"
     openssl req -x509 -nodes -days 7 \
         -newkey rsa:2048 \
