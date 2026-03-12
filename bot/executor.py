@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -114,6 +115,31 @@ def _get_best_price(client, token_id: str, side: str) -> float | None:
     return None
 
 
+def _wait_for_fill(client, order_id: str, timeout: int) -> bool:
+    """Poll order status until filled or timeout (seconds).
+
+    Returns True if the order was fully filled, False otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    poll_interval = min(3, max(1, timeout // 10))
+    while time.monotonic() < deadline:
+        try:
+            order = client.get_order(order_id)
+            raw_status = ""
+            if isinstance(order, dict):
+                raw_status = order.get("status", "").upper()
+            else:
+                raw_status = getattr(order, "status", "").upper()
+            if raw_status in ("FILLED", "MATCHED"):
+                return True
+            if raw_status in ("CANCELLED", "EXPIRED", "REJECTED"):
+                return False
+        except Exception as exc:
+            logger.warning("Error polling order %s: %s", order_id, exc)
+        time.sleep(poll_interval)
+    return False
+
+
 def execute_copy_trade(
     session: Session,
     trader: Trader,
@@ -220,7 +246,45 @@ def execute_copy_trade(
             )
             resp = client.post_order(order_args, ot)
             order_id = str(resp.get("orderID") or resp.get("order_id") or "")
-            status = "success"
+
+            if ot == OrderType.GTC and order_id:
+                # Poll for GTC fill, cancel + fallback if timeout
+                timeout = getattr(trader, "limit_timeout_seconds", 30) or 30
+                fallback = getattr(trader, "limit_fallback_market", True)
+                filled = _wait_for_fill(client, order_id, timeout)
+                if filled:
+                    status = "success"
+                else:
+                    # Cancel the unfilled GTC order
+                    try:
+                        client.cancel(order_id)
+                        logger.info("Cancelled unfilled GTC order %s", order_id)
+                    except Exception as cancel_exc:
+                        logger.warning("Failed to cancel GTC order %s: %s", order_id, cancel_exc)
+
+                    if fallback:
+                        logger.info("Falling back to FOK market order for trader %s", trader.wallet_address)
+                        try:
+                            fok_args = OrderArgs(
+                                token_id=trade["token_id"],
+                                price=round(order_price, 4),
+                                size=round(copy_size, 4),
+                                side=side,
+                            )
+                            fok_resp = client.post_order(fok_args, OrderType.FOK)
+                            order_id = str(fok_resp.get("orderID") or fok_resp.get("order_id") or "")
+                            status = "success"
+                            logger.info("FOK fallback succeeded: order_id=%s", order_id)
+                        except Exception as fok_exc:
+                            status = "failed"
+                            error_msg = f"GTC timeout + FOK fallback failed: {fok_exc}"
+                            logger.error("FOK fallback FAILED: %s", fok_exc)
+                    else:
+                        status = "failed"
+                        error_msg = f"GTC order not filled within {timeout}s (no fallback)"
+            else:
+                status = "success"
+
             logger.info(
                 "Copy trade executed for trader %s: market=%s side=%s size=%.4f "
                 "price=%.4f (orig=%.4f, slippage=%.1f%%) order_type=%s order_id=%s",

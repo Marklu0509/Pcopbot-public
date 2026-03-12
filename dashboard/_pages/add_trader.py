@@ -101,6 +101,16 @@ def render() -> None:
         )
         sell_slippage = st.number_input("Sell Slippage (%)", value=30.0, min_value=0.0, max_value=100.0)
 
+        st.markdown("##### Limit Order Settings")
+        limit_timeout_seconds = st.number_input(
+            "Limit Order Timeout (seconds)", value=30, min_value=5, max_value=300, step=5,
+            help="How long to wait for a limit (GTC) order to fill before cancelling.",
+        )
+        limit_fallback_market = st.checkbox(
+            "Fallback to Market if Limit times out", value=True,
+            help="If a limit order doesn't fill within the timeout, automatically retry with a market (FOK) order.",
+        )
+
         if st.form_submit_button("🚀 Add Trader"):
             if not wallet_address.strip():
                 st.error("Wallet address is required.")
@@ -129,6 +139,8 @@ def render() -> None:
                         "buy_order_type": buy_order_type,
                         "sell_order_type": sell_order_type,
                         "sell_slippage": sell_slippage,
+                        "limit_timeout_seconds": limit_timeout_seconds,
+                        "limit_fallback_market": limit_fallback_market,
                         "max_slippage": buy_slippage,
                         "min_trade_threshold": min_per_trade,
                         "is_active": True,

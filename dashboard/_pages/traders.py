@@ -314,6 +314,25 @@ def _render_trader_detail(t) -> None:
             )
             sell_slippage = st.number_input("Sell Slippage (%)", value=t.sell_slippage, min_value=0.0, max_value=100.0, key=f"ss_{t.id}")
 
+            st.markdown("##### Limit Order Settings")
+            _cur_timeout = getattr(t, 'limit_timeout_seconds', 30) or 30
+            limit_timeout_seconds = st.number_input(
+                "Limit Order Timeout (seconds)",
+                value=_cur_timeout,
+                min_value=5, max_value=300, step=5,
+                key=f"lto_{t.id}",
+                help="How long to wait for a limit (GTC) order to fill before cancelling.",
+            )
+            _cur_fallback = getattr(t, 'limit_fallback_market', True)
+            if _cur_fallback is None:
+                _cur_fallback = True
+            limit_fallback_market = st.checkbox(
+                "Fallback to Market if Limit times out",
+                value=_cur_fallback,
+                key=f"lfm_{t.id}",
+                help="If a limit order doesn't fill within the timeout, automatically retry with a market (FOK) order.",
+            )
+
             if st.form_submit_button("💾 Save"):
                 _update_trader(
                     t.id,
@@ -339,6 +358,8 @@ def _render_trader_detail(t) -> None:
                         "buy_order_type": buy_order_type,
                         "sell_order_type": sell_order_type,
                         "sell_slippage": sell_slippage,
+                        "limit_timeout_seconds": limit_timeout_seconds,
+                        "limit_fallback_market": limit_fallback_market,
                         "max_slippage": buy_slippage,
                         "min_trade_threshold": min_per_trade,
                     },

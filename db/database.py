@@ -44,6 +44,8 @@ def init_db() -> None:
     with engine.begin() as conn:
         for stmt in [
             "ALTER TABLE traders ADD COLUMN buy_order_type VARCHAR DEFAULT 'market'",
+            "ALTER TABLE traders ADD COLUMN limit_timeout_seconds INTEGER DEFAULT 30",
+            "ALTER TABLE traders ADD COLUMN limit_fallback_market BOOLEAN DEFAULT 1",
         ]:
             try:
                 conn.execute(text(stmt))

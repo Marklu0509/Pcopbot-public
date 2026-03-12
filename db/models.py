@@ -63,6 +63,10 @@ class Trader(Base):
     sell_order_type = Column(String, default="market")  # market | limit
     sell_slippage = Column(Float, default=30.0)
 
+    # Limit order management
+    limit_timeout_seconds = Column(Integer, default=30)    # seconds to wait for GTC fill
+    limit_fallback_market = Column(Boolean, default=True)  # fallback to FOK if GTC times out
+
     # Legacy / convenience aliases
     max_position_limit = Column(Float, default=500.0)
     max_slippage = Column(Float, default=30.0)
