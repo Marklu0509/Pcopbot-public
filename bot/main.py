@@ -160,6 +160,77 @@ def _update_pnl(session) -> None:
         logger.info("Updated unrealized PnL on %d BUY trade(s).", updated)
 
 
+def _refresh_copy_trade_fill_prices(session) -> None:
+    """Backfill copy_price from actual filled/average price using order_id.
+
+    This auto-corrects historical records where copy_price may have been stored
+    as a slippage-adjusted order price rather than the actual fill price.
+    """
+    if settings.DRY_RUN:
+        return
+
+    rows = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.status == "success",
+            CopyTrade.order_id.is_not(None),
+            CopyTrade.order_id != "",
+        )
+        .order_by(CopyTrade.executed_at.desc())
+        .limit(300)
+        .all()
+    )
+    if not rows:
+        return
+
+    try:
+        from bot.executor import _get_clob_client, _to_float_or_none  # reuse proven helpers
+        client = _get_clob_client()
+    except Exception as exc:
+        logger.warning("Skip fill-price refresh: failed to init CLOB client: %s", exc)
+        return
+
+    updated = 0
+    for ct in rows:
+        try:
+            order = client.get_order(ct.order_id)
+            if isinstance(order, dict):
+                candidates = [
+                    order.get("avgPrice"),
+                    order.get("averagePrice"),
+                    order.get("filledAvgPrice"),
+                    order.get("price"),
+                ]
+            else:
+                candidates = [
+                    getattr(order, "avgPrice", None),
+                    getattr(order, "averagePrice", None),
+                    getattr(order, "filledAvgPrice", None),
+                    getattr(order, "price", None),
+                ]
+
+            actual = None
+            for raw in candidates:
+                parsed = _to_float_or_none(raw)
+                if parsed is not None:
+                    actual = parsed
+                    break
+
+            if actual is None:
+                continue
+
+            current = ct.copy_price or 0.0
+            if abs(current - actual) > 1e-6:
+                ct.copy_price = actual
+                updated += 1
+        except Exception:
+            continue
+
+    if updated:
+        session.commit()
+        logger.info("Refreshed copy_price from actual fills on %d trade(s).", updated)
+
+
 def _poll_once(session) -> None:
     """One iteration: poll all active traders and copy new trades."""
     traders = session.query(Trader).filter(Trader.is_active == True).all()
@@ -233,6 +304,7 @@ def run() -> None:
             _poll_count += 1
             if _poll_count % 10 == 0:
                 try:
+                    _refresh_copy_trade_fill_prices(session)
                     _sync_positions(session)
                     _update_pnl(session)
                 except Exception as exc:
