@@ -102,7 +102,7 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
             )
             .filter(
                 CopyTrade.trader_id == trader_id,
-                CopyTrade.status.in_(["success", "dry_run"]),
+                CopyTrade.status == "success",
             )
             .all()
         )
@@ -190,7 +190,7 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
             )
             .filter(
                 CopyTrade.trader_id == trader_id,
-                CopyTrade.status.in_(["success", "dry_run"]),
+                CopyTrade.status == "success",
             )
             .all()
         )
