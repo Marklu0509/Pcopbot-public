@@ -87,8 +87,9 @@ def _load_trader_trades(trader_id: int) -> pd.DataFrame:
     return df
 
 
-def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
+def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> pd.DataFrame:
     """Aggregate current holdings per token for a trader, with current price."""
+    statuses = statuses or ["success"]
     with _SessionLocal() as session:
         rows = (
             session.query(
@@ -102,7 +103,7 @@ def _load_trader_holdings(trader_id: int) -> pd.DataFrame:
             )
             .filter(
                 CopyTrade.trader_id == trader_id,
-                CopyTrade.status == "success",
+                CopyTrade.status.in_(statuses),
             )
             .all()
         )
@@ -176,8 +177,9 @@ def _load_trader_positions(trader_id: int) -> pd.DataFrame:
     ])
 
 
-def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
+def _load_realized_pnl(trader_id: int, statuses: list[str] | None = None) -> pd.DataFrame:
     """Compute realized PnL per market/outcome from SELL copy trades."""
+    statuses = statuses or ["success"]
     with _SessionLocal() as session:
         rows = (
             session.query(
@@ -190,7 +192,7 @@ def _load_realized_pnl(trader_id: int) -> pd.DataFrame:
             )
             .filter(
                 CopyTrade.trader_id == trader_id,
-                CopyTrade.status == "success",
+                CopyTrade.status.in_(statuses),
             )
             .all()
         )
@@ -392,49 +394,81 @@ def _render_trader_detail(t) -> None:
 
     # ── Copy-Trade Holdings (our positions) ──
     st.subheader("📊 Copy-Trade Holdings")
-    holdings_df = _load_trader_holdings(t.id)
-    if holdings_df.empty:
-        st.info("No copy-trade holdings yet.")
-    else:
-        total_value = holdings_df["Value"].sum()
-        total_unrealized = holdings_df["Unrealized"].sum()
-        total_cost = (holdings_df["Avg Price"] * holdings_df["Position"]).sum()
-        pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Markets", len(holdings_df))
-        mc2.metric("Total Value", f"${total_value:,.2f}")
-        mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
-        mc4.metric("Change %", f"{pct:+.1f}%")
-        st.dataframe(
-            holdings_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
-                "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
-                "Value": st.column_config.NumberColumn(format="$%.2f"),
-                "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
-                "Change %": st.column_config.NumberColumn(format="%.1f%%"),
-            },
-        )
+    htab_live, htab_dry = st.tabs(["Live (success)", "Dry Run (simulated)"])
+
+    with htab_live:
+        holdings_df = _load_trader_holdings(t.id, statuses=["success"])
+        if holdings_df.empty:
+            st.info("No live copy-trade holdings yet.")
+        else:
+            total_value = holdings_df["Value"].sum()
+            total_unrealized = holdings_df["Unrealized"].sum()
+            total_cost = (holdings_df["Avg Price"] * holdings_df["Position"]).sum()
+            pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Markets", len(holdings_df))
+            mc2.metric("Total Value", f"${total_value:,.2f}")
+            mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
+            mc4.metric("Change %", f"{pct:+.1f}%")
+            st.dataframe(
+                holdings_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Value": st.column_config.NumberColumn(format="$%.2f"),
+                    "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
+                    "Change %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+    with htab_dry:
+        holdings_df = _load_trader_holdings(t.id, statuses=["dry_run"])
+        if holdings_df.empty:
+            st.info("No dry-run holdings yet.")
+        else:
+            total_value = holdings_df["Value"].sum()
+            total_unrealized = holdings_df["Unrealized"].sum()
+            total_cost = (holdings_df["Avg Price"] * holdings_df["Position"]).sum()
+            pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Markets", len(holdings_df))
+            mc2.metric("Total Value", f"${total_value:,.2f}")
+            mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
+            mc4.metric("Change %", f"{pct:+.1f}%")
+            st.dataframe(
+                holdings_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Value": st.column_config.NumberColumn(format="$%.2f"),
+                    "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
+                    "Change %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
 
     st.divider()
 
     # ── Realized PnL (closed / sold trades) ──
     st.subheader("💰 Realized PnL")
-    realized_df = _load_realized_pnl(t.id)
-    if realized_df.empty or len(realized_df) == 0:
-        # Show summary row of zeros
-        rm1, rm2, rm3, rm4 = st.columns(4)
-        rm1.metric("Closed Markets", 0)
-        rm2.metric("Total Invested", "$0.00")
-        rm3.metric("Total Realized", "$0.00")
-        rm4.metric("Win Rate", "—")
-        st.dataframe(realized_df, use_container_width=True, hide_index=True)
-    else:
+    rtab_live, rtab_dry = st.tabs(["Live (success)", "Dry Run (simulated)"])
+
+    def _render_realized_block(realized_df: pd.DataFrame, empty_msg: str) -> None:
+        if realized_df.empty or len(realized_df) == 0:
+            rm1, rm2, rm3, rm4 = st.columns(4)
+            rm1.metric("Closed Markets", 0)
+            rm2.metric("Total Invested", "$0.00")
+            rm3.metric("Total Realized", "$0.00")
+            rm4.metric("Win Rate", "—")
+            st.info(empty_msg)
+            st.dataframe(realized_df, use_container_width=True, hide_index=True)
+            return
+
         total_cost = realized_df["Total Cost"].sum()
         total_realized = realized_df["Realized PnL"].sum()
-        total_revenue = realized_df["Revenue"].sum()
         roi = (total_realized / total_cost * 100) if total_cost > 0 else 0
         wins = (realized_df["Realized PnL"] > 0).sum()
         total_markets = len(realized_df)
@@ -458,6 +492,18 @@ def _render_trader_detail(t) -> None:
                 "Avg Sell Price": st.column_config.NumberColumn(format="$%.4f"),
                 "ROI %": st.column_config.NumberColumn(format="%.1f%%"),
             },
+        )
+
+    with rtab_live:
+        _render_realized_block(
+            _load_realized_pnl(t.id, statuses=["success"]),
+            "No live realized PnL yet.",
+        )
+
+    with rtab_dry:
+        _render_realized_block(
+            _load_realized_pnl(t.id, statuses=["dry_run"]),
+            "No dry-run realized PnL yet.",
         )
 
     st.divider()
