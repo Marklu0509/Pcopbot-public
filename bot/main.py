@@ -32,16 +32,16 @@ class _DBLogHandler(logging.Handler):
             self.handleError(record)
 
 
-def _get_poll_interval(session_factory) -> int:
+def _get_poll_interval(session_factory) -> float:
     """Read poll interval from DB settings, falling back to env/config."""
     try:
         with session_factory() as session:
             row = session.query(BotSetting).filter(BotSetting.key == "poll_interval_seconds").first()
             if row:
-                return max(1, int(row.value))
+                return max(0.1, float(row.value))
     except Exception:
         pass
-    return settings.POLL_INTERVAL_SECONDS
+    return max(0.1, float(settings.POLL_INTERVAL_SECONDS))
 
 
 logging.basicConfig(

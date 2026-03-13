@@ -15,6 +15,9 @@ from db.models import CopyTrade, Trader
 
 logger = logging.getLogger(__name__)
 
+# If a SELL would leave less than this USD value, close out the full position.
+SELL_DUST_CLOSEOUT_USD = 1.0
+
 
 def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
     """Return net share holdings for a trader+token from successful/dry_run copy trades."""
@@ -66,7 +69,6 @@ def _get_avg_buy_price(session: Session, trader_id: int, token_id: str) -> float
     if total_size > 0:
         return total_cost / total_size
     return 0.0
-    return max(buy_total - sell_total, 0.0)
 
 
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
@@ -89,19 +91,43 @@ def _get_clob_client():
         from py_clob_client.client import ClobClient  # type: ignore
         from py_clob_client.clob_types import ApiCreds  # type: ignore
 
-        creds = ApiCreds(
-            api_key=settings.POLYMARKET_API_KEY,
-            api_secret=settings.POLYMARKET_API_SECRET,
-            api_passphrase=settings.POLYMARKET_API_PASSPHRASE,
-        )
-        return ClobClient(
+        private_key = (settings.POLYMARKET_PRIVATE_KEY or "").strip()
+        funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+        if not private_key:
+            raise ValueError("POLYMARKET_PRIVATE_KEY is empty")
+        if not funder:
+            raise ValueError("POLYMARKET_FUNDER_ADDRESS is empty")
+
+        client = ClobClient(
             host="https://clob.polymarket.com",
-            key=settings.POLYMARKET_PRIVATE_KEY,
+            key=private_key,
             chain_id=settings.POLYMARKET_CHAIN_ID,
             signature_type=2,
-            funder=settings.POLYMARKET_FUNDER_ADDRESS,
-            creds=creds,
+            funder=funder,
         )
+
+        env_api_key = (settings.POLYMARKET_API_KEY or "").strip()
+        env_api_secret = (settings.POLYMARKET_API_SECRET or "").strip()
+        env_api_passphrase = (settings.POLYMARKET_API_PASSPHRASE or "").strip()
+
+        # First, try env-provided API creds (if complete).
+        if env_api_key and env_api_secret and env_api_passphrase:
+            env_creds = ApiCreds(
+                api_key=env_api_key,
+                api_secret=env_api_secret,
+                api_passphrase=env_api_passphrase,
+            )
+            client.set_api_creds(env_creds)
+            try:
+                client.get_api_keys()
+                return client
+            except Exception as exc:
+                logger.warning("Env API creds rejected, falling back to derived creds: %s", exc)
+
+        # Fallback: derive/create API creds from private key + funder.
+        derived = client.create_or_derive_api_creds()
+        client.set_api_creds(derived)
+        return client
     except Exception as exc:  # pragma: no cover
         logger.error("Failed to initialise ClobClient: %s", exc)
         raise
@@ -223,6 +249,20 @@ def execute_copy_trade(
             logger.info(
                 "SELL capped for trader %s token %s: wanted %.4f but only hold %.4f",
                 trader.wallet_address, trade["token_id"], copy_size, holdings,
+            )
+            copy_size = holdings
+
+        remaining_size = max(holdings - copy_size, 0.0)
+        remaining_value = remaining_size * expected_price
+        if remaining_size > 0 and remaining_value < SELL_DUST_CLOSEOUT_USD:
+            logger.info(
+                "SELL closeout for trader %s token %s: remaining value $%.4f < $%.2f, "
+                "selling full holdings %.4f",
+                trader.wallet_address,
+                trade["token_id"],
+                remaining_value,
+                SELL_DUST_CLOSEOUT_USD,
+                holdings,
             )
             copy_size = holdings
 

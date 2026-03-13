@@ -64,6 +64,13 @@ def fetch_market(condition_id: str) -> dict:
         resp = _http.get(url, timeout=10)
         resp.raise_for_status()
         return resp.json()
+    except requests.HTTPError as exc:
+        status_code = getattr(exc.response, "status_code", None)
+        if status_code == 422:
+            logger.info("Market %s not available from Gamma endpoint (422).", condition_id)
+            return {}
+        logger.warning("Failed to fetch market %s: %s", condition_id, exc)
+        return {}
     except requests.RequestException as exc:
         logger.warning("Failed to fetch market %s: %s", condition_id, exc)
         return {}

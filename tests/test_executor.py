@@ -188,3 +188,25 @@ class TestSellCap:
             ct = execute_copy_trade(session, trader, _sample_trade(side="SELL"))
         assert ct.copy_size == pytest.approx(100.0)
         assert ct.status == "dry_run"
+
+    def test_sell_closes_out_when_leftover_value_below_one_dollar(self, session, trader):
+        """If a SELL would leave <$1 residual value, it should sell all holdings."""
+        buy = CopyTrade(
+            trader_id=trader.id, original_trade_id="buy-1", original_market="market-abc",
+            original_token_id="token-xyz", original_side="BUY", original_size=100.0,
+            original_price=0.5, copy_size=30.0, copy_price=0.5, status="dry_run",
+        )
+        session.add(buy)
+        session.commit()
+
+        # fixed_amount=14.8 at price=0.5 => sell 29.6 shares, leaving 0.4 shares.
+        # leftover value = 0.4 * 0.5 = $0.20 < $1, so should close out to 30.0 shares.
+        trader.fixed_amount = 14.8
+        session.commit()
+
+        with patch("bot.executor.settings") as mock_settings:
+            mock_settings.DRY_RUN = True
+            ct = execute_copy_trade(session, trader, _sample_trade(side="SELL", price=0.5))
+
+        assert ct.copy_size == pytest.approx(30.0)
+        assert ct.status == "dry_run"
