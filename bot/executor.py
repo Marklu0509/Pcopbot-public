@@ -200,6 +200,52 @@ def _wait_for_fill(client, order_id: str, timeout: int) -> bool:
     return False
 
 
+def _to_float_or_none(value) -> float | None:
+    """Best-effort float conversion for values returned by API payloads."""
+    try:
+        if value is None:
+            return None
+        parsed = float(value)
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_filled_price(client, order_id: str, fallback_price: float) -> float:
+    """Fetch actual filled/average price from order details.
+
+    Returns fallback_price when order details are unavailable or don't contain
+    a usable fill/average price.
+    """
+    if not order_id:
+        return fallback_price
+    try:
+        order = client.get_order(order_id)
+        if isinstance(order, dict):
+            candidates = [
+                order.get("avgPrice"),
+                order.get("averagePrice"),
+                order.get("filledAvgPrice"),
+                order.get("price"),
+            ]
+        else:
+            candidates = [
+                getattr(order, "avgPrice", None),
+                getattr(order, "averagePrice", None),
+                getattr(order, "filledAvgPrice", None),
+                getattr(order, "price", None),
+            ]
+
+        for raw in candidates:
+            parsed = _to_float_or_none(raw)
+            if parsed is not None:
+                return parsed
+    except Exception as exc:
+        logger.warning("Could not fetch filled price for order %s: %s", order_id, exc)
+
+    return fallback_price
+
+
 def execute_copy_trade(
     session: Session,
     trader: Trader,
@@ -402,9 +448,16 @@ def execute_copy_trade(
             rejection,
         )
 
-    # copy_price: in dry run, use expected_price (simulated fill);
-    # in live mode, use the order limit price (actual fill may differ).
-    recorded_price = expected_price if settings.DRY_RUN else order_price
+    # copy_price policy:
+    # - dry run: expected_price (simulated fill)
+    # - live success: actual filled/average price from order details
+    # - fallback: order_price when actual fill price is unavailable
+    if settings.DRY_RUN:
+        recorded_price = expected_price
+    elif status == "success":
+        recorded_price = _get_filled_price(client, order_id or "", order_price)
+    else:
+        recorded_price = order_price
 
     # Calculate realized PnL for SELL trades at execution time
     realized_pnl = 0.0
