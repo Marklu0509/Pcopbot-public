@@ -43,10 +43,14 @@ def _toggle_trader(trader_id: int, is_active: bool) -> None:
     _update_trader(trader_id, {"is_active": is_active})
 
 
-def _load_trader_trades(trader_id: int) -> pd.DataFrame:
-    """Load all copy trades for a trader, newest first."""
+def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame:
+    """Load copy trades for a trader, newest first.
+
+    By default, only recent rows are loaded for UI responsiveness.
+    Pass ``limit=None`` to load full history.
+    """
     with _SessionLocal() as session:
-        rows = (
+        query = (
             session.query(
                 CopyTrade.id,
                 CopyTrade.executed_at,
@@ -64,8 +68,10 @@ def _load_trader_trades(trader_id: int) -> pd.DataFrame:
             )
             .filter(CopyTrade.trader_id == trader_id)
             .order_by(CopyTrade.executed_at.desc())
-            .all()
         )
+        if limit is not None:
+            query = query.limit(limit)
+        rows = query.all()
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(
@@ -510,11 +516,31 @@ def _render_trader_detail(t) -> None:
 
     # ── Trade History ──
     st.subheader("📜 Trade History")
-    trades_df = _load_trader_trades(t.id)
+    c_recent, c_full = st.columns([2, 1])
+    with c_recent:
+        recent_limit = st.selectbox(
+            "Recent rows",
+            [100, 300, 500, 1000],
+            index=1,
+            key=f"history_limit_{t.id}",
+            help="Load only recent rows for faster rendering.",
+        )
+    with c_full:
+        load_full = st.toggle(
+            "Load full history",
+            value=False,
+            key=f"history_full_{t.id}",
+            help="May be slow if you have many trades.",
+        )
+
+    trades_df = _load_trader_trades(t.id, limit=None if load_full else int(recent_limit))
     if trades_df.empty:
         st.info("No trades recorded yet.")
     else:
-        st.caption(f"Total: {len(trades_df)} trades")
+        if load_full:
+            st.caption(f"Showing full history: {len(trades_df)} trades")
+        else:
+            st.caption(f"Showing latest {len(trades_df)} trades")
         st.dataframe(
             trades_df,
             use_container_width=True,
