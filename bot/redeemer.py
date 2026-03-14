@@ -203,16 +203,26 @@ def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | N
 
 # ── On-chain redemption ───────────────────────────────────────────────────────
 
-def _redeem_binary(w3, account, condition_id: str, token_id: str, outcome_index: int) -> str:
-    """Redeem a winning binary CTF position. Returns tx hash string."""
+def _redeem_binary(
+    w3, account, condition_id: str, token_id: str, outcome_index: int,
+    holder_address: str | None = None,
+) -> str:
+    """Redeem a winning binary CTF position. Returns tx hash string.
+
+    ``holder_address`` is the wallet that holds the CTF tokens (funder wallet
+    in proxy-key setups). Falls back to account.address when not provided.
+    """
+    owner = holder_address or account.address
     ctf = w3.eth.contract(
         address=w3.to_checksum_address(CTF_ADDRESS),
         abi=_CTF_ABI,
     )
 
-    balance = _get_token_balance(w3, CTF_ADDRESS, _CTF_ABI, account.address, token_id)
+    balance = _get_token_balance(w3, CTF_ADDRESS, _CTF_ABI, owner, token_id)
     if balance == 0:
-        raise ValueError(f"No CTF balance for token {token_id[:12]}")
+        raise ValueError(
+            f"No CTF balance for token {token_id[:12]} in wallet {owner[:12]}"
+        )
 
     # indexSet bitmask: outcome at index i → 1 << i
     index_set = 1 << outcome_index
@@ -237,14 +247,24 @@ def _redeem_binary(w3, account, condition_id: str, token_id: str, outcome_index:
     return tx_hash.hex()
 
 
-def _redeem_neg_risk(w3, account, condition_id: str, token_id: str) -> str:
-    """Redeem a winning neg_risk position via NegRiskAdapter. Returns tx hash string."""
+def _redeem_neg_risk(
+    w3, account, condition_id: str, token_id: str,
+    holder_address: str | None = None,
+) -> str:
+    """Redeem a winning neg_risk position via NegRiskAdapter. Returns tx hash string.
+
+    ``holder_address`` is the wallet that holds the tokens (funder wallet
+    in proxy-key setups). Falls back to account.address when not provided.
+    """
+    owner = holder_address or account.address
     # Check NegRiskAdapter balance first, then fall back to CTF
-    balance = _get_token_balance(w3, NEG_RISK_ADDRESS, _NEG_RISK_ABI, account.address, token_id)
+    balance = _get_token_balance(w3, NEG_RISK_ADDRESS, _NEG_RISK_ABI, owner, token_id)
     if balance == 0:
-        balance = _get_token_balance(w3, CTF_ADDRESS, _CTF_ABI, account.address, token_id)
+        balance = _get_token_balance(w3, CTF_ADDRESS, _CTF_ABI, owner, token_id)
     if balance == 0:
-        raise ValueError(f"No on-chain balance for neg_risk token {token_id[:12]}")
+        raise ValueError(
+            f"No on-chain balance for neg_risk token {token_id[:12]} in wallet {owner[:12]}"
+        )
 
     adapter = w3.eth.contract(
         address=w3.to_checksum_address(NEG_RISK_ADDRESS),
@@ -351,6 +371,8 @@ def redeem_resolved_positions(session: "Session") -> int:
         logger.warning("POLYMARKET_PRIVATE_KEY not set — cannot auto-redeem")
         return 0
 
+    funder_address = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+
     # ── Collect all open BUY positions ────────────────────────────────────────
     open_buys = (
         session.query(CopyTrade)
@@ -391,6 +413,17 @@ def redeem_resolved_positions(session: "Session") -> int:
     except Exception as exc:
         logger.warning("Cannot init web3 for redemption: %s", exc)
         return 0
+
+    # Determine the address that actually holds CTF tokens on-chain.
+    # In a proxy-wallet setup: POLYMARKET_PRIVATE_KEY = proxy key,
+    # POLYMARKET_FUNDER_ADDRESS = funder wallet (holds the tokens).
+    # In a direct-key setup: both point to the same address.
+    holder_address = funder_address if funder_address else account.address
+    if funder_address and funder_address.lower() != account.address.lower():
+        logger.info(
+            "Proxy-wallet mode: token holder=%s  signing key=%s",
+            holder_address[:12], account.address[:12],
+        )
 
     redeemed       = 0
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
@@ -433,9 +466,9 @@ def redeem_resolved_positions(session: "Session") -> int:
         # ── Execute on-chain redemption ───────────────────────────────────────
         try:
             if is_neg_risk:
-                tx_hash = _redeem_neg_risk(w3, account, condition_id, token_id)
+                tx_hash = _redeem_neg_risk(w3, account, condition_id, token_id, holder_address)
             else:
-                tx_hash = _redeem_binary(w3, account, condition_id, token_id, outcome_index)
+                tx_hash = _redeem_binary(w3, account, condition_id, token_id, outcome_index, holder_address)
 
             seen_conditions.add(condition_id)
             logger.info("Redemption successful: market=%r tx=%s", label, tx_hash[:20])
