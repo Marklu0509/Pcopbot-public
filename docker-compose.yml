@@ -23,12 +23,6 @@ services:
     volumes:
       - db-data:/app/data
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
 
   nginx:
     image: nginx:alpine
@@ -46,8 +40,7 @@ services:
       - certbot-www:/var/www/certbot
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     depends_on:
-      dashboard:
-        condition: service_healthy
+      - dashboard
     restart: unless-stopped
 
   certbot:
