@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
@@ -210,8 +210,27 @@ def _load_trader_positions(trader_id: int) -> pd.DataFrame:
     ])
 
 
-def _load_realized_pnl(trader_id: int, statuses: list[str] | None = None) -> pd.DataFrame:
-    """Compute realized PnL per market/outcome from SELL copy trades."""
+_PNL_RANGE_OPTIONS: dict[str, timedelta | None] = {
+    "今日":   timedelta(days=1),
+    "近3天":  timedelta(days=3),
+    "近7天":  timedelta(days=7),
+    "近30天": timedelta(days=30),
+    "近半年": timedelta(days=183),
+    "近一年": timedelta(days=365),
+    "全部":   None,
+}
+
+
+def _load_realized_pnl(
+    trader_id: int,
+    statuses: list[str] | None = None,
+    since: datetime | None = None,
+) -> pd.DataFrame:
+    """Compute realized PnL per market/outcome from SELL copy trades.
+
+    ``since`` filters SELL trades by executed_at. BUY trades are always loaded
+    in full so that the weighted average buy price is always accurate.
+    """
     statuses = statuses or ["success"]
     with _SessionLocal() as session:
         rows = (
@@ -222,6 +241,7 @@ def _load_realized_pnl(trader_id: int, statuses: list[str] | None = None) -> pd.
                 CopyTrade.copy_size,
                 CopyTrade.copy_price,
                 CopyTrade.pnl,
+                CopyTrade.executed_at,
             )
             .filter(
                 CopyTrade.trader_id == trader_id,
@@ -234,11 +254,14 @@ def _load_realized_pnl(trader_id: int, statuses: list[str] | None = None) -> pd.
     if not rows:
         return pd.DataFrame(columns=empty_cols)
 
-    df = pd.DataFrame(rows, columns=["Market", "Outcome", "Side", "Size", "Price", "PnL"])
+    df = pd.DataFrame(rows, columns=["Market", "Outcome", "Side", "Size", "Price", "PnL", "ExecutedAt"])
     realized: list[dict] = []
     for (market, outcome), group in df.groupby(["Market", "Outcome"]):
         buys = group[group["Side"] == "BUY"]
+        # Apply date filter to SELL rows only; keep all BUYs for correct avg price
         sells = group[group["Side"] == "SELL"]
+        if since is not None:
+            sells = sells[sells["ExecutedAt"].notna() & (sells["ExecutedAt"] >= since)]
         if sells.empty:
             continue
         sell_size = sells["Size"].sum()
@@ -486,7 +509,19 @@ def _render_trader_detail(t) -> None:
     st.divider()
 
     # ── Realized PnL (closed / sold trades) ──
-    st.subheader("💰 Realized PnL")
+    col_pnl_hdr, col_pnl_range = st.columns([3, 1])
+    col_pnl_hdr.subheader("💰 Realized PnL")
+    selected_range = col_pnl_range.selectbox(
+        "時間範圍",
+        list(_PNL_RANGE_OPTIONS.keys()),
+        index=len(_PNL_RANGE_OPTIONS) - 1,  # default: 全部
+        key=f"pnl_range_{t.id}",
+        label_visibility="collapsed",
+    )
+    _td = _PNL_RANGE_OPTIONS[selected_range]
+    _pnl_since = (
+        datetime.now(timezone.utc).replace(tzinfo=None) - _td if _td is not None else None
+    )
     rtab_live, rtab_dry = st.tabs(["Live (success)", "Dry Run (simulated)"])
 
     def _render_realized_block(realized_df: pd.DataFrame, empty_msg: str) -> None:
@@ -529,13 +564,13 @@ def _render_trader_detail(t) -> None:
 
     with rtab_live:
         _render_realized_block(
-            _load_realized_pnl(t.id, statuses=["success"]),
+            _load_realized_pnl(t.id, statuses=["success"], since=_pnl_since),
             "No live realized PnL yet.",
         )
 
     with rtab_dry:
         _render_realized_block(
-            _load_realized_pnl(t.id, statuses=["dry_run"]),
+            _load_realized_pnl(t.id, statuses=["dry_run"], since=_pnl_since),
             "No dry-run realized PnL yet.",
         )
 

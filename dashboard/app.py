@@ -43,6 +43,13 @@ st.sidebar.markdown(
 )
 st.sidebar.divider()
 
+# ── Wallet balance metrics (auto-refresh every 30s) ──
+_funder = (_settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+if _funder:
+    from dashboard.components.wallet_metrics import render_wallet_sidebar
+    render_wallet_sidebar(_funder)
+    st.sidebar.divider()
+
 st.sidebar.title("Pcopbot 🤖")
 page = st.sidebar.radio(
     "Navigate",
