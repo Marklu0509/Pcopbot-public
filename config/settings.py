@@ -46,6 +46,12 @@ POLYMARKET_API_KEY: str = _get_clean("POLYMARKET_API_KEY")
 POLYMARKET_API_SECRET: str = _get_clean("POLYMARKET_API_SECRET")
 POLYMARKET_API_PASSPHRASE: str = _get_clean("POLYMARKET_API_PASSPHRASE")
 POLYMARKET_FUNDER_ADDRESS: str = _get_clean("POLYMARKET_FUNDER_ADDRESS")
+# Optional: funder wallet private key for on-chain redemptions (proxy-wallet setups).
+# In proxy-wallet mode, POLYMARKET_PRIVATE_KEY is the proxy key and cannot sign
+# redeemPositions transactions (tokens are held by the funder wallet).
+# Set this to the funder wallet's private key to enable auto-redemption.
+# Leave empty if POLYMARKET_PRIVATE_KEY already IS the funder wallet key.
+POLYMARKET_FUNDER_PRIVATE_KEY: str = _get_clean("POLYMARKET_FUNDER_PRIVATE_KEY")
 POLYMARKET_CHAIN_ID: int = _get_int("POLYMARKET_CHAIN_ID", 137)
 
 # Database

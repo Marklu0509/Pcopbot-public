@@ -99,12 +99,25 @@ def _get_web3():
     return w3
 
 
-def _get_account(w3):
+def _get_account(w3, use_funder_key: bool = False):
+    """Return an Account for signing transactions.
+
+    When ``use_funder_key=True`` and POLYMARKET_FUNDER_PRIVATE_KEY is set,
+    returns the funder wallet account (needed for on-chain CTF redemptions in
+    proxy-wallet setups where tokens are held by the funder, not the proxy).
+    Falls back to POLYMARKET_PRIVATE_KEY when the funder key is not set.
+    """
     from eth_account import Account
-    private_key = (settings.POLYMARKET_PRIVATE_KEY or "").strip()
-    if not private_key.startswith("0x"):
-        private_key = "0x" + private_key
-    return Account.from_key(private_key)
+
+    raw_key = ""
+    if use_funder_key:
+        raw_key = (settings.POLYMARKET_FUNDER_PRIVATE_KEY or "").strip()
+    if not raw_key:
+        raw_key = (settings.POLYMARKET_PRIVATE_KEY or "").strip()
+
+    if not raw_key.startswith("0x"):
+        raw_key = "0x" + raw_key
+    return Account.from_key(raw_key)
 
 
 def _get_token_balance(w3, contract_address: str, abi: list, owner: str, token_id_hex: str) -> int:
@@ -406,24 +419,33 @@ def redeem_resolved_positions(session: "Session") -> int:
     if not active:
         return 0
 
-    # Initialize web3 once for all redemptions
+    # Initialize web3 once for all redemptions.
+    # Use funder key for signing if available (proxy-wallet setups where the
+    # proxy key cannot sign on behalf of the funder for CTF redeemPositions).
     try:
         w3      = _get_web3()
-        account = _get_account(w3)
+        account = _get_account(w3, use_funder_key=True)
     except Exception as exc:
         logger.warning("Cannot init web3 for redemption: %s", exc)
         return 0
 
     # Determine the address that actually holds CTF tokens on-chain.
-    # In a proxy-wallet setup: POLYMARKET_PRIVATE_KEY = proxy key,
-    # POLYMARKET_FUNDER_ADDRESS = funder wallet (holds the tokens).
-    # In a direct-key setup: both point to the same address.
     holder_address = funder_address if funder_address else account.address
+
+    using_funder_key = bool((settings.POLYMARKET_FUNDER_PRIVATE_KEY or "").strip())
     if funder_address and funder_address.lower() != account.address.lower():
-        logger.info(
-            "Proxy-wallet mode: token holder=%s  signing key=%s",
-            holder_address[:12], account.address[:12],
-        )
+        if using_funder_key:
+            logger.info(
+                "Proxy-wallet mode: signing with funder key=%s (holder=%s)",
+                account.address[:12], holder_address[:12],
+            )
+        else:
+            logger.warning(
+                "Proxy-wallet mode detected but POLYMARKET_FUNDER_PRIVATE_KEY is not set. "
+                "Token holder=%s but signing with proxy key=%s — redemption tx will likely revert. "
+                "Add POLYMARKET_FUNDER_PRIVATE_KEY to .env to enable auto-redemption.",
+                holder_address[:12], account.address[:12],
+            )
 
     redeemed       = 0
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
