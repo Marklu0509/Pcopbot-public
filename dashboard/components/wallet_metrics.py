@@ -51,24 +51,25 @@ def _fetch_portfolio_value(funder_address: str) -> float | None:
 
 
 @st.fragment(run_every=timedelta(seconds=30))
-def render_wallet_sidebar(funder_address: str) -> None:
-    """Render cash balance, positions value and total portfolio value in the sidebar.
+def render_wallet_metrics(funder_address: str) -> None:
+    """Render cash balance, positions value and total portfolio value.
 
+    Must be called inside a ``with st.sidebar:`` block in the caller.
     Auto-refreshes every 30 seconds via st.fragment.
     """
     cash = _fetch_cash_balance(funder_address)
     total = _fetch_portfolio_value(funder_address)
 
     if cash is None and total is None:
-        st.sidebar.caption("💰 餘額：無法取得")
+        st.caption("💰 餘額：無法取得")
         return
 
-    cash_val   = cash if cash is not None else 0.0
-    total_val  = total if total is not None else 0.0
-    pos_val    = max(0.0, total_val - cash_val)
+    cash_val  = cash if cash is not None else 0.0
+    total_val = total if total is not None else 0.0
+    pos_val   = max(0.0, total_val - cash_val)
 
-    st.sidebar.markdown("**💼 帳戶餘額**")
-    c1, c2 = st.sidebar.columns(2)
+    st.markdown("**💼 帳戶餘額**")
+    c1, c2 = st.columns(2)
     c1.metric("現金 (USDC)", f"${cash_val:,.2f}")
     c2.metric("持倉價值", f"${pos_val:,.2f}")
-    st.sidebar.metric("總資產", f"${total_val:,.2f}")
+    st.metric("總資產", f"${total_val:,.2f}")
