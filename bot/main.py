@@ -161,7 +161,8 @@ def _update_pnl(session) -> None:
 
 
 def _refresh_copy_trade_fill_prices(session) -> None:
-    """Backfill copy_price from actual filled/average price using order_id.
+    """Backfill copy_price from actual filled/average price using order_id,
+    then recalculate realized PnL for SELL trades based on corrected BUY prices.
 
     This auto-corrects historical records where copy_price may have been stored
     as a slippage-adjusted order price rather than the actual fill price.
@@ -172,12 +173,11 @@ def _refresh_copy_trade_fill_prices(session) -> None:
     rows = (
         session.query(CopyTrade)
         .filter(
+            CopyTrade.original_side == "BUY",
             CopyTrade.status == "success",
             CopyTrade.order_id.is_not(None),
             CopyTrade.order_id != "",
         )
-        .order_by(CopyTrade.executed_at.desc())
-        .limit(300)
         .all()
     )
     if not rows:
@@ -190,7 +190,7 @@ def _refresh_copy_trade_fill_prices(session) -> None:
         logger.warning("Skip fill-price refresh: failed to init CLOB client: %s", exc)
         return
 
-    updated = 0
+    buy_updated = 0
     for ct in rows:
         try:
             order = client.get_order(ct.order_id)
@@ -222,13 +222,60 @@ def _refresh_copy_trade_fill_prices(session) -> None:
             current = ct.copy_price or 0.0
             if abs(current - actual) > 1e-6:
                 ct.copy_price = actual
-                updated += 1
+                buy_updated += 1
         except Exception:
             continue
 
-    if updated:
+    if buy_updated:
         session.commit()
-        logger.info("Refreshed copy_price from actual fills on %d trade(s).", updated)
+        logger.info("Refreshed copy_price from actual fills on %d BUY trade(s).", buy_updated)
+        _recalculate_sell_pnl(session)
+
+
+def _recalculate_sell_pnl(session) -> None:
+    """Recompute realized PnL for all SELL trades using corrected BUY copy_prices."""
+    from sqlalchemy import func
+
+    sells = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.original_side == "SELL",
+            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.copy_size > 0,
+        )
+        .all()
+    )
+    if not sells:
+        return
+
+    sell_updated = 0
+    for ct in sells:
+        result = (
+            session.query(
+                func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0),
+                func.coalesce(func.sum(CopyTrade.copy_size), 0.0),
+            )
+            .filter(
+                CopyTrade.trader_id == ct.trader_id,
+                CopyTrade.original_token_id == ct.original_token_id,
+                CopyTrade.original_side == "BUY",
+                CopyTrade.status.in_(["success", "dry_run"]),
+            )
+            .first()
+        )
+        total_cost, total_size = result
+        if not total_size or total_size <= 0:
+            continue
+        avg_buy = total_cost / total_size
+        sell_price = ct.copy_price or 0.0
+        new_pnl = round((sell_price - avg_buy) * ct.copy_size, 4)
+        if abs((ct.pnl or 0.0) - new_pnl) > 1e-6:
+            ct.pnl = new_pnl
+            sell_updated += 1
+
+    if sell_updated:
+        session.commit()
+        logger.info("Recalculated realized PnL on %d SELL trade(s).", sell_updated)
 
 
 def _poll_once(session) -> None:
