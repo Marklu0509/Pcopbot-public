@@ -120,52 +120,34 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
 
     df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
 
-    # Fetch live prices using token IDs directly (works for active + resolved markets)
-    from bot.tracker import fetch_prices_by_token_ids, fetch_token_prices
-    all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
+    # Fetch current prices from our own wallet's open positions (most accurate source)
+    import requests as _req
+    from config import settings as _settings
     price_map: dict[str, float] = {}
-
-    # Primary: Gamma API via clob_token_ids query param
-    if all_buy_token_ids:
+    funder = (_settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if funder:
         try:
-            price_map = fetch_prices_by_token_ids(all_buy_token_ids)
+            resp = _req.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": funder},
+                timeout=10,
+            )
+            if resp.ok:
+                for pos in resp.json():
+                    asset = pos.get("asset", "")
+                    cur = pos.get("curPrice", 0.0)
+                    if asset and cur:
+                        price_map[asset] = float(cur)
         except Exception:
             pass
 
-    # Secondary: Gamma API via condition_id for any still missing
+    # Fallback: Gamma API via clob_token_ids for any token not in our positions
+    all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
     missing_tids = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
     if missing_tids:
-        missing_cids = (
-            df[df["TokenId"].isin(missing_tids)]["ConditionId"].dropna().unique().tolist()
-        )
-        if missing_cids:
-            try:
-                price_map.update(fetch_token_prices(missing_cids))
-            except Exception:
-                pass
-
-    # Tertiary: CLOB book midpoint for any still missing (active markets only)
-    import requests as _req
-    still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
-    for tid in still_missing:
+        from bot.tracker import fetch_prices_by_token_ids
         try:
-            resp = _req.get(
-                "https://clob.polymarket.com/book",
-                params={"token_id": tid},
-                timeout=5,
-            )
-            if resp.ok:
-                book = resp.json()
-                bids = book.get("bids", [])
-                asks = book.get("asks", [])
-                best_bid = float(bids[0]["price"]) if bids else 0.0
-                best_ask = float(asks[0]["price"]) if asks else 0.0
-                if best_bid > 0 and best_ask > 0:
-                    price_map[tid] = round((best_bid + best_ask) / 2, 4)
-                elif best_ask > 0:
-                    price_map[tid] = best_ask
-                elif best_bid > 0:
-                    price_map[tid] = best_bid
+            price_map.update(fetch_prices_by_token_ids(missing_tids))
         except Exception:
             pass
 
