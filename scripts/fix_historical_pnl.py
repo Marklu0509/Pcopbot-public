@@ -118,7 +118,7 @@ def main() -> None:
         refresh_sell_prices,
         recalculate_sell_pnl,
     )
-    from bot.redeemer import detect_manual_redemptions
+    from bot.redeemer import detect_manual_redemptions, detect_manual_sells
 
     logger.info("=== fix_historical_pnl: starting ===")
     init_db()
@@ -157,12 +157,16 @@ def main() -> None:
         logger.info("--- Step 2: Correcting SELL copy_prices ---")
         sell_updated = refresh_sell_prices(session, funder, trade_activity)
 
-        # Step 3: Insert missing manual redemption SELL records
-        logger.info("--- Step 3: Detecting manual redemptions ---")
+        # Step 3: Insert missing manual sell SELL records
+        logger.info("--- Step 3: Detecting manual sells ---")
+        manual_sells_added = detect_manual_sells(session)
+
+        # Step 4: Insert missing manual redemption SELL records
+        logger.info("--- Step 4: Detecting manual redemptions ---")
         redemptions_added = detect_manual_redemptions(session)
 
-        # Step 4: Recompute all realized PnL with corrected prices
-        logger.info("--- Step 4: Recalculating realized PnL ---")
+        # Step 5: Recompute all realized PnL with corrected prices
+        logger.info("--- Step 5: Recalculating realized PnL ---")
         pnl_updated = recalculate_sell_pnl(session)
 
         after = _snapshot(session)
@@ -177,7 +181,7 @@ def main() -> None:
         {
             "buy_updated": buy_updated,
             "sell_updated": sell_updated,
-            "redemptions_added": redemptions_added,
+            "redemptions_added": redemptions_added + manual_sells_added,
             "pnl_updated": pnl_updated,
         },
     )

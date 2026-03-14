@@ -455,6 +455,176 @@ def redeem_resolved_positions(session: "Session") -> int:
     return redeemed
 
 
+def detect_manual_sells(session: "Session") -> int:
+    """Detect SELL trades made manually via Polymarket UI and create synthetic SELL records.
+
+    Matches funder wallet SELL activity against existing CopyTrade SELL records by
+    token_id + timestamp (±10 min window). Unmatched sells are treated as manual.
+    Returns count of new records created.
+    """
+    import requests as _req
+    from sqlalchemy import func
+    from bot.executor import _get_net_holdings
+
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if not funder:
+        return 0
+
+    url = f"{settings.DATA_API_BASE}/activity"
+    try:
+        resp = _req.get(url, params={"user": funder, "limit": 500}, timeout=15)
+        resp.raise_for_status()
+        all_activity = resp.json()
+        if not isinstance(all_activity, list):
+            all_activity = all_activity.get("data", [])
+    except Exception as exc:
+        logger.warning("Failed to fetch funder activity for manual sell detection: %s", exc)
+        return 0
+
+    # Only TRADE-type SELL entries from our funder wallet
+    sell_activity = [
+        d for d in all_activity
+        if d.get("type", "").upper() == "TRADE" and (d.get("side") or "").upper() == "SELL"
+    ]
+    if not sell_activity:
+        return 0
+
+    # Build lookup of existing SELL CopyTrade records: token_id → [(ts, size), ...]
+    existing_sells = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.original_side == "SELL",
+            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.original_token_id.is_not(None),
+        )
+        .all()
+    )
+    existing_map: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for ct in existing_sells:
+        ts = ct.executed_at.timestamp() if ct.executed_at else 0.0
+        existing_map[ct.original_token_id].append((ts, ct.copy_size or 0.0))
+
+    _MATCH_WINDOW = 600  # 10-minute window for timestamp matching
+
+    def _is_matched(token_id: str, activity_ts: float, activity_size: float) -> bool:
+        """Return True if this sell activity already has a CopyTrade SELL record."""
+        for rec_ts, rec_size in existing_map.get(token_id, []):
+            if abs(rec_ts - activity_ts) < _MATCH_WINDOW and abs(rec_size - activity_size) < 0.01:
+                return True
+        return False
+
+    created = 0
+
+    for raw in sell_activity:
+        token_id = raw.get("asset") or raw.get("asset_id") or raw.get("assetId") or ""
+        tx_hash = raw.get("transactionHash") or raw.get("id") or ""
+        condition_id = raw.get("conditionId") or raw.get("market") or ""
+        market_title = raw.get("title") or ""
+        sell_price = float(raw.get("price", 0) or 0)
+        sell_size = float(raw.get("size", 0) or raw.get("shares", 0) or 0)
+        activity_ts = float(raw.get("timestamp", 0) or 0)
+
+        if not token_id or not tx_hash or sell_price <= 0 or sell_size <= 0:
+            continue
+
+        # Skip if already matched to an existing CopyTrade SELL
+        if _is_matched(token_id, activity_ts, sell_size):
+            continue
+
+        # Dedup: avoid creating duplicate manual sell records across runs
+        order_id_key = f"manual_sell:{tx_hash[:20]}:{token_id[:12]}"
+        if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
+            continue
+
+        # Find which traders hold (or held) this token via BUY records
+        buy_trades = (
+            session.query(CopyTrade)
+            .filter(
+                CopyTrade.original_token_id == token_id,
+                CopyTrade.original_side == "BUY",
+                CopyTrade.status.in_(["success", "dry_run"]),
+            )
+            .all()
+        )
+        if not buy_trades:
+            continue
+
+        trader_ids = {int(bt.trader_id) for bt in buy_trades}
+        sell_time = (
+            datetime.datetime.utcfromtimestamp(activity_ts)
+            if activity_ts else datetime.datetime.utcnow()
+        )
+
+        for trader_id in trader_ids:
+            net_shares = _get_net_holdings(session, trader_id, token_id)
+            if net_shares <= 0:
+                continue
+
+            # Weighted avg buy price for this trader + token
+            result = (
+                session.query(
+                    func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0),
+                    func.coalesce(func.sum(CopyTrade.copy_size), 0.0),
+                )
+                .filter(
+                    CopyTrade.trader_id == trader_id,
+                    CopyTrade.original_token_id == token_id,
+                    CopyTrade.original_side == "BUY",
+                    CopyTrade.status.in_(["success", "dry_run"]),
+                )
+                .first()
+            )
+            total_cost, total_size = result
+            avg_buy = (total_cost / total_size) if total_size and total_size > 0 else 0.0
+            actual_size = min(sell_size, net_shares)
+            pnl = round((sell_price - avg_buy) * actual_size, 4)
+
+            sample_buy = next(
+                (bt for bt in buy_trades if bt.trader_id == trader_id),
+                buy_trades[0],
+            )
+            manual_sell = CopyTrade(
+                trader_id=trader_id,
+                original_trade_id=f"manual_sell:{tx_hash[:24]}",
+                original_market=condition_id or sample_buy.original_market,
+                original_token_id=token_id,
+                market_title=market_title or sample_buy.market_title,
+                outcome=sample_buy.outcome,
+                original_side="SELL",
+                original_size=actual_size,
+                original_price=sell_price,
+                original_timestamp=sell_time,
+                copy_size=actual_size,
+                copy_price=sell_price,
+                status="success",
+                order_id=order_id_key,
+                pnl=pnl,
+                executed_at=sell_time,
+            )
+            session.add(manual_sell)
+
+            # Register in local map so subsequent activity entries for the same
+            # token don't create duplicates within the same run
+            existing_map[token_id].append((activity_ts, actual_size))
+
+            # Zero out unrealized PnL on BUY records if position is fully closed
+            remaining = net_shares - actual_size
+            if remaining <= 0:
+                for bt in buy_trades:
+                    if bt.trader_id == trader_id and bt.original_token_id == token_id:
+                        bt.pnl = 0.0
+
+            created += 1
+            logger.info(
+                "Manual sell recorded: market=%s trader=%d size=%.4f price=%.4f pnl=%.4f",
+                market_title or token_id[:12], trader_id, actual_size, sell_price, pnl,
+            )
+
+    if created:
+        session.commit()
+    return created
+
+
 def detect_manual_redemptions(session: "Session") -> int:
     """Fetch REDEEM-type activities from funder wallet and create synthetic SELL records.
 
