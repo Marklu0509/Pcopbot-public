@@ -102,6 +102,7 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
                 CopyTrade.market_title,
                 CopyTrade.outcome,
                 CopyTrade.original_market,
+                CopyTrade.original_token_id,
                 CopyTrade.original_side,
                 CopyTrade.copy_size,
                 CopyTrade.copy_price,
@@ -113,18 +114,21 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
             )
             .all()
         )
-        # Build a lookup for current prices from Position table
-        pos_rows = (
-            session.query(Position.condition_id, Position.outcome, Position.cur_price)
-            .filter(Position.trader_id == trader_id)
-            .all()
-        )
-    price_lookup = {(r[0], r[1]): r[2] for r in pos_rows}
 
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "Side", "Size", "Price", "PnL"])
+    df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
+
+    # Fetch live prices from Gamma API using our actual token IDs
+    from bot.tracker import fetch_token_prices
+    condition_ids = df["ConditionId"].dropna().unique().tolist()
+    price_map: dict[str, float] = {}
+    if condition_ids:
+        try:
+            price_map = fetch_token_prices(condition_ids)
+        except Exception:
+            pass
 
     holdings: list[dict] = []
     for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
@@ -137,7 +141,9 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
             if buy_rows["Size"].sum() > 0 else 0
         )
         total_pnl = group["PnL"].sum()
-        cur_price = price_lookup.get((cid, outcome), 0.0)
+        # Use token_id from BUY rows to look up live price from Gamma API
+        token_id = buy_rows["TokenId"].iloc[0] if not buy_rows.empty else ""
+        cur_price = price_map.get(token_id, 0.0)
         cost_basis = avg_price * net_size
         current_value = cur_price * net_size
         unrealized = current_value - cost_basis if cur_price > 0 else 0.0
