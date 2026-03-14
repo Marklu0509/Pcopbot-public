@@ -121,15 +121,37 @@ def _get_token_balance(w3, contract_address: str, abi: list, owner: str, token_i
         return 0
 
 
-def _get_market_info(condition_id: str) -> dict | None:
+def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | None:
     """Fetch market from Gamma API and return resolution details.
 
     Returns None if the market is not yet resolved.
     Returns a dict with keys:
         neg_risk, condition_id, token_info ({token_id: {outcome, price, index}}), winner
+
+    When Gamma returns 422 (resolved market), falls back to price lookup via token_id.
     """
     data = fetch_market(condition_id)
     if not data:
+        # Fallback for resolved markets that return 422 on /markets/{id}
+        if token_id:
+            from bot.tracker import fetch_prices_by_token_ids
+            price_map = fetch_prices_by_token_ids([token_id])
+            price = price_map.get(token_id, 0.0)
+            if price >= 0.99:
+                # Gamma returned 422 — assume binary (neg_risk=False).
+                # If this is actually a neg_risk market, _redeem_binary will
+                # fail fast on zero CTF balance (ValueError, no gas wasted).
+                logger.warning(
+                    "Market %s returned 422 from Gamma — assuming binary for redemption. "
+                    "If this is a neg_risk market, please redeem manually.",
+                    condition_id[:16],
+                )
+                return {
+                    "neg_risk": False,
+                    "condition_id": condition_id,
+                    "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
+                    "winner": "",
+                }
         return None
 
     resolved = data.get("resolved", False) or data.get("closed", False)
@@ -379,7 +401,7 @@ def redeem_resolved_positions(session: "Session") -> int:
 
         # ── Check if market is resolved ───────────────────────────────────────
         try:
-            market = _get_market_info(condition_id)
+            market = _get_market_info(condition_id, token_id=token_id)
         except Exception as exc:
             logger.debug("Market info fetch failed for %s: %s", condition_id[:12], exc)
             continue
@@ -431,3 +453,132 @@ def redeem_resolved_positions(session: "Session") -> int:
         logger.info("Auto-redemption complete: %d position(s) redeemed", redeemed)
 
     return redeemed
+
+
+def detect_manual_redemptions(session: "Session") -> int:
+    """Fetch REDEEM-type activities from funder wallet and create synthetic SELL records.
+
+    Handles manual redemptions done via Polymarket UI.
+    Returns count of new records created.
+    """
+    import requests as _req
+    from sqlalchemy import func
+    from bot.executor import _get_net_holdings
+
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if not funder:
+        return 0
+
+    url = f"{settings.DATA_API_BASE}/activity"
+    try:
+        resp = _req.get(url, params={"user": funder, "limit": 500}, timeout=15)
+        resp.raise_for_status()
+        all_activity = resp.json()
+        if not isinstance(all_activity, list):
+            all_activity = all_activity.get("data", [])
+    except Exception as exc:
+        logger.warning("Failed to fetch funder activity for manual redemption detection: %s", exc)
+        return 0
+
+    redeems = [d for d in all_activity if d.get("type", "").upper() == "REDEEM"]
+    if not redeems:
+        return 0
+
+    created = 0
+
+    for raw in redeems:
+        condition_id = raw.get("conditionId", "")
+        tx_hash = raw.get("transactionHash", "")
+        market_title = raw.get("title", "")
+        if not condition_id or not tx_hash:
+            continue
+
+        ts = float(raw.get("timestamp", 0) or 0)
+        redeem_time = (
+            datetime.datetime.utcfromtimestamp(ts) if ts else datetime.datetime.utcnow()
+        )
+
+        buy_trades = (
+            session.query(CopyTrade)
+            .filter(
+                CopyTrade.original_market == condition_id,
+                CopyTrade.original_side == "BUY",
+                CopyTrade.status.in_(["success", "dry_run"]),
+            )
+            .all()
+        )
+        if not buy_trades:
+            continue
+
+        by_trader: dict[int, set] = defaultdict(set)
+        for bt in buy_trades:
+            if bt.original_token_id:
+                by_trader[int(bt.trader_id)].add(bt.original_token_id)
+
+        for trader_id, token_ids in by_trader.items():
+            for token_id in token_ids:
+                # Dedup key is scoped per trader+token+tx to avoid skipping
+                # traders on a second run after a mid-run interruption.
+                order_id_key = f"manual_redeem:{tx_hash[:20]}:t{trader_id}:{token_id[:12]}"
+                if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
+                    continue
+
+                net_shares = _get_net_holdings(session, trader_id, token_id)
+                if net_shares <= 0:
+                    continue
+
+                result = (
+                    session.query(
+                        func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0),
+                        func.coalesce(func.sum(CopyTrade.copy_size), 0.0),
+                    )
+                    .filter(
+                        CopyTrade.trader_id == trader_id,
+                        CopyTrade.original_token_id == token_id,
+                        CopyTrade.original_side == "BUY",
+                        CopyTrade.status.in_(["success", "dry_run"]),
+                    )
+                    .first()
+                )
+                total_cost, total_size = result
+                avg_buy = (total_cost / total_size) if total_size and total_size > 0 else 0.0
+                pnl = round((1.0 - avg_buy) * net_shares, 4)
+
+                sample_buy = next(
+                    (bt for bt in buy_trades if bt.trader_id == trader_id and bt.original_token_id == token_id),
+                    buy_trades[0],
+                )
+                redemption = CopyTrade(
+                    trader_id=trader_id,
+                    original_trade_id=f"redeem:{tx_hash[:24]}",
+                    original_market=condition_id,
+                    original_token_id=token_id,
+                    market_title=market_title or sample_buy.market_title,
+                    outcome=sample_buy.outcome,
+                    original_side="SELL",
+                    original_size=net_shares,
+                    original_price=1.0,
+                    original_timestamp=redeem_time,
+                    copy_size=net_shares,
+                    copy_price=1.0,
+                    status="success",
+                    order_id=order_id_key,
+                    pnl=pnl,
+                    executed_at=redeem_time,
+                )
+                session.add(redemption)
+
+                # Zero out unrealized PnL on BUY records for this position
+                for bt in buy_trades:
+                    if bt.trader_id == trader_id and bt.original_token_id == token_id:
+                        bt.pnl = 0.0
+
+                created += 1
+                logger.info(
+                    "Manual redemption recorded: market=%s trader=%d size=%.4f pnl=%.4f",
+                    market_title or condition_id[:12], trader_id, net_shares, pnl,
+                )
+
+    if created:
+        session.commit()
+    return created

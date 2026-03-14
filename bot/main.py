@@ -388,10 +388,13 @@ def run() -> None:
             # Auto-redeem resolved winning positions every 20 poll cycles
             if _poll_count % 20 == 0:
                 try:
-                    from bot.redeemer import redeem_resolved_positions
+                    from bot.redeemer import redeem_resolved_positions, detect_manual_redemptions
                     redeemed = redeem_resolved_positions(session)
                     if redeemed:
                         logger.info("Auto-redeemed %d resolved position(s).", redeemed)
+                    manual = detect_manual_redemptions(session)
+                    if manual:
+                        logger.info("Recorded %d manual redemption(s) from funder wallet.", manual)
                 except Exception as exc:
                     logger.error("Error during auto-redemption: %s", exc)
 

@@ -9,7 +9,6 @@ import streamlit as st
 
 from db.database import get_session_factory, init_db
 from db.models import CopyTrade, Position, Trader
-from bot.watermark import set_watermark
 
 init_db()
 _SessionLocal = get_session_factory()
@@ -156,12 +155,13 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
         buy_size = group.loc[group["Side"] == "BUY", "Size"].sum()
         sell_size = group.loc[group["Side"] == "SELL", "Size"].sum()
         net_size = buy_size - sell_size
+        if net_size <= 0:
+            continue  # fully sold or redeemed — skip
         buy_rows = group[group["Side"] == "BUY"]
         avg_price = (
             (buy_rows["Price"] * buy_rows["Size"]).sum() / buy_rows["Size"].sum()
             if buy_rows["Size"].sum() > 0 else 0
         )
-        total_pnl = group["PnL"].sum()
         # Use token_id from BUY rows to look up live price from Gamma API
         token_id = buy_rows["TokenId"].iloc[0] if not buy_rows.empty else ""
         cur_price = price_map.get(token_id, 0.0)
