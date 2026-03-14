@@ -195,41 +195,68 @@ def _refresh_copy_trade_fill_prices(session) -> None:
     if not our_activity:
         return
 
-    # Build lookup: token_id → list of (unix_ts, actual_price) for BUY trades
     from collections import defaultdict
-    activity_map: dict[str, list] = defaultdict(list)
-    for raw in our_activity:
-        if (raw.get("side") or "").upper() != "BUY":
-            continue
-        tid = raw.get("asset") or raw.get("asset_id") or ""
-        price = float(raw.get("price", 0) or 0)
-        ts = float(raw.get("timestamp", 0) or 0)
-        if tid and price > 0 and ts > 0:
-            activity_map[tid].append((ts, price))
 
-    buy_updated = 0
-    for ct in buys:
-        tid = ct.original_token_id
-        if not tid or tid not in activity_map:
-            continue
+    def _build_map(side: str) -> dict[str, list]:
+        m: dict[str, list] = defaultdict(list)
+        for raw in our_activity:
+            if (raw.get("side") or "").upper() != side:
+                continue
+            tid = raw.get("asset") or raw.get("asset_id") or ""
+            price = float(raw.get("price", 0) or 0)
+            ts = float(raw.get("timestamp", 0) or 0)
+            if tid and price > 0 and ts > 0:
+                m[tid].append((ts, price))
+        return m
 
+    def _match(act_map: dict, ct) -> float | None:
+        candidates = act_map.get(ct.original_token_id, [])
         ct_ts = ct.executed_at.timestamp() if ct.executed_at else 0.0
         best_price, best_diff = None, float("inf")
-        for ts, price in activity_map[tid]:
+        for ts, price in candidates:
             diff = abs(ts - ct_ts)
             if diff < best_diff:
                 best_diff = diff
                 best_price = price
+        return best_price if best_price is not None and best_diff < 600 else None
 
-        # Only update if a match is found within 10 minutes
-        if best_price is not None and best_diff < 600:
-            if abs((ct.copy_price or 0.0) - best_price) > 1e-6:
-                ct.copy_price = best_price
-                buy_updated += 1
+    buy_map = _build_map("BUY")
+    sell_map = _build_map("SELL")
+
+    # Fix BUY copy_prices
+    buy_updated = 0
+    for ct in buys:
+        if not ct.original_token_id:
+            continue
+        actual = _match(buy_map, ct)
+        if actual is not None and abs((ct.copy_price or 0.0) - actual) > 1e-6:
+            ct.copy_price = actual
+            buy_updated += 1
 
     if buy_updated:
         session.commit()
         logger.info("Refreshed copy_price from activity on %d BUY trade(s).", buy_updated)
+
+    # Fix SELL copy_prices
+    sells = (
+        session.query(CopyTrade)
+        .filter(CopyTrade.original_side == "SELL", CopyTrade.status == "success")
+        .all()
+    )
+    sell_updated = 0
+    for ct in sells:
+        if not ct.original_token_id:
+            continue
+        actual = _match(sell_map, ct)
+        if actual is not None and abs((ct.copy_price or 0.0) - actual) > 1e-6:
+            ct.copy_price = actual
+            sell_updated += 1
+
+    if sell_updated:
+        session.commit()
+        logger.info("Refreshed copy_price from activity on %d SELL trade(s).", sell_updated)
+
+    if buy_updated or sell_updated:
         _recalculate_sell_pnl(session)
 
 
