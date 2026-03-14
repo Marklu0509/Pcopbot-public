@@ -122,11 +122,37 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
 
     # Fetch live prices from Gamma API using our actual token IDs
     from bot.tracker import fetch_token_prices
+    import requests as _requests
     condition_ids = df["ConditionId"].dropna().unique().tolist()
     price_map: dict[str, float] = {}
     if condition_ids:
         try:
             price_map = fetch_token_prices(condition_ids)
+        except Exception:
+            pass
+
+    # Fallback: for tokens still missing prices, query CLOB book API midpoint
+    all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
+    missing = [tid for tid in all_buy_token_ids if tid and price_map.get(tid, 0.0) == 0.0]
+    for tid in missing:
+        try:
+            resp = _requests.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": tid},
+                timeout=5,
+            )
+            if resp.ok:
+                book = resp.json()
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                best_bid = float(bids[0]["price"]) if bids else 0.0
+                best_ask = float(asks[0]["price"]) if asks else 0.0
+                if best_bid > 0 and best_ask > 0:
+                    price_map[tid] = round((best_bid + best_ask) / 2, 4)
+                elif best_ask > 0:
+                    price_map[tid] = best_ask
+                elif best_bid > 0:
+                    price_map[tid] = best_bid
         except Exception:
             pass
 
