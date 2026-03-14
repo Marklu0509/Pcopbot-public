@@ -161,74 +161,75 @@ def _update_pnl(session) -> None:
 
 
 def _refresh_copy_trade_fill_prices(session) -> None:
-    """Backfill copy_price from actual filled/average price using order_id,
-    then recalculate realized PnL for SELL trades based on corrected BUY prices.
+    """Backfill copy_price from our wallet's actual trade activity.
 
-    This auto-corrects historical records where copy_price may have been stored
-    as a slippage-adjusted order price rather than the actual fill price.
+    Polymarket FOK orders are not retained in the CLOB after fill, so
+    client.get_order() returns None.  Instead, we query our funder wallet's
+    trade activity from the Data API and match each BUY copy trade by
+    token_id + execution timestamp (within a 10-minute window).
     """
     if settings.DRY_RUN:
         return
 
-    rows = (
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if not funder:
+        return
+
+    buys = (
         session.query(CopyTrade)
         .filter(
             CopyTrade.original_side == "BUY",
             CopyTrade.status == "success",
-            CopyTrade.order_id.is_not(None),
-            CopyTrade.order_id != "",
         )
         .all()
     )
-    if not rows:
+    if not buys:
         return
 
     try:
-        from bot.executor import _get_clob_client, _to_float_or_none  # reuse proven helpers
-        client = _get_clob_client()
+        our_activity = tracker.fetch_trades(funder, limit=500)
     except Exception as exc:
-        logger.warning("Skip fill-price refresh: failed to init CLOB client: %s", exc)
+        logger.warning("Skip fill-price refresh: failed to fetch activity: %s", exc)
         return
 
-    buy_updated = 0
-    for ct in rows:
-        try:
-            order = client.get_order(ct.order_id)
-            if isinstance(order, dict):
-                candidates = [
-                    order.get("avgPrice"),
-                    order.get("averagePrice"),
-                    order.get("filledAvgPrice"),
-                    order.get("price"),
-                ]
-            else:
-                candidates = [
-                    getattr(order, "avgPrice", None),
-                    getattr(order, "averagePrice", None),
-                    getattr(order, "filledAvgPrice", None),
-                    getattr(order, "price", None),
-                ]
+    if not our_activity:
+        return
 
-            actual = None
-            for raw in candidates:
-                parsed = _to_float_or_none(raw)
-                if parsed is not None:
-                    actual = parsed
-                    break
-
-            if actual is None:
-                continue
-
-            current = ct.copy_price or 0.0
-            if abs(current - actual) > 1e-6:
-                ct.copy_price = actual
-                buy_updated += 1
-        except Exception:
+    # Build lookup: token_id → list of (unix_ts, actual_price) for BUY trades
+    from collections import defaultdict
+    activity_map: dict[str, list] = defaultdict(list)
+    for raw in our_activity:
+        if (raw.get("side") or "").upper() != "BUY":
             continue
+        tid = raw.get("asset") or raw.get("asset_id") or ""
+        price = float(raw.get("price", 0) or 0)
+        ts = float(raw.get("timestamp", 0) or 0)
+        if tid and price > 0 and ts > 0:
+            activity_map[tid].append((ts, price))
+
+    buy_updated = 0
+    for ct in buys:
+        tid = ct.original_token_id
+        if not tid or tid not in activity_map:
+            continue
+
+        ct_ts = ct.executed_at.timestamp() if ct.executed_at else 0.0
+        best_price, best_diff = None, float("inf")
+        for ts, price in activity_map[tid]:
+            diff = abs(ts - ct_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_price = price
+
+        # Only update if a match is found within 10 minutes
+        if best_price is not None and best_diff < 600:
+            if abs((ct.copy_price or 0.0) - best_price) > 1e-6:
+                ct.copy_price = best_price
+                buy_updated += 1
 
     if buy_updated:
         session.commit()
-        logger.info("Refreshed copy_price from actual fills on %d BUY trade(s).", buy_updated)
+        logger.info("Refreshed copy_price from activity on %d BUY trade(s).", buy_updated)
         _recalculate_sell_pnl(session)
 
 

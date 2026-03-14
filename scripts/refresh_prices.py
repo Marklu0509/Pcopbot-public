@@ -4,8 +4,9 @@ Usage (from project root):
     python -m scripts.refresh_prices
 
 What it does:
-1. For every BUY CopyTrade with a real order_id (status=success), fetch the
-   actual average fill price from the CLOB API and update copy_price.
+1. For every BUY CopyTrade (status=success), match against our funder wallet's
+   trade activity from the Data API by token_id + execution timestamp to find
+   the actual fill price (not the slippage-adjusted order price).
 2. For every SELL CopyTrade (status=success or dry_run), recompute realized PnL
    using the weighted-average corrected BUY price for that token.
 """
@@ -19,6 +20,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import logging
+from collections import defaultdict
 from sqlalchemy import func
 
 from db.database import get_session_factory, init_db
@@ -31,73 +33,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _to_float_or_none(value) -> float | None:
+def _fetch_activity(wallet_address: str, limit: int = 500) -> list[dict]:
+    """Fetch trade activity for a wallet from the Polymarket Data API."""
+    import requests
     try:
-        if value is None:
-            return None
-        parsed = float(value)
-        return parsed if parsed > 0 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _get_clob_client():
-    from py_clob_client.client import ClobClient  # type: ignore
-    from py_clob_client.clob_types import ApiCreds  # type: ignore
-    from config import settings
-
-    private_key = (settings.POLYMARKET_PRIVATE_KEY or "").strip()
-    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
-    client = ClobClient(
-        host="https://clob.polymarket.com",
-        key=private_key,
-        chain_id=settings.POLYMARKET_CHAIN_ID,
-        signature_type=2,
-        funder=funder,
-    )
-
-    env_api_key = (settings.POLYMARKET_API_KEY or "").strip()
-    env_api_secret = (settings.POLYMARKET_API_SECRET or "").strip()
-    env_api_passphrase = (settings.POLYMARKET_API_PASSPHRASE or "").strip()
-
-    if env_api_key and env_api_secret and env_api_passphrase:
-        creds = ApiCreds(
-            api_key=env_api_key,
-            api_secret=env_api_secret,
-            api_passphrase=env_api_passphrase,
+        resp = requests.get(
+            "https://data-api.polymarket.com/activity",
+            params={"user": wallet_address, "limit": limit},
+            timeout=15,
         )
-        client.set_api_creds(creds)
-    else:
-        derived = client.create_or_derive_api_creds()
-        client.set_api_creds(derived)
-    return client
-
-
-def _fetch_fill_price(client, order_id: str) -> float | None:
-    """Return actual average fill price for an order, or None if unavailable."""
-    try:
-        order = client.get_order(order_id)
-        if isinstance(order, dict):
-            candidates = [
-                order.get("avgPrice"),
-                order.get("averagePrice"),
-                order.get("filledAvgPrice"),
-                order.get("price"),
-            ]
-        else:
-            candidates = [
-                getattr(order, "avgPrice", None),
-                getattr(order, "averagePrice", None),
-                getattr(order, "filledAvgPrice", None),
-                getattr(order, "price", None),
-            ]
-        for raw in candidates:
-            parsed = _to_float_or_none(raw)
-            if parsed is not None:
-                return parsed
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return [d for d in data if d.get("type", "").upper() == "TRADE"]
+        return data.get("data", [])
     except Exception as exc:
-        logger.debug("Could not fetch fill price for order %s: %s", order_id, exc)
-    return None
+        logger.error("Failed to fetch activity for %s: %s", wallet_address, exc)
+        return []
 
 
 def _get_avg_buy_price(session, trader_id: int, token_id: str) -> float:
@@ -121,8 +73,11 @@ def _get_avg_buy_price(session, trader_id: int, token_id: str) -> float:
     return 0.0
 
 
-def refresh_buy_prices(session, client) -> int:
-    """Update copy_price for all BUY trades with order_id using actual fill price.
+def refresh_buy_prices(session, funder_address: str) -> int:
+    """Update copy_price for all BUY trades using actual fill prices from wallet activity.
+
+    Matches each copy trade to a trade event from our funder wallet's Data API
+    activity by token_id + execution timestamp (within a 10-minute window).
 
     Returns the number of records updated.
     """
@@ -131,25 +86,55 @@ def refresh_buy_prices(session, client) -> int:
         .filter(
             CopyTrade.original_side == "BUY",
             CopyTrade.status == "success",
-            CopyTrade.order_id.is_not(None),
-            CopyTrade.order_id != "",
         )
         .all()
     )
-    logger.info("Found %d BUY trades with order_id to check.", len(buys))
+    logger.info("Found %d BUY trades to check.", len(buys))
+
+    if not buys:
+        return 0
+
+    # Fetch our wallet's actual trade activity
+    activity = _fetch_activity(funder_address, limit=500)
+    logger.info("Fetched %d activity entries for funder wallet.", len(activity))
+
+    # Build lookup: token_id → list of (unix_ts, actual_price) for BUY side
+    activity_map: dict[str, list] = defaultdict(list)
+    for raw in activity:
+        if (raw.get("side") or "").upper() != "BUY":
+            continue
+        tid = raw.get("asset") or raw.get("asset_id") or ""
+        price = float(raw.get("price", 0) or 0)
+        ts = float(raw.get("timestamp", 0) or 0)
+        if tid and price > 0 and ts > 0:
+            activity_map[tid].append((ts, price))
 
     updated = 0
     for ct in buys:
-        actual = _fetch_fill_price(client, ct.order_id)
-        if actual is None:
+        tid = ct.original_token_id
+        if not tid or tid not in activity_map:
             continue
+
+        ct_ts = ct.executed_at.timestamp() if ct.executed_at else 0.0
+
+        # Find closest activity entry by time (within 10 minutes)
+        best_price, best_diff = None, float("inf")
+        for ts, price in activity_map[tid]:
+            diff = abs(ts - ct_ts)
+            if diff < best_diff:
+                best_diff = diff
+                best_price = price
+
+        if best_price is None or best_diff >= 600:
+            continue
+
         current = ct.copy_price or 0.0
-        if abs(current - actual) > 1e-6:
+        if abs(current - best_price) > 1e-6:
             logger.info(
-                "BUY id=%d token=%s: copy_price %.6f → %.6f (diff %.6f)",
-                ct.id, ct.original_token_id, current, actual, actual - current,
+                "BUY id=%d token=...%s: copy_price %.6f → %.6f (diff %.6f, time_gap=%.0fs)",
+                ct.id, tid[-8:], current, best_price, best_price - current, best_diff,
             )
-            ct.copy_price = actual
+            ct.copy_price = best_price
             updated += 1
 
     if updated:
@@ -184,8 +169,8 @@ def recalculate_sell_pnl(session) -> int:
         old_pnl = ct.pnl or 0.0
         if abs(new_pnl - old_pnl) > 1e-6:
             logger.info(
-                "SELL id=%d token=%s: pnl %.4f → %.4f (avg_buy=%.4f, sell_price=%.4f, size=%.4f)",
-                ct.id, ct.original_token_id, old_pnl, new_pnl, avg_buy, sell_price, ct.copy_size,
+                "SELL id=%d token=...%s: pnl %.4f → %.4f (avg_buy=%.4f, sell=%.4f, size=%.4f)",
+                ct.id, ct.original_token_id[-8:], old_pnl, new_pnl, avg_buy, sell_price, ct.copy_size,
             )
             ct.pnl = new_pnl
             updated += 1
@@ -197,18 +182,19 @@ def recalculate_sell_pnl(session) -> int:
 
 
 def main() -> None:
+    from config import settings
+
     logger.info("=== refresh_prices: starting ===")
     init_db()
-    SessionLocal = get_session_factory()
+    session_factory = get_session_factory()
 
-    try:
-        client = _get_clob_client()
-    except Exception as exc:
-        logger.error("Failed to connect to CLOB API: %s", exc)
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if not funder:
+        logger.error("POLYMARKET_FUNDER_ADDRESS is not set — cannot fetch activity.")
         sys.exit(1)
 
-    with SessionLocal() as session:
-        buy_updated = refresh_buy_prices(session, client)
+    with session_factory() as session:
+        buy_updated = refresh_buy_prices(session, funder)
         sell_updated = recalculate_sell_pnl(session)
 
     logger.info(

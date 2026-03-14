@@ -35,14 +35,14 @@ def _make_session() -> requests.Session:
 _http = _make_session()
 
 
-def fetch_trades(wallet_address: str) -> list[dict]:
+def fetch_trades(wallet_address: str, limit: int = 100) -> list[dict]:
     """Fetch recent trades for *wallet_address* from the Polymarket Data API.
 
     Uses the ``/activity`` endpoint with ``user`` param, which correctly
     filters by wallet.  Returns a list of raw trade dicts, newest-first.
     """
     url = f"{settings.DATA_API_BASE}/activity"
-    params = {"user": wallet_address, "limit": 100}
+    params = {"user": wallet_address, "limit": limit}
     try:
         resp = _http.get(url, params=params, timeout=10)
         resp.raise_for_status()
@@ -162,6 +162,50 @@ def get_new_trades(wallet_address: str, watermark: datetime) -> list[dict[str, A
     ]
     new.sort(key=lambda t: t["timestamp"])
     return new
+
+
+def fetch_prices_by_token_ids(token_ids: list[str]) -> dict[str, float]:
+    """Fetch current prices using token IDs directly via Gamma API.
+
+    Queries ``/markets?clob_token_ids=[...]`` which works for both active
+    and recently-resolved markets (unlike the ``/markets/{condition_id}``
+    path which returns 422 for resolved markets).
+
+    Returns ``{token_id: price}`` for every token found.
+    """
+    if not token_ids:
+        return {}
+
+    import json as _json
+
+    price_map: dict[str, float] = {}
+    try:
+        resp = _http.get(
+            f"{settings.GAMMA_API_BASE}/markets",
+            params={"clob_token_ids": _json.dumps(token_ids)},
+            timeout=15,
+        )
+        if not resp.ok:
+            return price_map
+        markets = resp.json()
+        if not isinstance(markets, list):
+            markets = [markets]
+        for data in markets:
+            t_ids = data.get("clobTokenIds", [])
+            prices = data.get("outcomePrices", [])
+            if isinstance(t_ids, str):
+                t_ids = _json.loads(t_ids)
+            if isinstance(prices, str):
+                prices = _json.loads(prices)
+            for tid, p in zip(t_ids, prices):
+                try:
+                    price_map[str(tid)] = float(p)
+                except (ValueError, TypeError):
+                    pass
+    except Exception as exc:
+        logger.warning("Error fetching prices by token IDs: %s", exc)
+
+    return price_map
 
 
 def fetch_positions(wallet_address: str) -> list[dict[str, Any]]:

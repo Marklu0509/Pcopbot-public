@@ -120,23 +120,36 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
 
     df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
 
-    # Fetch live prices from Gamma API using our actual token IDs
-    from bot.tracker import fetch_token_prices
-    import requests as _requests
-    condition_ids = df["ConditionId"].dropna().unique().tolist()
+    # Fetch live prices using token IDs directly (works for active + resolved markets)
+    from bot.tracker import fetch_prices_by_token_ids, fetch_token_prices
+    all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
     price_map: dict[str, float] = {}
-    if condition_ids:
+
+    # Primary: Gamma API via clob_token_ids query param
+    if all_buy_token_ids:
         try:
-            price_map = fetch_token_prices(condition_ids)
+            price_map = fetch_prices_by_token_ids(all_buy_token_ids)
         except Exception:
             pass
 
-    # Fallback: for tokens still missing prices, query CLOB book API midpoint
-    all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
-    missing = [tid for tid in all_buy_token_ids if tid and price_map.get(tid, 0.0) == 0.0]
-    for tid in missing:
+    # Secondary: Gamma API via condition_id for any still missing
+    missing_tids = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
+    if missing_tids:
+        missing_cids = (
+            df[df["TokenId"].isin(missing_tids)]["ConditionId"].dropna().unique().tolist()
+        )
+        if missing_cids:
+            try:
+                price_map.update(fetch_token_prices(missing_cids))
+            except Exception:
+                pass
+
+    # Tertiary: CLOB book midpoint for any still missing (active markets only)
+    import requests as _req
+    still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
+    for tid in still_missing:
         try:
-            resp = _requests.get(
+            resp = _req.get(
                 "https://clob.polymarket.com/book",
                 params={"token_id": tid},
                 timeout=5,
