@@ -53,6 +53,23 @@ def _fetch_activity(wallet_address: str, limit: int = 500) -> list[dict]:
         return []
 
 
+def _fetch_activity_all(wallet_address: str, limit: int = 500) -> list[dict]:
+    """Fetch all activity types (TRADE + REDEEM) for a wallet."""
+    import requests
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/activity",
+            params={"user": wallet_address, "limit": limit},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else data.get("data", [])
+    except Exception as exc:
+        logger.error("Failed to fetch activity for %s: %s", wallet_address, exc)
+        return []
+
+
 def _build_activity_map(activity: list[dict], side: str) -> dict[str, list]:
     """Build {token_id: [(unix_ts, price), ...]} for trades of the given side."""
     result: dict[str, list] = defaultdict(list)
@@ -223,6 +240,130 @@ def recalculate_sell_pnl(session) -> int:
         session.commit()
     logger.info("Updated PnL on %d SELL trade(s).", updated)
     return updated
+
+
+# ── Manual redemption sync ───────────────────────────────────────────────────
+
+def sync_manual_redemptions(session, funder_address: str, all_activity: list[dict] | None = None) -> int:
+    """Create SELL records for manual Polymarket redemptions not yet in DB.
+
+    REDEEM activities have empty asset/outcome fields, so we match by
+    conditionId to find which traders held positions in that market.
+    For each trader with net holdings > 0 in the redeemed market, we
+    create a synthetic SELL at price=1.0 (redemption always pays $1/share).
+
+    Returns the number of records created.
+    """
+    import datetime
+    from sqlalchemy import or_
+    from bot.executor import _get_net_holdings
+
+    if all_activity is None:
+        all_activity = _fetch_activity_all(funder_address, limit=500)
+
+    redeems = [d for d in all_activity if d.get("type", "").upper() == "REDEEM"]
+    if not redeems:
+        logger.info("No REDEEM activities found.")
+        return 0
+
+    logger.info("Found %d REDEEM activities to process.", len(redeems))
+    created = 0
+
+    for raw in redeems:
+        condition_id = raw.get("conditionId", "")
+        tx_hash = raw.get("transactionHash", "")
+        market_title = raw.get("title", "")
+        if not condition_id or not tx_hash:
+            continue
+
+        ts = float(raw.get("timestamp", 0) or 0)
+        redeem_time = datetime.datetime.utcfromtimestamp(ts) if ts else datetime.datetime.utcnow()
+
+        # Duplicate check: if we already have a record for this tx, skip
+        order_id_key = f"manual_redeem:{tx_hash[:20]}"
+        if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
+            logger.debug("Already recorded: %s", order_id_key)
+            continue
+
+        # Find all BUY trades for this market across all traders
+        buy_trades = (
+            session.query(CopyTrade)
+            .filter(
+                CopyTrade.original_market == condition_id,
+                CopyTrade.original_side == "BUY",
+                CopyTrade.status.in_(["success", "dry_run"]),
+            )
+            .all()
+        )
+        if not buy_trades:
+            logger.debug("No BUY trades for redeemed market %s (%s)", market_title, condition_id[:12])
+            continue
+
+        # Group by trader_id → unique token_ids
+        by_trader: dict[int, set] = defaultdict(set)
+        for bt in buy_trades:
+            if bt.original_token_id:
+                by_trader[bt.trader_id].add(bt.original_token_id)
+
+        for trader_id, token_ids in by_trader.items():
+            for token_id in token_ids:
+                net_shares = _get_net_holdings(session, trader_id, token_id)
+                if net_shares <= 0:
+                    continue  # already fully sold or no holdings
+
+                # Weighted avg buy price for this trader + token
+                result = (
+                    session.query(
+                        func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0),
+                        func.coalesce(func.sum(CopyTrade.copy_size), 0.0),
+                    )
+                    .filter(
+                        CopyTrade.trader_id == trader_id,
+                        CopyTrade.original_token_id == token_id,
+                        CopyTrade.original_side == "BUY",
+                        CopyTrade.status.in_(["success", "dry_run"]),
+                    )
+                    .first()
+                )
+                total_cost, total_size = result
+                avg_buy = (total_cost / total_size) if total_size and total_size > 0 else 0.0
+                pnl = round((1.0 - avg_buy) * net_shares, 4)
+
+                # Get outcome from any buy trade for this token
+                sample_buy = next(
+                    (bt for bt in buy_trades if bt.trader_id == trader_id and bt.original_token_id == token_id),
+                    buy_trades[0],
+                )
+
+                redemption = CopyTrade(
+                    trader_id=trader_id,
+                    original_trade_id=f"redeem:{tx_hash[:24]}",
+                    original_market=condition_id,
+                    original_token_id=token_id,
+                    market_title=market_title or sample_buy.market_title,
+                    outcome=sample_buy.outcome,
+                    original_side="SELL",
+                    original_size=net_shares,
+                    original_price=1.0,
+                    original_timestamp=redeem_time,
+                    copy_size=net_shares,
+                    copy_price=1.0,
+                    status="success",
+                    order_id=order_id_key,
+                    pnl=pnl,
+                    executed_at=redeem_time,
+                )
+                session.add(redemption)
+                created += 1
+                logger.info(
+                    "Redemption recorded: market=%s trader=%d size=%.4f avg_buy=%.4f pnl=%.4f",
+                    market_title or condition_id[:12], trader_id, net_shares, avg_buy, pnl,
+                )
+
+    if created:
+        session.commit()
+    logger.info("Created %d manual redemption record(s).", created)
+    return created
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
