@@ -357,6 +357,16 @@ def run() -> None:
                 except Exception as exc:
                     logger.error("Error syncing positions/PnL: %s", exc)
 
+            # Auto-redeem resolved winning positions every 20 poll cycles
+            if _poll_count % 20 == 0:
+                try:
+                    from bot.redeemer import redeem_resolved_positions
+                    redeemed = redeem_resolved_positions(session)
+                    if redeemed:
+                        logger.info("Auto-redeemed %d resolved position(s).", redeemed)
+                except Exception as exc:
+                    logger.error("Error during auto-redemption: %s", exc)
+
         logger.debug("Sleeping %s seconds…", poll_interval)
         time.sleep(poll_interval)
 
