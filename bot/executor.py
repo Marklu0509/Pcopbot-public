@@ -468,8 +468,12 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
     sold = 0
     for (trader_id, token_id), buys in token_trader_map.items():
         # Use wallet's actual position size as source of truth.
-        # Falls back to DB net holdings if wallet data unavailable.
+        # Only fall back to DB if funder position data was not loaded at all.
         wallet_size = funder_sizes.get(token_id, 0.0)
+        if funder_sizes and wallet_size <= 0:
+            # Wallet data is available and shows no holdings — trust it.
+            # The position was likely sold manually or redeemed outside the bot.
+            continue
         db_net = _get_net_holdings(session, trader_id, token_id)
         net_shares = wallet_size if wallet_size > 0 else db_net
         if net_shares <= 0:
