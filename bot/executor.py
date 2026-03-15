@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 # If a SELL would leave less than this USD value, close out the full position.
 SELL_DUST_CLOSEOUT_USD = 1.0
 
+# Cooldown between FOK sell attempts per token (seconds).
+# Prevents spamming the CLOB API when price is near but below threshold.
+_AUTO_SELL_COOLDOWN = 30
+_auto_sell_last_attempt: dict[str, float] = {}
+
 
 def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
     """Return net share holdings for a trader+token from successful/dry_run copy trades."""
@@ -347,46 +352,36 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             if comp_best_ask is not None and comp_best_ask > 0:
                 complement_price = round(1.0 - comp_best_ask, 4)
 
-        clob_triggered = best_bid is not None and best_bid >= threshold
-        gamma_triggered = gamma_price >= threshold
-        funder_triggered = funder_price >= threshold
-        complement_triggered = complement_price >= threshold
+        # Best observed price from all sources
+        effective = max(gamma_price, funder_price, complement_price, best_bid or 0.0)
 
-        if not clob_triggered and not gamma_triggered and not funder_triggered and not complement_triggered:
-            effective = max(gamma_price, funder_price, complement_price, best_bid or 0.0)
-            if effective >= 0.95:
-                logger.info(
-                    "auto_sell skip: token=%s CLOB_bid=%s Comp=%.4f Gamma=%.4f Funder=%.4f < threshold=%.4f",
-                    token_id[:16],
-                    f"{best_bid:.4f}" if best_bid is not None else "None",
-                    complement_price,
-                    gamma_price,
-                    funder_price,
-                    threshold,
-                )
-            continue
+        # Strategy: CLOB handles complement matching transparently.
+        # FOK orders are free (off-chain, auto-cancel if no fill).
+        # When price is close (>= ATTEMPT_FLOOR), attempt FOK SELL at
+        # threshold price — CLOB may fill via complement matching even
+        # though the visible orderbook shows a lower price.
+        attempt_floor = max(threshold - 0.05, 0.90)
 
-        # Determine sell price: prefer complement price (most accurate for binary
-        # markets), then CLOB direct bid, then threshold as fallback
-        if complement_triggered:
-            sell_price = complement_price
+        if effective < attempt_floor:
+            continue  # Price too far from threshold, skip silently
+
+        # Cooldown: don't spam FOK attempts every cycle when price < threshold
+        if effective < threshold:
+            now_ts = time.monotonic()
+            last = _auto_sell_last_attempt.get(token_id, 0.0)
+            if now_ts - last < _AUTO_SELL_COOLDOWN:
+                continue  # Still in cooldown, skip
+            _auto_sell_last_attempt[token_id] = now_ts
             logger.info(
-                "auto_sell: token=%s complement-matched price %.4f >= %.4f "
-                "(CLOB_bid=%s, No_ask=%.4f, Gamma=%.4f, Funder=%.4f)",
-                token_id[:16], complement_price, threshold,
+                "auto_sell ATTEMPT: token=%s effective=%.4f < threshold=%.4f, "
+                "trying FOK at %.4f (CLOB_bid=%s Comp=%.4f Gamma=%.4f Funder=%.4f)",
+                token_id[:16], effective, threshold, threshold,
                 f"{best_bid:.4f}" if best_bid is not None else "None",
-                1.0 - complement_price if complement_price else 0.0,
-                gamma_price, funder_price,
+                complement_price, gamma_price, funder_price,
             )
-        elif clob_triggered:
-            sell_price = best_bid
-        else:
-            # Gamma/Funder triggered but no complement data — use threshold
-            sell_price = threshold
-            logger.info(
-                "auto_sell: token=%s using threshold %.4f (Gamma=%.4f, Funder=%.4f, no complement data)",
-                token_id[:16], threshold, gamma_price, funder_price,
-            )
+
+        # Always sell at threshold price — let CLOB find the best match
+        sell_price = threshold
         sample = buys[0]
         avg_buy = _get_avg_buy_price(session, trader_id, token_id)
         pnl = round((sell_price - avg_buy) * net_shares, 4)
@@ -427,7 +422,12 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         except Exception as exc:
             status = "failed"
             error_msg = str(exc)
-            logger.error("auto_sell FAILED for token=%s: %s", token_id[:16], exc)
+            # FOK not filling is expected when attempting below visible price.
+            # Only log at INFO to avoid noisy error logs on every cycle.
+            logger.info(
+                "auto_sell FOK not filled for token=%s (will retry next cycle): %s",
+                token_id[:16], exc,
+            )
 
         if status != "success":
             # Don't persist failed attempts — they pollute trade history
