@@ -54,6 +54,7 @@ def render() -> None:
             max_value=3600.0,
             value=float(current_interval),
             step=0.1,
+            format="%.1f",
             help=_DEFAULTS["poll_interval_seconds"]["help"],
         )
 
