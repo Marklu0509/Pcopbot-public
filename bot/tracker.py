@@ -208,12 +208,19 @@ def fetch_prices_by_token_ids(token_ids: list[str]) -> dict[str, float]:
     return price_map
 
 
-def fetch_complement_token_ids(token_ids: list[str]) -> dict[str, str]:
-    """Return a mapping of ``{token_id: complement_token_id}`` for binary markets.
+def fetch_complement_token_ids(
+    token_ids: list[str],
+    condition_ids: list[str] | None = None,
+) -> dict[str, str]:
+    """Return ``{token_id: complement_token_id}`` for binary markets.
 
-    In a binary market each token has a complement (Yes ↔ No).
-    Queries Gamma ``/markets?clob_token_ids=[...]`` and pairs up token IDs
-    from the same market.
+    Two strategies:
+    1. Gamma ``/markets?clob_token_ids=[...]`` — works for active markets.
+    2. CLOB REST API ``/markets/{condition_id}`` fallback — works even for
+       resolved markets where Gamma returns 422/empty.
+
+    *condition_ids* is an optional list of condition IDs to try via CLOB
+    for any tokens not found via Gamma.
     """
     if not token_ids:
         return {}
@@ -221,27 +228,52 @@ def fetch_complement_token_ids(token_ids: list[str]) -> dict[str, str]:
     import json as _json
 
     complement_map: dict[str, str] = {}
+    found_tokens: set[str] = set()
+
+    # --- Strategy 1: Gamma batch query ---
     try:
         resp = _http.get(
             f"{settings.GAMMA_API_BASE}/markets",
             params={"clob_token_ids": _json.dumps(token_ids)},
             timeout=15,
         )
-        if not resp.ok:
-            return complement_map
-        markets = resp.json()
-        if not isinstance(markets, list):
-            markets = [markets]
-        for data in markets:
-            t_ids = data.get("clobTokenIds", [])
-            if isinstance(t_ids, str):
-                t_ids = _json.loads(t_ids)
-            # Binary market: exactly 2 tokens
-            if len(t_ids) == 2:
-                complement_map[str(t_ids[0])] = str(t_ids[1])
-                complement_map[str(t_ids[1])] = str(t_ids[0])
+        if resp.ok:
+            markets = resp.json()
+            if not isinstance(markets, list):
+                markets = [markets]
+            for data in markets:
+                t_ids = data.get("clobTokenIds", [])
+                if isinstance(t_ids, str):
+                    t_ids = _json.loads(t_ids)
+                if len(t_ids) == 2:
+                    complement_map[str(t_ids[0])] = str(t_ids[1])
+                    complement_map[str(t_ids[1])] = str(t_ids[0])
+                    found_tokens.update(str(t) for t in t_ids)
     except Exception as exc:
-        logger.warning("Error fetching complement token IDs: %s", exc)
+        logger.warning("Gamma complement lookup failed: %s", exc)
+
+    # --- Strategy 2: CLOB REST API fallback for missing tokens ---
+    missing = [t for t in token_ids if t not in found_tokens]
+    if missing and condition_ids:
+        for cid in set(condition_ids):
+            try:
+                resp = _http.get(
+                    f"https://clob.polymarket.com/markets/{cid}",
+                    timeout=10,
+                )
+                if not resp.ok:
+                    continue
+                market_data = resp.json()
+                tokens = market_data.get("tokens", [])
+                if len(tokens) == 2:
+                    t0 = str(tokens[0].get("token_id", ""))
+                    t1 = str(tokens[1].get("token_id", ""))
+                    if t0 and t1:
+                        complement_map[t0] = t1
+                        complement_map[t1] = t0
+                        found_tokens.update([t0, t1])
+            except Exception as exc:
+                logger.warning("CLOB complement lookup failed for %s: %s", cid, exc)
 
     return complement_map
 

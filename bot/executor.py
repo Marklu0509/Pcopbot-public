@@ -316,10 +316,15 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
     # effective sell price = 1 - best_ask(complement).
     # This is the most reliable method: it's exactly how Polymarket UI
     # calculates the sell price.
+    # Collect condition_ids from buys for CLOB API fallback
+    unique_condition_ids = list({
+        ct.original_market for cts in token_trader_map.values()
+        for ct in cts if ct.original_market
+    })
     complement_map: dict[str, str] = {}
     try:
         from bot.tracker import fetch_complement_token_ids
-        complement_map = fetch_complement_token_ids(unique_token_ids)
+        complement_map = fetch_complement_token_ids(unique_token_ids, unique_condition_ids)
     except Exception as exc:
         logger.warning("auto_sell: complement token fetch failed: %s", exc)
 
