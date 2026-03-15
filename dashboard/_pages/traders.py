@@ -545,6 +545,7 @@ def _render_trader_detail(t) -> None:
         _decisive = realized_df[_roi_pct.abs() >= 3]
         wins = (_decisive["Realized PnL"] > 0).sum()
         total_markets = len(_decisive)
+        win_rate = (wins / total_markets * 100) if total_markets > 0 else 0
 
         rm1, rm2, rm3, rm4, rm5 = st.columns(5)
         rm1.metric("Closed Markets", total_markets)
