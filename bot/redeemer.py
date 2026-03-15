@@ -302,14 +302,20 @@ def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | N
             price_map = fetch_prices_by_token_ids([token_id])
             price = price_map.get(token_id, 0.0)
             if price >= 0.99:
-                # Gamma returned 422 — assume binary (neg_risk=False).
-                # If this is actually a neg_risk market, _redeem_binary will
-                # fail fast on zero CTF balance (ValueError, no gas wasted).
+                # Winning token — assume binary (neg_risk=False).
                 logger.warning(
                     "Market %s returned 422 from Gamma — assuming binary for redemption. "
                     "If this is a neg_risk market, please redeem manually.",
                     condition_id[:16],
                 )
+                return {
+                    "neg_risk": False,
+                    "condition_id": condition_id,
+                    "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
+                    "winner": "",
+                }
+            if price < 0.01:
+                # Losing token on a resolved market — record as expired loss
                 return {
                     "neg_risk": False,
                     "condition_id": condition_id,
@@ -554,6 +560,76 @@ def _record_redemption(
     )
 
 
+def _record_expired_loss(
+    session: "Session",
+    trader_id: int,
+    buy_trades: list[CopyTrade],
+    net_shares: float,
+) -> None:
+    """Create a synthetic SELL at price=0 for a resolved losing position.
+
+    Called when a market resolved and our token is the losing side (price ≈ 0).
+    The full cost paid becomes a realized loss.
+    """
+    from sqlalchemy import func
+
+    if not buy_trades:
+        return
+
+    sample = buy_trades[0]
+    order_id_key = f"expired_loss:{sample.original_market[:20]}:t{trader_id}:{sample.original_token_id[:12]}"
+    if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
+        return  # already recorded
+
+    result = (
+        session.query(
+            func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0),
+            func.coalesce(func.sum(CopyTrade.copy_size), 0.0),
+        )
+        .filter(
+            CopyTrade.trader_id         == trader_id,
+            CopyTrade.original_token_id == sample.original_token_id,
+            CopyTrade.original_side     == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .first()
+    )
+    total_cost, total_size = result
+    avg_buy = (total_cost / total_size) if total_size and total_size > 0 else 0.0
+    pnl = round(-avg_buy * net_shares, 4)  # paid avg_buy per share, got $0 back
+
+    loss_record = CopyTrade(
+        trader_id           = trader_id,
+        original_trade_id   = f"expired:{sample.original_market[:24]}",
+        original_market     = sample.original_market,
+        original_token_id   = sample.original_token_id,
+        market_title        = sample.market_title,
+        outcome             = sample.outcome,
+        original_side       = "SELL",
+        original_size       = net_shares,
+        original_price      = 0.0,
+        original_timestamp  = datetime.datetime.utcnow(),
+        copy_size           = net_shares,
+        copy_price          = 0.0,
+        status              = "success",
+        order_id            = order_id_key,
+        pnl                 = pnl,
+        executed_at         = datetime.datetime.utcnow(),
+    )
+    session.add(loss_record)
+
+    for ct in buy_trades:
+        if ct.trader_id == trader_id:
+            ct.pnl = 0.0
+
+    session.commit()
+    logger.info(
+        "Expired loss recorded: market=%s trader=%d shares=%.4f avg_buy=%.4f pnl=%.4f",
+        sample.market_title or sample.original_market[:12],
+        trader_id, net_shares, avg_buy, pnl,
+    )
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def redeem_resolved_positions(session: "Session") -> int:
@@ -659,7 +735,16 @@ def redeem_resolved_positions(session: "Session") -> int:
 
         price = token_data["price"]
         if price < 0.99:
-            # Our token lost (or market is still live) — nothing to redeem
+            if price < 0.01:
+                # Resolved market, our token is the losing side → record the loss
+                label = trades[0].market_title or condition_id[:12]
+                logger.info(
+                    "Expired loss detected: market=%r token=%s shares=%.4f",
+                    label, token_id[:12], net_shares,
+                )
+                _record_expired_loss(session, trader_id, trades, net_shares)
+                seen_conditions.add(condition_id)
+            # price between 0.01–0.98: market still live or outcome uncertain, skip
             continue
 
         is_neg_risk   = market["neg_risk"]
