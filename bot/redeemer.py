@@ -300,9 +300,23 @@ def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | N
     if not data:
         # Fallback for resolved markets that return 422 on /markets/{id}
         if token_id:
-            from bot.tracker import fetch_prices_by_token_ids
+            # Try multiple price sources — Gamma batch can return 0.0 for some tokens
+            from bot.tracker import fetch_prices_by_token_ids, fetch_position_prices
             price_map = fetch_prices_by_token_ids([token_id])
             price = price_map.get(token_id, 0.0)
+
+            # Fallback: funder wallet curPrice (more reliable for resolved markets)
+            if price < 0.99:
+                funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+                if funder:
+                    try:
+                        funder_prices = fetch_position_prices(funder)
+                        funder_price = funder_prices.get(token_id, 0.0)
+                        if funder_price > price:
+                            price = funder_price
+                    except Exception:
+                        pass
+
             if price >= 0.99:
                 # Winning token — assume binary (neg_risk=False).
                 logger.warning(
@@ -316,9 +330,8 @@ def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | N
                     "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
                     "winner": "",
                 }
-            # price < 0.01 from CLOB is NOT reliable for resolved markets —
-            # the winning token may also show 0 after resolution (CLOB stops).
-            # Do not auto-detect losses from the 422 fallback.
+            # price < 0.99 — market may not be resolved, or token is losing side.
+            # Do not auto-detect losses from fallback prices.
         return None
 
     resolved = data.get("resolved", False) or data.get("closed", False)
@@ -656,8 +669,6 @@ def redeem_resolved_positions(session: "Session") -> int:
         )
         .all()
     )
-    if not open_buys:
-        return 0
 
     # Group by (trader_id, condition_id, token_id)
     groups: dict[tuple, list[CopyTrade]] = defaultdict(list)
@@ -665,15 +676,36 @@ def redeem_resolved_positions(session: "Session") -> int:
         key = (ct.trader_id, ct.original_market, ct.original_token_id)
         groups[key].append(ct)
 
-    # Keep only groups where net holdings > 0 (not already sold)
+    # Fetch funder wallet's actual positions for accurate share counts
+    from bot.tracker import fetch_positions as _fetch_positions
+    funder_wallet_sizes: dict[str, float] = {}
+    if funder_address:
+        try:
+            for p in _fetch_positions(funder_address):
+                tid = p.get("asset_id", "")
+                if tid and p.get("size", 0) > 0:
+                    funder_wallet_sizes[tid] = p["size"]
+        except Exception as exc:
+            logger.warning("Failed to fetch funder positions for redeem: %s", exc)
+
+    # Keep only groups where we actually hold shares (wallet or DB)
     from bot.executor import _get_net_holdings
     active: list[tuple] = []
     for (trader_id, condition_id, token_id), trades in groups.items():
         if not condition_id or not token_id:
             continue
-        net = _get_net_holdings(session, trader_id, token_id)
+        wallet_size = funder_wallet_sizes.pop(token_id, 0.0)
+        db_net = _get_net_holdings(session, trader_id, token_id)
+        net = wallet_size if wallet_size > 0 else db_net
         if net > 0:
             active.append((trader_id, condition_id, token_id, trades, net))
+
+    # Also include wallet-only positions not tracked in DB
+    if funder_wallet_sizes and open_buys:
+        sample_trader_id = open_buys[0].trader_id
+        for token_id, wallet_size in funder_wallet_sizes.items():
+            if wallet_size > 0:
+                active.append((sample_trader_id, "", token_id, [], wallet_size))
 
     if not active:
         return 0
@@ -712,6 +744,27 @@ def redeem_resolved_positions(session: "Session") -> int:
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
 
     for trader_id, condition_id, token_id, trades, net_shares in active:
+        # For wallet-only positions, try to find condition_id from CLOB API
+        if not condition_id:
+            try:
+                from bot.tracker import fetch_complement_token_ids
+                comp_map = fetch_complement_token_ids([token_id])
+                # We just need condition_id — fetch it from CLOB market endpoint
+                import requests as _req
+                resp = _req.get(
+                    f"https://clob.polymarket.com/markets",
+                    params={"token_id": token_id},
+                    timeout=10,
+                )
+                if resp.ok:
+                    mdata = resp.json()
+                    condition_id = mdata.get("condition_id", "") if isinstance(mdata, dict) else ""
+            except Exception:
+                pass
+            if not condition_id:
+                logger.debug("Cannot find condition_id for wallet-only token %s, skipping", token_id[:12])
+                continue
+
         if condition_id in seen_conditions:
             continue
 
@@ -739,7 +792,7 @@ def redeem_resolved_positions(session: "Session") -> int:
             continue
 
         is_neg_risk   = market["neg_risk"]
-        label         = trades[0].market_title or condition_id[:12]
+        label         = (trades[0].market_title if trades else "") or condition_id[:12]
         outcome       = token_data["outcome"]
         outcome_index = token_data["index"]
 
