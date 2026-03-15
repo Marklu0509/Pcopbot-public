@@ -362,8 +362,17 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         # though the visible orderbook shows a lower price.
         attempt_floor = 0.95
 
+        # Always log price info for tokens with holdings
+        logger.info(
+            "auto_sell check: token=%s net=%.4f effective=%.4f "
+            "CLOB_bid=%s Comp=%.4f Gamma=%.4f Funder=%.4f",
+            token_id[:16], net_shares, effective,
+            f"{best_bid:.4f}" if best_bid is not None else "None",
+            complement_price, gamma_price, funder_price,
+        )
+
         if effective < attempt_floor:
-            continue  # Price too far from threshold, skip silently
+            continue  # Price too far from threshold
 
         # Cooldown: don't spam FOK attempts every cycle when price < threshold
         if effective < threshold:
