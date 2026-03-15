@@ -1,7 +1,9 @@
 """Check ERC-1155 approval status for funder wallet."""
 from web3 import Web3
 
-w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+import os
+rpc = os.environ.get("POLYGON_RPC_URL", "https://rpc.ankr.com/polygon")
+w3 = Web3(Web3.HTTPProvider(rpc))
 abi = [
     {
         "inputs": [
