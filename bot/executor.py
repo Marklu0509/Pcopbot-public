@@ -412,8 +412,13 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                 complement_price, gamma_price, funder_price,
             )
 
-        # Always sell at threshold price — let CLOB find the best match
+        # Use funder cur_price as the primary sell price when it's high,
+        # then fall back to lower prices if CLOB rejects.
+        # Priority: cur_price → 0.999 → 0.99
         sell_price = threshold
+        if funder_price >= 0.995:
+            sell_price = round(funder_price, 4)
+
         sample = buys[0] if buys else None
         avg_buy = _get_avg_buy_price(session, trader_id, token_id)
         pnl = round((sell_price - avg_buy) * net_shares, 4)
@@ -435,11 +440,22 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
             from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
 
-            # Try sell_price first; if CLOB rejects due to price bounds
-            # (max 0.99 for some tokens), retry with capped price.
-            prices_to_try = [round(sell_price, 4)]
-            if sell_price > 0.99:
-                prices_to_try.append(0.99)
+            # Build descending price list: cur_price → 0.999 → 0.99
+            # CLOB rejects prices > 0.99 for some tokens, so we cascade.
+            prices_to_try: list[float] = []
+            if sell_price > 0.999:
+                prices_to_try.append(round(sell_price, 4))
+            if sell_price >= 0.999:
+                prices_to_try.append(0.999)
+            prices_to_try.append(0.99)
+            # Deduplicate while preserving order
+            seen: set[float] = set()
+            unique_prices: list[float] = []
+            for p in prices_to_try:
+                if p not in seen:
+                    seen.add(p)
+                    unique_prices.append(p)
+            prices_to_try = unique_prices
 
             last_exc: Exception | None = None
             for attempt_price in prices_to_try:
