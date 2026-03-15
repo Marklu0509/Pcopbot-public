@@ -538,9 +538,13 @@ def _render_trader_detail(t) -> None:
         total_cost = realized_df["Total Cost"].sum()
         total_realized = realized_df["Realized PnL"].sum()
         roi = (total_realized / total_cost * 100) if total_cost > 0 else 0
-        wins = (realized_df["Realized PnL"] > 0).sum()
-        total_markets = len(realized_df)
-        win_rate = (wins / total_markets * 100) if total_markets > 0 else 0
+        # Exclude near-breakeven markets (|ROI| < 3%) from win rate
+        _roi_pct = realized_df["Realized PnL"] / realized_df["Total Cost"].abs().where(
+            realized_df["Total Cost"].abs() > 0, other=float("nan")
+        ) * 100
+        _decisive = realized_df[_roi_pct.abs() >= 3]
+        wins = (_decisive["Realized PnL"] > 0).sum()
+        total_markets = len(_decisive)
 
         rm1, rm2, rm3, rm4, rm5 = st.columns(5)
         rm1.metric("Closed Markets", total_markets)

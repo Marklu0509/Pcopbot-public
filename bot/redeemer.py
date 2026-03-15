@@ -1069,3 +1069,91 @@ def detect_manual_redemptions(session: "Session") -> int:
     if created:
         session.commit()
     return created
+
+
+def detect_expired_losses(session: "Session") -> int:
+    """Record SELL at price=0 for positions where the market closed and our token lost.
+
+    Uses Gamma /markets?clob_token_ids to check both price AND market status.
+    Only triggers when Gamma confirms: closed/inactive AND outcomePrices[token] == 0.
+    This is safe — winning tokens show ~1.0 even after resolution.
+
+    Returns count of new loss records created.
+    """
+    import json as _json
+    import requests as _req
+
+    open_buys = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .all()
+    )
+    if not open_buys:
+        return 0
+
+    # Collect tokens that still have open holdings
+    token_buys: dict[str, list[CopyTrade]] = {}
+    for ct in open_buys:
+        if ct.original_token_id:
+            token_buys.setdefault(ct.original_token_id, []).append(ct)
+
+    all_token_ids = list(token_buys.keys())
+    if not all_token_ids:
+        return 0
+
+    # Fetch market data via Gamma — works for both active and recently-resolved
+    try:
+        resp = _req.get(
+            f"{settings.GAMMA_API_BASE}/markets",
+            params={"clob_token_ids": _json.dumps(all_token_ids)},
+            timeout=15,
+        )
+        if not resp.ok:
+            return 0
+        markets_data = resp.json()
+        if not isinstance(markets_data, list):
+            markets_data = [markets_data]
+    except Exception as exc:
+        logger.warning("detect_expired_losses: failed to fetch Gamma market data: %s", exc)
+        return 0
+
+    # Build token_id -> {price, closed}
+    token_info: dict[str, dict] = {}
+    for mkt in markets_data:
+        t_ids = mkt.get("clobTokenIds", [])
+        prices = mkt.get("outcomePrices", [])
+        if isinstance(t_ids, str):
+            t_ids = _json.loads(t_ids)
+        if isinstance(prices, str):
+            prices = _json.loads(prices)
+        # Market is closed when active=false OR closed=true
+        is_closed = (not mkt.get("active", True)) or bool(mkt.get("closed", False))
+        for tid, p in zip(t_ids, prices):
+            try:
+                token_info[str(tid)] = {"price": float(p), "closed": is_closed}
+            except (ValueError, TypeError):
+                pass
+
+    created = 0
+    for token_id, buys in token_buys.items():
+        info = token_info.get(token_id)
+        # Require: market confirmed closed AND Gamma price == 0
+        if info is None or not info["closed"] or info["price"] >= 0.02:
+            continue
+
+        by_trader: dict[int, list] = {}
+        for ct in buys:
+            by_trader.setdefault(ct.trader_id, []).append(ct)
+
+        from bot.executor import _get_net_holdings
+        for trader_id, trader_buys in by_trader.items():
+            net = _get_net_holdings(session, trader_id, token_id)
+            if net <= 0:
+                continue
+            _record_expired_loss(session, trader_id, trader_buys, net)
+            created += 1
+
+    return created

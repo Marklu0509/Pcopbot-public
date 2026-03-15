@@ -70,11 +70,15 @@ def render() -> None:
     net_pnl = realized_pnl + unrealized_pnl
     roi = (net_pnl / total_invested * 100) if total_invested > 0 else 0
 
-    # Win rate per market
-    market_pnl = executed.groupby(["market", "outcome"])["pnl"].sum()
-    wins = (market_pnl > 0).sum()
-    total_markets = len(market_pnl)
-    win_rate = (wins / total_markets * 100) if total_markets > 0 else 0
+    # Win rate per market — exclude near-breakeven trades (|ROI| < 3%)
+    sell_groups = executed[executed["side"] == "SELL"].groupby(["market", "outcome"])
+    buy_cost_groups = executed[executed["side"] == "BUY"].groupby(["market", "outcome"])
+    market_pnl = sell_groups["pnl"].sum()
+    market_cost = buy_cost_groups["cost"].sum().reindex(market_pnl.index, fill_value=0.0)
+    roi_pct = market_pnl / market_cost.where(market_cost > 0, other=float("nan")) * 100
+    decisive = market_pnl[roi_pct.abs() >= 3]
+    wins = (decisive > 0).sum()
+    total_markets = len(decisive)
 
     st.subheader("📈 Overall Summary")
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
