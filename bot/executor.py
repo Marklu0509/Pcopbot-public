@@ -309,13 +309,15 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         gamma_triggered = gamma_price >= threshold
 
         if not clob_triggered and not gamma_triggered:
-            logger.debug(
-                "auto_sell skip: token=%s CLOB_bid=%s Gamma=%.4f threshold=%.4f",
-                token_id[:16],
-                f"{best_bid:.4f}" if best_bid is not None else "None",
-                gamma_price,
-                threshold,
-            )
+            # Log at INFO when price is close (>= 0.95) so user can see monitoring
+            if gamma_price >= 0.95 or (best_bid is not None and best_bid >= 0.95):
+                logger.info(
+                    "auto_sell skip: token=%s CLOB_bid=%s Gamma=%.4f < threshold=%.4f",
+                    token_id[:16],
+                    f"{best_bid:.4f}" if best_bid is not None else "None",
+                    gamma_price,
+                    threshold,
+                )
             continue
 
         if not best_bid:
