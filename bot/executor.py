@@ -440,14 +440,13 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
             from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
 
-            # Build descending price list: cur_price → 0.999 → 0.99
+            # Build descending price list: cur_price → 0.999
             # CLOB rejects prices > 0.99 for some tokens, so we cascade.
+            # If both fail, skip — let auto-redeem handle it at $1.00 for free.
             prices_to_try: list[float] = []
             if sell_price > 0.999:
                 prices_to_try.append(round(sell_price, 4))
-            if sell_price >= 0.999:
-                prices_to_try.append(0.999)
-            prices_to_try.append(0.99)
+            prices_to_try.append(0.999)
             # Deduplicate while preserving order
             seen: set[float] = set()
             unique_prices: list[float] = []
