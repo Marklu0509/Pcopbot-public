@@ -316,14 +316,9 @@ def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | N
                     "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
                     "winner": "",
                 }
-            if price < 0.01:
-                # Losing token on a resolved market — record as expired loss
-                return {
-                    "neg_risk": False,
-                    "condition_id": condition_id,
-                    "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
-                    "winner": "",
-                }
+            # price < 0.01 from CLOB is NOT reliable for resolved markets —
+            # the winning token may also show 0 after resolution (CLOB stops).
+            # Do not auto-detect losses from the 422 fallback.
         return None
 
     resolved = data.get("resolved", False) or data.get("closed", False)
@@ -737,16 +732,9 @@ def redeem_resolved_positions(session: "Session") -> int:
 
         price = token_data["price"]
         if price < 0.99:
-            if price < 0.01:
-                # Resolved market, our token is the losing side → record the loss
-                label = trades[0].market_title or condition_id[:12]
-                logger.info(
-                    "Expired loss detected: market=%r token=%s shares=%.4f",
-                    label, token_id[:12], net_shares,
-                )
-                _record_expired_loss(session, trader_id, trades, net_shares)
-                seen_conditions.add(condition_id)
-            # price between 0.01–0.98: market still live or outcome uncertain, skip
+            # Cannot reliably detect losses from CLOB prices alone —
+            # resolved winning tokens may also show price=0 after market closes.
+            # Skip: market still live, or outcome uncertain.
             continue
 
         is_neg_risk   = market["neg_risk"]
