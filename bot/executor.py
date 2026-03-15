@@ -18,10 +18,129 @@ logger = logging.getLogger(__name__)
 # If a SELL would leave less than this USD value, close out the full position.
 SELL_DUST_CLOSEOUT_USD = 1.0
 
+# Polymarket contract addresses on Polygon (chain_id=137).
+_CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens (ERC-1155)
+_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Regular
+_NEG_RISK_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"  # NegRiskAdapter
+
+# Minimal ABI for ERC-1155 approval check + set
+_ERC1155_APPROVAL_ABI = [
+    {
+        "inputs": [
+            {"name": "account", "type": "address"},
+            {"name": "operator", "type": "address"},
+        ],
+        "name": "isApprovedForAll",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"},
+        ],
+        "name": "setApprovalForAll",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+# Cache: set of exchange addresses already approved this session.
+_approved_exchanges: set[str] = set()
+
 # Cooldown between FOK sell attempts per token (seconds).
 # Prevents spamming the CLOB API when price is near but below threshold.
 _AUTO_SELL_COOLDOWN = 30
 _auto_sell_last_attempt: dict[str, float] = {}
+
+
+def _ensure_sell_approval(client, token_id: str) -> None:
+    """Ensure the funder wallet has approved the correct Exchange contract
+    to transfer conditional tokens (ERC-1155 setApprovalForAll).
+
+    Checks both regular and neg-risk exchange contracts. Sends an on-chain
+    approval tx if needed (costs minimal gas on Polygon, ~0.001 MATIC).
+    """
+    from web3 import Web3
+
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    funder_key = (settings.POLYMARKET_FUNDER_PRIVATE_KEY or "").strip()
+    if not funder or not funder_key:
+        # Fall back to proxy key if no separate funder key
+        funder_key = (settings.POLYMARKET_PRIVATE_KEY or "").strip()
+    if not funder or not funder_key:
+        return
+
+    # Determine if this token uses neg-risk exchange
+    is_neg_risk = False
+    try:
+        resp = client.get_neg_risk(token_id)
+        if isinstance(resp, dict):
+            is_neg_risk = resp.get("neg_risk", False)
+        elif isinstance(resp, bool):
+            is_neg_risk = resp
+    except Exception:
+        pass  # Default to checking both
+
+    exchanges_to_check = []
+    if is_neg_risk:
+        exchanges_to_check.append(_NEG_RISK_EXCHANGE)
+    else:
+        exchanges_to_check.append(_EXCHANGE_ADDRESS)
+    # Always check both to be safe
+    exchanges_to_check = [_EXCHANGE_ADDRESS, _NEG_RISK_EXCHANGE]
+
+    rpc_url = settings.POLYGON_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    ctf = w3.eth.contract(
+        address=Web3.to_checksum_address(_CTF_ADDRESS),
+        abi=_ERC1155_APPROVAL_ABI,
+    )
+    funder_cs = Web3.to_checksum_address(funder)
+
+    for exchange_addr in exchanges_to_check:
+        if exchange_addr in _approved_exchanges:
+            continue
+
+        exchange_cs = Web3.to_checksum_address(exchange_addr)
+        try:
+            approved = ctf.functions.isApprovedForAll(funder_cs, exchange_cs).call()
+        except Exception as exc:
+            logger.warning("Failed to check approval for %s: %s", exchange_addr[:10], exc)
+            continue
+
+        if approved:
+            _approved_exchanges.add(exchange_addr)
+            continue
+
+        # Need to approve — send on-chain tx
+        logger.info(
+            "Setting ERC-1155 approval for Exchange %s (funder=%s)…",
+            exchange_addr[:10], funder[:10],
+        )
+        try:
+            tx = ctf.functions.setApprovalForAll(exchange_cs, True).build_transaction({
+                "from": funder_cs,
+                "nonce": w3.eth.get_transaction_count(funder_cs),
+                "gas": 100_000,
+                "gasPrice": w3.eth.gas_price,
+                "chainId": settings.POLYMARKET_CHAIN_ID,
+            })
+            signed = w3.eth.account.sign_transaction(tx, private_key=funder_key)
+            tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt["status"] == 1:
+                _approved_exchanges.add(exchange_addr)
+                logger.info(
+                    "Approval tx confirmed: %s (exchange=%s)",
+                    tx_hash.hex(), exchange_addr[:10],
+                )
+            else:
+                logger.error("Approval tx failed: %s", tx_hash.hex())
+        except Exception as exc:
+            logger.error("Failed to send approval tx for %s: %s", exchange_addr[:10], exc)
 
 
 def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
@@ -436,6 +555,12 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         error_msg: str | None = None
         recorded_price = sell_price
 
+        # Ensure ERC-1155 approval before attempting sell
+        try:
+            _ensure_sell_approval(client, token_id)
+        except Exception as exc:
+            logger.warning("auto_sell: approval check failed for token=%s: %s", token_id[:16], exc)
+
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
             from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
@@ -457,6 +582,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             prices_to_try = unique_prices
 
             last_exc: Exception | None = None
+            approval_retried = False
             for attempt_price in prices_to_try:
                 try:
                     order_args = OrderArgs(
@@ -480,13 +606,35 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                 except Exception as exc:
                     last_exc = exc
                     err_str = str(exc)
-                    # If price bounds error ("min: 0.01 - max: 0.99"), retry with lower price
+                    # If price bounds error, retry with lower price
                     if "max: 0.99" in err_str or "max:0.99" in err_str:
                         logger.info(
                             "auto_sell: price %.4f rejected (bounds), retrying at next price for token=%s",
                             attempt_price, token_id[:16],
                         )
                         continue
+                    # If balance/allowance error, try setting approval and retry once
+                    if "balance" in err_str.lower() and "allowance" in err_str.lower() and not approval_retried:
+                        approval_retried = True
+                        logger.info(
+                            "auto_sell: balance/allowance error for token=%s, forcing approval and retrying…",
+                            token_id[:16],
+                        )
+                        # Clear cache so _ensure_sell_approval re-checks on-chain
+                        _approved_exchanges.clear()
+                        try:
+                            _ensure_sell_approval(client, token_id)
+                        except Exception:
+                            pass
+                        # Also refresh CLOB's cached balance/allowance
+                        try:
+                            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore
+                            client.update_balance_allowance(
+                                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                            )
+                        except Exception:
+                            pass
+                        continue  # Retry same price after approval
                     # Other errors: don't retry
                     break
 
