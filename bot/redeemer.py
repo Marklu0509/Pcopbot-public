@@ -39,6 +39,8 @@ _POLYGON_RPC_FALLBACKS = [
     "https://polygon.drpc.org",
     "https://rpc.ankr.com/polygon",
 ]
+_RELAYER_URL = "https://relayer-v2.polymarket.com/submit"
+_ZERO_ADDR   = "0x0000000000000000000000000000000000000000"
 
 # ── Minimal ABIs ─────────────────────────────────────────────────────────────
 _CTF_ABI = [
@@ -66,6 +68,16 @@ _CTF_ABI = [
     },
 ]
 
+_SAFE_ABI_NONCE = [
+    {
+        "inputs": [],
+        "name": "nonce",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
 _NEG_RISK_ABI = [
     {
         "inputs": [
@@ -91,6 +103,123 @@ _NEG_RISK_ABI = [
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _get_safe_nonce(w3, safe_address: str) -> int:
+    """Read the current nonce from a Gnosis Safe contract (read-only, no gas)."""
+    safe = w3.eth.contract(
+        address=w3.to_checksum_address(safe_address),
+        abi=_SAFE_ABI_NONCE,
+    )
+    return safe.functions.nonce().call()
+
+
+def _compute_safe_tx_hash(
+    chain_id: int, safe_address: str, to: str, data: bytes, nonce: int
+) -> bytes:
+    """Compute the EIP-712 Safe transaction hash for a gasless CALL operation."""
+    from eth_abi import encode as _enc
+    from web3 import Web3
+
+    zero = Web3.to_checksum_address(_ZERO_ADDR)
+
+    domain_typehash = Web3.keccak(
+        text="EIP712Domain(uint256 chainId,address verifyingContract)"
+    )
+    safe_tx_typehash = Web3.keccak(
+        text=(
+            "SafeTx(address to,uint256 value,bytes data,uint8 operation,"
+            "uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,"
+            "address gasToken,address refundReceiver,uint256 nonce)"
+        )
+    )
+
+    domain_sep = Web3.keccak(
+        _enc(
+            ["bytes32", "uint256", "address"],
+            [domain_typehash, chain_id, Web3.to_checksum_address(safe_address)],
+        )
+    )
+    struct_hash = Web3.keccak(
+        _enc(
+            [
+                "bytes32", "address", "uint256", "bytes32", "uint8",
+                "uint256", "uint256", "uint256", "address", "address", "uint256",
+            ],
+            [
+                safe_tx_typehash,
+                Web3.to_checksum_address(to),
+                0,                   # value
+                Web3.keccak(data),   # keccak256(data)
+                0,                   # operation = CALL
+                0,                   # safeTxGas
+                0,                   # baseGas
+                0,                   # gasPrice
+                zero,                # gasToken
+                zero,                # refundReceiver
+                nonce,
+            ],
+        )
+    )
+    return Web3.keccak(b"\x19\x01" + domain_sep + struct_hash)
+
+
+def _sign_safe_hash(account, hash_bytes: bytes) -> str:
+    """Sign a raw Safe tx hash with the account key. Returns 0x-prefixed hex."""
+    try:
+        signed = account.unsafe_sign_hash(hash_bytes)
+    except AttributeError:
+        signed = account.signHash(hash_bytes)  # older eth_account fallback
+    return "0x" + signed.signature.hex()
+
+
+def _submit_via_relayer(
+    from_addr: str, to: str, proxy_wallet: str,
+    data: bytes, nonce: int, signature: str,
+) -> str:
+    """POST a Safe transaction to the Polymarket Relayer (gasless). Returns transaction ID."""
+    import requests as _req
+
+    relayer_key = (settings.POLYMARKET_RELAYER_API_KEY or "").strip()
+    if not relayer_key:
+        raise RuntimeError(
+            "POLYMARKET_RELAYER_API_KEY is not set. "
+            "Get it from Polymarket Settings → API Keys and add to .env."
+        )
+
+    payload = {
+        "from": from_addr,
+        "to": to,
+        "proxyWallet": proxy_wallet,
+        "data": "0x" + data.hex(),
+        "nonce": str(nonce),
+        "signature": signature,
+        "signatureParams": {
+            "gasPrice": "0",
+            "operation": "0",
+            "safeTxnGas": "0",
+            "baseGas": "0",
+            "gasToken": _ZERO_ADDR,
+            "refundReceiver": _ZERO_ADDR,
+        },
+        "type": "SAFE",
+    }
+
+    resp = _req.post(
+        _RELAYER_URL,
+        json=payload,
+        headers={
+            "RELAYER_API_KEY": relayer_key,
+            "RELAYER_API_KEY_ADDRESS": from_addr,
+            "Content-Type": "application/json",
+        },
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"Relayer API error {resp.status_code}: {resp.text[:300]}")
+
+    result = resp.json()
+    return result.get("transactionID") or result.get("transactionHash") or ""
+
 
 def _condition_bytes(condition_id: str) -> bytes:
     """Convert a 0x-prefixed hex condition_id string to 32 bytes."""
@@ -242,10 +371,11 @@ def _redeem_binary(
     w3, account, condition_id: str, token_id: str, outcome_index: int,
     holder_address: str | None = None,
 ) -> str:
-    """Redeem a winning binary CTF position. Returns tx hash string.
+    """Redeem a winning binary CTF position. Returns tx/relayer ID string.
 
-    ``holder_address`` is the wallet that holds the CTF tokens (funder wallet
-    in proxy-key setups). Falls back to account.address when not provided.
+    When POLYMARKET_RELAYER_API_KEY is set, submits via Relayer (gasless Safe tx).
+    Otherwise falls back to a direct on-chain tx (requires MATIC for gas).
+    ``holder_address`` is the Gnosis Safe / funder wallet that holds the tokens.
     """
     owner = holder_address or account.address
     ctf = w3.eth.contract(
@@ -259,24 +389,43 @@ def _redeem_binary(
             f"No CTF balance for token {token_id[:12]} in wallet {owner[:12]}"
         )
 
-    # indexSet bitmask: outcome at index i → 1 << i
     index_set = 1 << outcome_index
+    data_hex = ctf.encodeABI(
+        fn_name="redeemPositions",
+        args=[
+            w3.to_checksum_address(USDC_ADDRESS),
+            b"\x00" * 32,
+            _condition_bytes(condition_id),
+            [index_set],
+        ],
+    )
+    data_bytes = bytes.fromhex(data_hex.removeprefix("0x"))
 
+    if (settings.POLYMARKET_RELAYER_API_KEY or "").strip():
+        nonce     = _get_safe_nonce(w3, owner)
+        safe_hash = _compute_safe_tx_hash(
+            settings.POLYMARKET_CHAIN_ID, owner, CTF_ADDRESS, data_bytes, nonce
+        )
+        signature = _sign_safe_hash(account, safe_hash)
+        tx_id = _submit_via_relayer(account.address, CTF_ADDRESS, owner, data_bytes, nonce, signature)
+        logger.info("Binary redeem submitted via Relayer: id=%s", tx_id)
+        return tx_id
+
+    # Fallback: direct on-chain (requires MATIC for gas)
     tx = ctf.functions.redeemPositions(
         w3.to_checksum_address(USDC_ADDRESS),
-        b"\x00" * 32,               # parentCollectionId = zero hash (top-level)
+        b"\x00" * 32,
         _condition_bytes(condition_id),
         [index_set],
     ).build_transaction({
         "from":     account.address,
         "nonce":    w3.eth.get_transaction_count(account.address),
         "gas":      250_000,
-        "gasPrice": w3.eth.gas_price * 2,  # 2× for faster inclusion
+        "gasPrice": w3.eth.gas_price * 2,
     })
-
-    signed   = account.sign_transaction(tx)
-    tx_hash  = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt  = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    signed  = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     if receipt["status"] != 1:
         raise RuntimeError(f"Binary redeem tx reverted: {tx_hash.hex()}")
     return tx_hash.hex()
@@ -286,13 +435,12 @@ def _redeem_neg_risk(
     w3, account, condition_id: str, token_id: str,
     holder_address: str | None = None,
 ) -> str:
-    """Redeem a winning neg_risk position via NegRiskAdapter. Returns tx hash string.
+    """Redeem a winning neg_risk position via NegRiskAdapter. Returns tx/relayer ID.
 
-    ``holder_address`` is the wallet that holds the tokens (funder wallet
-    in proxy-key setups). Falls back to account.address when not provided.
+    When POLYMARKET_RELAYER_API_KEY is set, submits via Relayer (gasless Safe tx).
+    ``holder_address`` is the Gnosis Safe / funder wallet that holds the tokens.
     """
     owner = holder_address or account.address
-    # Check NegRiskAdapter balance first, then fall back to CTF
     balance = _get_token_balance(w3, NEG_RISK_ADDRESS, _NEG_RISK_ABI, owner, token_id)
     if balance == 0:
         balance = _get_token_balance(w3, CTF_ADDRESS, _CTF_ABI, owner, token_id)
@@ -305,7 +453,23 @@ def _redeem_neg_risk(
         address=w3.to_checksum_address(NEG_RISK_ADDRESS),
         abi=_NEG_RISK_ABI,
     )
+    data_hex = adapter.encodeABI(
+        fn_name="redeemPositions",
+        args=[_condition_bytes(condition_id), balance],
+    )
+    data_bytes = bytes.fromhex(data_hex.removeprefix("0x"))
 
+    if (settings.POLYMARKET_RELAYER_API_KEY or "").strip():
+        nonce     = _get_safe_nonce(w3, owner)
+        safe_hash = _compute_safe_tx_hash(
+            settings.POLYMARKET_CHAIN_ID, owner, NEG_RISK_ADDRESS, data_bytes, nonce
+        )
+        signature = _sign_safe_hash(account, safe_hash)
+        tx_id = _submit_via_relayer(account.address, NEG_RISK_ADDRESS, owner, data_bytes, nonce, signature)
+        logger.info("Neg-risk redeem submitted via Relayer: id=%s", tx_id)
+        return tx_id
+
+    # Fallback: direct on-chain (requires MATIC for gas)
     tx = adapter.functions.redeemPositions(
         _condition_bytes(condition_id),
         balance,
@@ -315,7 +479,6 @@ def _redeem_neg_risk(
         "gas":      350_000,
         "gasPrice": w3.eth.gas_price * 2,
     })
-
     signed  = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
@@ -462,12 +625,14 @@ def redeem_resolved_positions(session: "Session") -> int:
                 account.address[:12], holder_address[:12],
             )
         else:
-            logger.warning(
-                "Proxy-wallet mode detected but POLYMARKET_FUNDER_PRIVATE_KEY is not set. "
-                "Token holder=%s but signing with proxy key=%s — redemption tx will likely revert. "
-                "Add POLYMARKET_FUNDER_PRIVATE_KEY to .env to enable auto-redemption.",
-                holder_address[:12], account.address[:12],
-            )
+            has_relayer = bool((settings.POLYMARKET_RELAYER_API_KEY or "").strip())
+            if not has_relayer:
+                logger.warning(
+                    "Proxy-wallet mode: token holder=%s, signing with=%s. "
+                    "Set POLYMARKET_RELAYER_API_KEY in .env for gasless auto-redemption, "
+                    "or set POLYMARKET_FUNDER_PRIVATE_KEY if you have the funder wallet key.",
+                    holder_address[:12], account.address[:12],
+                )
 
     redeemed       = 0
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass

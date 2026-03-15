@@ -52,6 +52,9 @@ POLYMARKET_FUNDER_ADDRESS: str = _get_clean("POLYMARKET_FUNDER_ADDRESS")
 # Set this to the funder wallet's private key to enable auto-redemption.
 # Leave empty if POLYMARKET_PRIVATE_KEY already IS the funder wallet key.
 POLYMARKET_FUNDER_PRIVATE_KEY: str = _get_clean("POLYMARKET_FUNDER_PRIVATE_KEY")
+# Relayer API key — get from Polymarket Settings → API Keys.
+# Used to submit redeemPositions transactions gaslessly via Polymarket's relayer.
+POLYMARKET_RELAYER_API_KEY: str = _get_clean("POLYMARKET_RELAYER_API_KEY")
 POLYMARKET_CHAIN_ID: int = _get_int("POLYMARKET_CHAIN_ID", 137)
 
 # Database
