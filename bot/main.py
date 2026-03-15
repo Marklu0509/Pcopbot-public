@@ -332,6 +332,12 @@ def _poll_once(session) -> None:
             logger.info("[%s] Found %d new trade(s).", label, len(new_trades))
 
         for trade in new_trades:
+            # Sell-only mode: skip BUY trades for this trader
+            if getattr(t, "sell_only", False) and trade["side"] == "BUY":
+                logger.info("[%s] Sell-only mode: skipping BUY trade.", label)
+                watermark.advance_watermark(session, t, trade["timestamp"])
+                continue
+
             try:
                 execute_copy_trade(session, t, trade)
             except Exception as exc:

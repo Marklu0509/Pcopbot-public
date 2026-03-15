@@ -49,6 +49,7 @@ def init_db() -> None:
             "ALTER TABLE traders ADD COLUMN buy_order_type VARCHAR DEFAULT 'market'",
             "ALTER TABLE traders ADD COLUMN limit_timeout_seconds INTEGER DEFAULT 30",
             "ALTER TABLE traders ADD COLUMN limit_fallback_market BOOLEAN DEFAULT 1",
+            "ALTER TABLE traders ADD COLUMN sell_only BOOLEAN DEFAULT 0",
         ]:
             try:
                 conn.execute(text(stmt))

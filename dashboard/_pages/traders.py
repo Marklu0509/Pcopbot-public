@@ -322,11 +322,22 @@ def _render_trader_detail(t) -> None:
     _sell_ot = t.sell_order_type or 'market'
     c8.metric("Sell Order", f"{_sell_ot.upper()} ({t.sell_slippage:.0f}%)")
 
-    # ── Toggle active ──
-    new_active = st.toggle("Active", value=t.is_active, key=f"toggle_{t.id}")
-    if new_active != t.is_active:
-        _toggle_trader(t.id, new_active)
-        st.rerun()
+    # ── Toggles ──
+    tc1, tc2 = st.columns(2)
+    with tc1:
+        new_active = st.toggle("Active", value=t.is_active, key=f"toggle_{t.id}")
+        if new_active != t.is_active:
+            _toggle_trader(t.id, new_active)
+            st.rerun()
+    with tc2:
+        cur_sell_only = bool(getattr(t, "sell_only", False))
+        new_sell_only = st.toggle(
+            "Sell Only (skip BUY)", value=cur_sell_only, key=f"sell_only_{t.id}",
+            help="Only copy SELL trades from this trader. BUY trades will be ignored.",
+        )
+        if new_sell_only != cur_sell_only:
+            _update_trader(t.id, {"sell_only": new_sell_only})
+            st.rerun()
 
     # ── Edit full parameters ──
     with st.expander("⚙️ Edit Copy-Trade Settings"):

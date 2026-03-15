@@ -26,6 +26,9 @@ class Trader(Base):
     label = Column(String, default="")
     is_active = Column(Boolean, default=True)
 
+    # Sell-only mode: only copy SELL trades, skip BUY
+    sell_only = Column(Boolean, default=False)
+
     # Sizing — "fixed" or "proportional"
     sizing_mode = Column(String, default="fixed")
     fixed_amount = Column(Float, default=50.0)
