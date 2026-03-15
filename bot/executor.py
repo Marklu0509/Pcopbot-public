@@ -360,7 +360,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         # When price is close (>= ATTEMPT_FLOOR), attempt FOK SELL at
         # threshold price — CLOB may fill via complement matching even
         # though the visible orderbook shows a lower price.
-        attempt_floor = max(threshold - 0.05, 0.90)
+        attempt_floor = 0.95
 
         if effective < attempt_floor:
             continue  # Price too far from threshold, skip silently

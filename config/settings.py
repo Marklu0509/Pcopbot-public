@@ -70,9 +70,10 @@ DATABASE_URL: str = _get("DATABASE_URL", "sqlite:///./data/pcopbot.db")
 # Bot
 POLL_INTERVAL_SECONDS: float = _get_float("POLL_INTERVAL_SECONDS", 15.0)
 DRY_RUN: bool = _get_bool("DRY_RUN", True)
-# Auto-sell threshold: sell position via CLOB when cur_price >= this value.
-# Set to 0 to disable. Default 0.998 captures ~99.8% of winning value without on-chain redemption.
-AUTO_SELL_THRESHOLD: float = _get_float("AUTO_SELL_THRESHOLD", 0.998)
+# Auto-sell threshold: the price to post FOK SELL at.
+# When any price source >= 0.95, bot attempts FOK SELL at this price.
+# Set to 0 to disable. Default 0.999 matches Polymarket UI "Cash Out" price.
+AUTO_SELL_THRESHOLD: float = _get_float("AUTO_SELL_THRESHOLD", 0.999)
 LOG_LEVEL: str = _get("LOG_LEVEL", "INFO")
 
 # Streamlit
