@@ -649,7 +649,7 @@ def redeem_resolved_positions(session: "Session") -> int:
         session.query(CopyTrade)
         .filter(
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success"]),
+            CopyTrade.status.in_(["success", "dry_run"]),
             CopyTrade.original_market.is_not(None),
             CopyTrade.original_token_id.is_not(None),
         )

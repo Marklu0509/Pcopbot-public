@@ -247,20 +247,22 @@ def _get_filled_price(client, order_id: str, fallback_price: float) -> float:
 
 
 def auto_sell_winning_positions(session: Session, threshold: float | None = None) -> int:
-    """Sell any open positions where current CLOB bid price >= threshold.
+    """Sell open positions when price >= threshold.
 
-    Uses the same FOK market-sell path as regular copy trades.
-    Returns count of positions sold.
+    Trigger condition: Gamma outcomePrices OR CLOB best-bid >= threshold.
+    Actual sell price: best available CLOB bid (what we actually receive).
+    If Gamma says winning but CLOB has no bids (market resolved/closed),
+    logs and skips — the 20-cycle redeemer will handle on-chain redemption.
+
+    Returns count of positions successfully sold.
     """
     from datetime import datetime, timezone
-    from sqlalchemy import func
 
     if threshold is None:
         threshold = settings.AUTO_SELL_THRESHOLD
-    if threshold <= 0:
+    if threshold <= 0 or settings.DRY_RUN:
         return 0
 
-    # Find all unique (trader_id, token_id) pairs with open BUY holdings
     open_buys = (
         session.query(CopyTrade)
         .filter(
@@ -272,54 +274,75 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
     if not open_buys:
         return 0
 
+    # Group by (trader_id, token_id)
     token_trader_map: dict[tuple[int, str], list[CopyTrade]] = {}
     for ct in open_buys:
-        key = (ct.trader_id, ct.original_token_id)
-        token_trader_map.setdefault(key, []).append(ct)
+        if ct.original_token_id:
+            key = (ct.trader_id, ct.original_token_id)
+            token_trader_map.setdefault(key, []).append(ct)
 
-    client = None
-    if not settings.DRY_RUN:
-        try:
-            client = _get_clob_client()
-        except Exception as exc:
-            logger.error("auto_sell: failed to get CLOB client: %s", exc)
-            return 0
+    try:
+        client = _get_clob_client()
+    except Exception as exc:
+        logger.error("auto_sell: failed to get CLOB client: %s", exc)
+        return 0
+
+    # Batch-fetch Gamma prices for all unique token_ids (one API call)
+    unique_token_ids = list({tid for (_, tid) in token_trader_map})
+    try:
+        from bot.tracker import fetch_prices_by_token_ids
+        gamma_prices = fetch_prices_by_token_ids(unique_token_ids)
+    except Exception as exc:
+        logger.warning("auto_sell: Gamma price fetch failed: %s", exc)
+        gamma_prices = {}
 
     sold = 0
     for (trader_id, token_id), buys in token_trader_map.items():
-        if not token_id:
-            continue
-
         net_shares = _get_net_holdings(session, trader_id, token_id)
         if net_shares <= 0:
             continue
 
-        # Get best bid price from CLOB (what we'd actually receive)
-        if settings.DRY_RUN:
-            best_bid = None
-        else:
-            best_bid = _get_best_price(client, token_id, "SELL")
+        best_bid = _get_best_price(client, token_id, "SELL")
+        gamma_price = gamma_prices.get(token_id, 0.0)
 
-        # In dry_run mode we can't query CLOB safely, skip auto-sell
-        if settings.DRY_RUN:
+        clob_triggered = best_bid is not None and best_bid >= threshold
+        gamma_triggered = gamma_price >= threshold
+
+        if not clob_triggered and not gamma_triggered:
+            logger.debug(
+                "auto_sell skip: token=%s CLOB_bid=%s Gamma=%.4f threshold=%.4f",
+                token_id[:16],
+                f"{best_bid:.4f}" if best_bid is not None else "None",
+                gamma_price,
+                threshold,
+            )
             continue
 
-        if best_bid is None or best_bid < threshold:
+        if not best_bid:
+            # Gamma says winning but CLOB has no bids — market resolved, CLOB closed.
+            # on-chain redeemer (every 20 cycles) will handle this.
+            logger.info(
+                "auto_sell: token=%s Gamma=%.4f >= %.4f but CLOB has no bids "
+                "(market resolved — redeemer will handle on-chain)",
+                token_id[:16], gamma_price, threshold,
+            )
             continue
 
+        # Use CLOB bid as actual sell price (market reality, could be slightly < Gamma)
+        sell_price = best_bid
         sample = buys[0]
         avg_buy = _get_avg_buy_price(session, trader_id, token_id)
-        pnl = round((best_bid - avg_buy) * net_shares, 4)
+        pnl = round((sell_price - avg_buy) * net_shares, 4)
 
         logger.info(
-            "auto_sell: token=%s net=%.4f bid=%.4f >= threshold=%.4f pnl=%.4f",
-            token_id, net_shares, best_bid, threshold, pnl,
+            "auto_sell: token=%s net=%.4f CLOB_bid=%.4f Gamma=%.4f threshold=%.4f avg_buy=%.4f",
+            token_id[:16], net_shares, sell_price, gamma_price, threshold, avg_buy,
         )
 
         order_id: str | None = None
         status = "failed"
         error_msg: str | None = None
-        recorded_price = best_bid
+        recorded_price = sell_price
 
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
@@ -327,24 +350,24 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
 
             order_args = OrderArgs(
                 token_id=token_id,
-                price=round(best_bid, 4),
+                price=round(sell_price, 4),
                 size=round(net_shares, 4),
                 side=_SELL,
             )
             signed_order = client.create_order(order_args)
             resp = client.post_order(signed_order, OrderType.FOK)
             order_id = str(resp.get("orderID") or resp.get("order_id") or "")
-            recorded_price = _get_filled_price(client, order_id or "", best_bid)
+            recorded_price = _get_filled_price(client, order_id or "", sell_price)
             pnl = round((recorded_price - avg_buy) * net_shares, 4)
             status = "success"
             logger.info(
-                "auto_sell SUCCESS: token=%s size=%.4f price=%.4f pnl=%.4f order_id=%s",
-                token_id, net_shares, recorded_price, pnl, order_id,
+                "auto_sell SUCCESS: token=%s size=%.4f filled_price=%.4f pnl=%.4f order_id=%s",
+                token_id[:16], net_shares, recorded_price, pnl, order_id,
             )
         except Exception as exc:
             status = "failed"
             error_msg = str(exc)
-            logger.error("auto_sell FAILED for token=%s: %s", token_id, exc)
+            logger.error("auto_sell FAILED for token=%s: %s", token_id[:16], exc)
 
         sell_record = CopyTrade(
             trader_id=trader_id,
@@ -355,7 +378,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             outcome=sample.outcome,
             original_side="SELL",
             original_size=net_shares,
-            original_price=best_bid,
+            original_price=sell_price,
             original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
             copy_size=net_shares if status == "success" else 0.0,
             copy_price=recorded_price,
