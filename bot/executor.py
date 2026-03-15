@@ -57,41 +57,39 @@ _auto_sell_last_attempt: dict[str, float] = {}
 
 
 def _ensure_sell_approval(client, token_id: str) -> None:
-    """Ensure the funder wallet has approved the correct Exchange contract
-    to transfer conditional tokens (ERC-1155 setApprovalForAll).
+    """Ensure the CLOB recognises our token balance and allowance.
 
-    Checks both regular and neg-risk exchange contracts. Sends an on-chain
-    approval tx if needed (costs minimal gas on Polygon, ~0.001 MATIC).
+    Strategy 1 (always): Call CLOB API update_balance_allowance to refresh
+    the server's cached view of our on-chain balance/allowance.
+
+    Strategy 2 (only if POLYMARKET_FUNDER_PRIVATE_KEY is set): Send an
+    on-chain setApprovalForAll tx.  This only works when we have the
+    funder wallet's own private key (EOA).  In proxy-wallet (Gnosis Safe)
+    setups the proxy key cannot sign on-chain txs for the Safe.
     """
-    from web3 import Web3
+    # --- Strategy 1: CLOB API refresh (works for all wallet types) ---
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore
+        client.update_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+        logger.debug("Refreshed CLOB balance/allowance for token=%s", token_id[:16])
+    except Exception as exc:
+        logger.warning("update_balance_allowance failed for token=%s: %s", token_id[:16], exc)
+
+    # --- Strategy 2: On-chain approval (only with explicit funder key) ---
+    funder_key = (settings.POLYMARKET_FUNDER_PRIVATE_KEY or "").strip()
+    if not funder_key:
+        return  # Proxy-wallet setup — can't sign on-chain txs
 
     funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
-    funder_key = (settings.POLYMARKET_FUNDER_PRIVATE_KEY or "").strip()
-    if not funder or not funder_key:
-        # Fall back to proxy key if no separate funder key
-        funder_key = (settings.POLYMARKET_PRIVATE_KEY or "").strip()
-    if not funder or not funder_key:
+    if not funder:
         return
 
-    # Determine if this token uses neg-risk exchange
-    is_neg_risk = False
-    try:
-        resp = client.get_neg_risk(token_id)
-        if isinstance(resp, dict):
-            is_neg_risk = resp.get("neg_risk", False)
-        elif isinstance(resp, bool):
-            is_neg_risk = resp
-    except Exception:
-        pass  # Default to checking both
+    from web3 import Web3
 
-    exchanges_to_check = []
-    if is_neg_risk:
-        exchanges_to_check.append(_NEG_RISK_EXCHANGE)
-    else:
-        exchanges_to_check.append(_EXCHANGE_ADDRESS)
-    # Always check both to be safe
+    # Check both exchange contracts
     exchanges_to_check = [_EXCHANGE_ADDRESS, _NEG_RISK_EXCHANGE]
-
     rpc_url = settings.POLYGON_RPC_URL or "https://polygon-rpc.com"
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     ctf = w3.eth.contract(
@@ -115,7 +113,6 @@ def _ensure_sell_approval(client, token_id: str) -> None:
             _approved_exchanges.add(exchange_addr)
             continue
 
-        # Need to approve — send on-chain tx
         logger.info(
             "Setting ERC-1155 approval for Exchange %s (funder=%s)…",
             exchange_addr[:10], funder[:10],
@@ -133,12 +130,9 @@ def _ensure_sell_approval(client, token_id: str) -> None:
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
             if receipt["status"] == 1:
                 _approved_exchanges.add(exchange_addr)
-                logger.info(
-                    "Approval tx confirmed: %s (exchange=%s)",
-                    tx_hash.hex(), exchange_addr[:10],
-                )
+                logger.info("Approval tx confirmed: %s (exchange=%s)", tx_hash.hex(), exchange_addr[:10])
             else:
-                logger.error("Approval tx failed: %s", tx_hash.hex())
+                logger.error("Approval tx reverted: %s", tx_hash.hex())
         except Exception as exc:
             logger.error("Failed to send approval tx for %s: %s", exchange_addr[:10], exc)
 
