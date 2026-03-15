@@ -249,10 +249,15 @@ def _get_filled_price(client, order_id: str, fallback_price: float) -> float:
 def auto_sell_winning_positions(session: Session, threshold: float | None = None) -> int:
     """Sell open positions when price >= threshold.
 
-    Trigger condition: Gamma outcomePrices OR CLOB best-bid >= threshold.
-    Actual sell price: best available CLOB bid (what we actually receive).
-    If Gamma says winning but CLOB has no bids (market resolved/closed),
-    logs and skips — the 20-cycle redeemer will handle on-chain redemption.
+    Three trigger sources (any one suffices):
+    1. CLOB orderbook best-bid >= threshold (direct bids)
+    2. Gamma outcomePrices >= threshold
+    3. Data API funder position curPrice >= threshold (complement-aware)
+
+    Source #3 is the most reliable for binary markets where selling Yes
+    is matched via complement (BUY No). When triggered by Gamma/Funder
+    but CLOB direct bids are low, posts FOK SELL at threshold price —
+    CLOB handles complement matching internally.
 
     Returns count of positions successfully sold.
     """
@@ -296,6 +301,19 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         logger.warning("auto_sell: Gamma price fetch failed: %s", exc)
         gamma_prices = {}
 
+    # Fetch funder wallet position prices (Data API curPrice).
+    # This is the most reliable source: it accounts for complement matching
+    # in binary markets (selling Yes@0.999 via BUY No@0.001).
+    funder_prices: dict[str, float] = {}
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if funder:
+        try:
+            from bot.tracker import fetch_position_prices
+            funder_prices = fetch_position_prices(funder)
+        except Exception as exc:
+            logger.warning("auto_sell: funder position price fetch failed: %s", exc)
+            funder_prices = {}
+
     sold = 0
     for (trader_id, token_id), buys in token_trader_map.items():
         net_shares = _get_net_holdings(session, trader_id, token_id)
@@ -304,41 +322,62 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
 
         best_bid = _get_best_price(client, token_id, "SELL")
         gamma_price = gamma_prices.get(token_id, 0.0)
+        funder_price = funder_prices.get(token_id, 0.0)
 
         clob_triggered = best_bid is not None and best_bid >= threshold
         gamma_triggered = gamma_price >= threshold
+        funder_triggered = funder_price >= threshold
 
-        if not clob_triggered and not gamma_triggered:
+        if not clob_triggered and not gamma_triggered and not funder_triggered:
             # Log at INFO when price is close (>= 0.95) so user can see monitoring
-            if gamma_price >= 0.95 or (best_bid is not None and best_bid >= 0.95):
+            effective = max(gamma_price, funder_price, best_bid or 0.0)
+            if effective >= 0.95:
                 logger.info(
-                    "auto_sell skip: token=%s CLOB_bid=%s Gamma=%.4f < threshold=%.4f",
+                    "auto_sell skip: token=%s CLOB_bid=%s Gamma=%.4f Funder=%.4f < threshold=%.4f",
                     token_id[:16],
                     f"{best_bid:.4f}" if best_bid is not None else "None",
                     gamma_price,
+                    funder_price,
                     threshold,
                 )
             continue
 
-        if not best_bid:
-            # Gamma says winning but CLOB has no bids — market resolved, CLOB closed.
-            # on-chain redeemer (every 20 cycles) will handle this.
-            logger.info(
-                "auto_sell: token=%s Gamma=%.4f >= %.4f but CLOB has no bids "
-                "(market resolved — redeemer will handle on-chain)",
-                token_id[:16], gamma_price, threshold,
-            )
-            continue
-
-        # Use CLOB bid as actual sell price (market reality, could be slightly < Gamma)
-        sell_price = best_bid
+        if not best_bid or best_bid < threshold:
+            # Price source (Gamma/Funder) says winning but CLOB direct bids are low.
+            # This happens in binary markets where selling Yes is done via complement
+            # matching (BUY No). Post FOK SELL at threshold price — CLOB handles
+            # complement matching internally.
+            if funder_triggered or gamma_triggered:
+                logger.info(
+                    "auto_sell: token=%s using threshold price %.4f (CLOB_bid=%s, "
+                    "Gamma=%.4f, Funder=%.4f — complement matching expected)",
+                    token_id[:16],
+                    threshold,
+                    f"{best_bid:.4f}" if best_bid is not None else "None",
+                    gamma_price,
+                    funder_price,
+                )
+                # Use threshold as sell price — CLOB will match via complement
+                sell_price = threshold
+            else:
+                logger.info(
+                    "auto_sell: token=%s CLOB has no usable bids, skipping",
+                    token_id[:16],
+                )
+                continue
+        else:
+            # CLOB direct bid is above threshold — use it as sell price
+            sell_price = best_bid
         sample = buys[0]
         avg_buy = _get_avg_buy_price(session, trader_id, token_id)
         pnl = round((sell_price - avg_buy) * net_shares, 4)
 
         logger.info(
-            "auto_sell: token=%s net=%.4f CLOB_bid=%.4f Gamma=%.4f threshold=%.4f avg_buy=%.4f",
-            token_id[:16], net_shares, sell_price, gamma_price, threshold, avg_buy,
+            "auto_sell: token=%s net=%.4f sell_price=%.4f CLOB_bid=%s Gamma=%.4f "
+            "Funder=%.4f threshold=%.4f avg_buy=%.4f",
+            token_id[:16], net_shares, sell_price,
+            f"{best_bid:.4f}" if best_bid is not None else "None",
+            gamma_price, funder_price, threshold, avg_buy,
         )
 
         order_id: str | None = None

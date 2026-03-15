@@ -208,6 +208,34 @@ def fetch_prices_by_token_ids(token_ids: list[str]) -> dict[str, float]:
     return price_map
 
 
+def fetch_position_prices(wallet_address: str) -> dict[str, float]:
+    """Fetch current prices from a wallet's Data API positions.
+
+    Returns ``{token_id: curPrice}`` for every position held by the wallet.
+    Unlike CLOB orderbook bids, ``curPrice`` accounts for complement matching
+    in binary markets (e.g. selling Yes@0.999 via BUY No@0.001).
+    """
+    url = f"{settings.DATA_API_BASE}/positions"
+    params = {"user": wallet_address}
+    try:
+        resp = _http.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            data = data.get("data", [])
+    except requests.RequestException as exc:
+        logger.warning("Failed to fetch position prices for %s: %s", wallet_address, exc)
+        return {}
+
+    price_map: dict[str, float] = {}
+    for raw in data:
+        asset = raw.get("asset", "")
+        cur_price = float(raw.get("curPrice", 0) or 0)
+        if asset and cur_price > 0:
+            price_map[asset] = cur_price
+    return price_map
+
+
 def fetch_positions(wallet_address: str) -> list[dict[str, Any]]:
     """Fetch current open positions for *wallet_address* from the Data API.
 
