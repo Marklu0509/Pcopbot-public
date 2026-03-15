@@ -1,4 +1,7 @@
 """Show all wallet positions with price >= 0.95 (potential winners)."""
+import sys
+sys.path.insert(0, "/app")
+
 from bot.tracker import fetch_positions
 from config import settings
 
