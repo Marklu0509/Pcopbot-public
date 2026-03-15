@@ -70,6 +70,9 @@ DATABASE_URL: str = _get("DATABASE_URL", "sqlite:///./data/pcopbot.db")
 # Bot
 POLL_INTERVAL_SECONDS: float = _get_float("POLL_INTERVAL_SECONDS", 15.0)
 DRY_RUN: bool = _get_bool("DRY_RUN", True)
+# Auto-sell threshold: sell position via CLOB when cur_price >= this value.
+# Set to 0 to disable. Default 0.998 captures ~99.8% of winning value without on-chain redemption.
+AUTO_SELL_THRESHOLD: float = _get_float("AUTO_SELL_THRESHOLD", 0.998)
 LOG_LEVEL: str = _get("LOG_LEVEL", "INFO")
 
 # Streamlit

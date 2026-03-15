@@ -246,6 +246,134 @@ def _get_filled_price(client, order_id: str, fallback_price: float) -> float:
     return fallback_price
 
 
+def auto_sell_winning_positions(session: Session, threshold: float | None = None) -> int:
+    """Sell any open positions where current CLOB bid price >= threshold.
+
+    Uses the same FOK market-sell path as regular copy trades.
+    Returns count of positions sold.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import func
+
+    if threshold is None:
+        threshold = settings.AUTO_SELL_THRESHOLD
+    if threshold <= 0:
+        return 0
+
+    # Find all unique (trader_id, token_id) pairs with open BUY holdings
+    open_buys = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .all()
+    )
+    if not open_buys:
+        return 0
+
+    token_trader_map: dict[tuple[int, str], list[CopyTrade]] = {}
+    for ct in open_buys:
+        key = (ct.trader_id, ct.original_token_id)
+        token_trader_map.setdefault(key, []).append(ct)
+
+    client = None
+    if not settings.DRY_RUN:
+        try:
+            client = _get_clob_client()
+        except Exception as exc:
+            logger.error("auto_sell: failed to get CLOB client: %s", exc)
+            return 0
+
+    sold = 0
+    for (trader_id, token_id), buys in token_trader_map.items():
+        if not token_id:
+            continue
+
+        net_shares = _get_net_holdings(session, trader_id, token_id)
+        if net_shares <= 0:
+            continue
+
+        # Get best bid price from CLOB (what we'd actually receive)
+        if settings.DRY_RUN:
+            best_bid = None
+        else:
+            best_bid = _get_best_price(client, token_id, "SELL")
+
+        # In dry_run mode we can't query CLOB safely, skip auto-sell
+        if settings.DRY_RUN:
+            continue
+
+        if best_bid is None or best_bid < threshold:
+            continue
+
+        sample = buys[0]
+        avg_buy = _get_avg_buy_price(session, trader_id, token_id)
+        pnl = round((best_bid - avg_buy) * net_shares, 4)
+
+        logger.info(
+            "auto_sell: token=%s net=%.4f bid=%.4f >= threshold=%.4f pnl=%.4f",
+            token_id, net_shares, best_bid, threshold, pnl,
+        )
+
+        order_id: str | None = None
+        status = "failed"
+        error_msg: str | None = None
+        recorded_price = best_bid
+
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+            from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
+
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=round(best_bid, 4),
+                size=round(net_shares, 4),
+                side=_SELL,
+            )
+            signed_order = client.create_order(order_args)
+            resp = client.post_order(signed_order, OrderType.FOK)
+            order_id = str(resp.get("orderID") or resp.get("order_id") or "")
+            recorded_price = _get_filled_price(client, order_id or "", best_bid)
+            pnl = round((recorded_price - avg_buy) * net_shares, 4)
+            status = "success"
+            logger.info(
+                "auto_sell SUCCESS: token=%s size=%.4f price=%.4f pnl=%.4f order_id=%s",
+                token_id, net_shares, recorded_price, pnl, order_id,
+            )
+        except Exception as exc:
+            status = "failed"
+            error_msg = str(exc)
+            logger.error("auto_sell FAILED for token=%s: %s", token_id, exc)
+
+        sell_record = CopyTrade(
+            trader_id=trader_id,
+            original_trade_id=f"auto_sell:{token_id[:24]}",
+            original_market=sample.original_market,
+            original_token_id=token_id,
+            market_title=sample.market_title,
+            outcome=sample.outcome,
+            original_side="SELL",
+            original_size=net_shares,
+            original_price=best_bid,
+            original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+            copy_size=net_shares if status == "success" else 0.0,
+            copy_price=recorded_price,
+            status=status,
+            error_message=error_msg,
+            order_id=order_id,
+            pnl=pnl if status == "success" else 0.0,
+            executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        session.add(sell_record)
+        session.commit()
+
+        if status == "success":
+            sold += 1
+
+    return sold
+
+
 def execute_copy_trade(
     session: Session,
     trader: Trader,

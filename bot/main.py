@@ -385,6 +385,16 @@ def run() -> None:
                 except Exception as exc:
                     logger.error("Error syncing positions/PnL: %s", exc)
 
+            # Auto-sell positions at threshold price every poll cycle (live only)
+            if not settings.DRY_RUN:
+                try:
+                    from bot.executor import auto_sell_winning_positions
+                    sold = auto_sell_winning_positions(session)
+                    if sold:
+                        logger.info("Auto-sold %d winning position(s) at threshold.", sold)
+                except Exception as exc:
+                    logger.error("Error during auto-sell: %s", exc)
+
             # Auto-redeem resolved winning positions every 20 poll cycles
             if _poll_count % 20 == 0:
                 try:
