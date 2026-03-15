@@ -2,16 +2,46 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import requests as _req
 import streamlit as st
 
+from config import settings as _settings
 from db.database import get_session_factory, init_db
 from db.models import CopyTrade, Position, Trader
 
+_logger = logging.getLogger(__name__)
 init_db()
 _SessionLocal = get_session_factory()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_position_prices() -> dict[str, float]:
+    """Fetch current prices from funder wallet positions (cached 30s)."""
+    funder = (_settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if not funder:
+        return {}
+    try:
+        resp = _req.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": funder},
+            timeout=10,
+        )
+        if not resp.ok:
+            return {}
+        price_map: dict[str, float] = {}
+        for pos in resp.json():
+            asset = pos.get("asset", "")
+            cur = pos.get("curPrice", 0.0)
+            if asset and cur:
+                price_map[asset] = float(cur)
+        return price_map
+    except Exception as exc:
+        _logger.warning("Failed to fetch position prices: %s", exc)
+        return {}
 
 STATUS_ICONS = {
     "success": "🟢",
@@ -120,25 +150,7 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
     df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
 
     # Fetch current prices from our own wallet's open positions (most accurate source)
-    import requests as _req
-    from config import settings as _settings
-    price_map: dict[str, float] = {}
-    funder = (_settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
-    if funder:
-        try:
-            resp = _req.get(
-                "https://data-api.polymarket.com/positions",
-                params={"user": funder},
-                timeout=10,
-            )
-            if resp.ok:
-                for pos in resp.json():
-                    asset = pos.get("asset", "")
-                    cur = pos.get("curPrice", 0.0)
-                    if asset and cur:
-                        price_map[asset] = float(cur)
-        except Exception:
-            pass
+    price_map = _fetch_position_prices()
 
     # Fallback: Gamma API via clob_token_ids for any token not in our positions
     all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
@@ -147,8 +159,8 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
         from bot.tracker import fetch_prices_by_token_ids
         try:
             price_map.update(fetch_prices_by_token_ids(missing_tids))
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.warning("Gamma price fetch failed: %s", exc)
 
     holdings: list[dict] = []
     for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):

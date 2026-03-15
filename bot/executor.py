@@ -369,6 +369,11 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             error_msg = str(exc)
             logger.error("auto_sell FAILED for token=%s: %s", token_id[:16], exc)
 
+        if status != "success":
+            # Don't persist failed attempts — they pollute trade history
+            # and create spurious records on retries.
+            continue
+
         sell_record = CopyTrade(
             trader_id=trader_id,
             original_trade_id=f"auto_sell:{token_id[:24]}",
@@ -380,19 +385,16 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             original_size=net_shares,
             original_price=sell_price,
             original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
-            copy_size=net_shares if status == "success" else 0.0,
+            copy_size=net_shares,
             copy_price=recorded_price,
-            status=status,
-            error_message=error_msg,
+            status="success",
             order_id=order_id,
-            pnl=pnl if status == "success" else 0.0,
+            pnl=pnl,
             executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
         )
         session.add(sell_record)
         session.commit()
-
-        if status == "success":
-            sold += 1
+        sold += 1
 
     return sold
 

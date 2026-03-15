@@ -39,8 +39,8 @@ def _get_poll_interval(session_factory) -> float:
             row = session.query(BotSetting).filter(BotSetting.key == "poll_interval_seconds").first()
             if row:
                 return max(0.1, float(row.value))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Failed to read poll_interval from DB: %s", exc)
     return max(0.1, float(settings.POLL_INTERVAL_SECONDS))
 
 

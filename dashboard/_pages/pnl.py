@@ -79,6 +79,7 @@ def render() -> None:
     decisive = market_pnl[roi_pct.abs() >= 3]
     wins = (decisive > 0).sum()
     total_markets = len(decisive)
+    win_rate = (wins / total_markets * 100) if total_markets > 0 else 0
 
     st.subheader("📈 Overall Summary")
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)

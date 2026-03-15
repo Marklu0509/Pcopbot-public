@@ -96,12 +96,14 @@ def render() -> None:
         for field in _CREDENTIAL_FIELDS:
             current = _get_setting(field["key"])
             if field["type"] == "password":
+                # Never send secret values back to the browser — show placeholder only
                 values[field["key"]] = st.text_input(
                     field["label"],
-                    value=current,
+                    value="",
                     type="password",
                     help=field["help"],
                     key=f"w_{field['key']}",
+                    placeholder="••••••••" if current else "Not set",
                 )
             else:
                 values[field["key"]] = st.text_input(
@@ -112,9 +114,19 @@ def render() -> None:
                 )
 
         if st.form_submit_button("💾 Save Credentials"):
+            saved = 0
             for key, val in values.items():
-                _set_setting(key, val.strip())
-            st.success("Credentials saved!")
+                val = val.strip()
+                # For password fields, skip empty submissions (don't overwrite existing)
+                field_def = next((f for f in _CREDENTIAL_FIELDS if f["key"] == key), None)
+                if field_def and field_def["type"] == "password" and not val:
+                    continue
+                _set_setting(key, val)
+                saved += 1
+            if saved:
+                st.success("Credentials saved!")
+            else:
+                st.info("No changes — leave password fields empty to keep current values.")
 
     st.divider()
     st.subheader("Current Status")

@@ -40,7 +40,10 @@ def init_db() -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     # Schema migration: add columns that may not exist in older databases
+    import logging
     from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    _db_logger = logging.getLogger(__name__)
     with engine.begin() as conn:
         for stmt in [
             "ALTER TABLE traders ADD COLUMN buy_order_type VARCHAR DEFAULT 'market'",
@@ -49,8 +52,10 @@ def init_db() -> None:
         ]:
             try:
                 conn.execute(text(stmt))
-            except Exception:
+            except OperationalError:
                 pass  # Column already exists
+            except Exception as exc:
+                _db_logger.warning("Schema migration failed: %s — %s", stmt[:50], exc)
 
 
 def get_db():

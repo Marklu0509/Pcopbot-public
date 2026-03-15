@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import re
+
 import streamlit as st
 
 from db.database import get_session_factory, init_db
@@ -9,15 +12,24 @@ from db.models import Position, Trader
 from bot.watermark import set_watermark
 from bot import tracker
 
+logger = logging.getLogger(__name__)
+
 init_db()
 _SessionLocal = get_session_factory()
 
 
+_ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
 def _add_trader(data: dict) -> str | None:
+    addr = data.get("wallet_address", "")
+    if not _ETH_ADDRESS_RE.fullmatch(addr):
+        return "Invalid wallet address. Must be 0x followed by 40 hex characters."
+
     with _SessionLocal() as session:
         existing = (
             session.query(Trader)
-            .filter(Trader.wallet_address == data["wallet_address"])
+            .filter(Trader.wallet_address == addr)
             .first()
         )
         if existing:
@@ -47,8 +59,8 @@ def _add_trader(data: dict) -> str | None:
                     cur_price=p["cur_price"],
                 ))
             session.commit()
-        except Exception:
-            pass  # non-critical — positions will be fetched on next bot startup
+        except Exception as exc:
+            logger.warning("Failed to pre-fetch positions for %s: %s", trader.wallet_address[:12], exc)
     return None
 
 

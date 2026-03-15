@@ -536,7 +536,7 @@ def _record_redemption(
         original_side       = "SELL",
         original_size       = net_shares,
         original_price      = 1.0,
-        original_timestamp  = datetime.datetime.utcnow(),
+        original_timestamp  = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
         copy_size           = net_shares,
         copy_price          = 1.0,
         status              = "success",
@@ -545,9 +545,10 @@ def _record_redemption(
     )
     session.add(redemption)
 
-    # Zero out unrealized PnL on all BUY entries for this position
+    # Zero out unrealized PnL on BUY entries for THIS trader only
     for ct in buy_trades:
-        ct.pnl = 0.0
+        if ct.trader_id == sample.trader_id:
+            ct.pnl = 0.0
 
     session.commit()
     logger.info(
@@ -605,13 +606,13 @@ def _record_expired_loss(
         original_side       = "SELL",
         original_size       = net_shares,
         original_price      = 0.0,
-        original_timestamp  = datetime.datetime.utcnow(),
+        original_timestamp  = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
         copy_size           = net_shares,
         copy_price          = 0.0,
         status              = "success",
         order_id            = order_id_key,
         pnl                 = pnl,
-        executed_at         = datetime.datetime.utcnow(),
+        executed_at         = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
     )
     session.add(loss_record)
 
@@ -868,8 +869,8 @@ def detect_manual_sells(session: "Session") -> int:
 
         trader_ids = {int(bt.trader_id) for bt in buy_trades}
         sell_time = (
-            datetime.datetime.utcfromtimestamp(activity_ts)
-            if activity_ts else datetime.datetime.utcnow()
+            datetime.datetime.fromtimestamp(activity_ts, tz=datetime.timezone.utc).replace(tzinfo=None)
+            if activity_ts else datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         )
 
         for trader_id in trader_ids:
@@ -982,7 +983,7 @@ def detect_manual_redemptions(session: "Session") -> int:
 
         ts = float(raw.get("timestamp", 0) or 0)
         redeem_time = (
-            datetime.datetime.utcfromtimestamp(ts) if ts else datetime.datetime.utcnow()
+            datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).replace(tzinfo=None) if ts else datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         )
 
         buy_trades = (
