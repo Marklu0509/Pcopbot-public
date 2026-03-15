@@ -306,16 +306,24 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         logger.warning("auto_sell: Gamma price fetch failed: %s", exc)
         gamma_prices = {}
 
-    # Fetch funder wallet position prices (Data API curPrice).
+    # Fetch funder wallet's ACTUAL positions (Data API).
+    # This is the source of truth for what shares we hold — covers both
+    # bot-copied trades AND pre-existing/manually-bought positions.
     funder_prices: dict[str, float] = {}
+    funder_sizes: dict[str, float] = {}
     funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
     if funder:
         try:
-            from bot.tracker import fetch_position_prices
-            funder_prices = fetch_position_prices(funder)
+            from bot.tracker import fetch_positions
+            wallet_positions = fetch_positions(funder)
+            for p in wallet_positions:
+                tid = p.get("asset_id", "")
+                if tid:
+                    funder_prices[tid] = p.get("cur_price", 0.0)
+                    funder_sizes[tid] = p.get("size", 0.0)
         except Exception as exc:
-            logger.warning("auto_sell: funder position price fetch failed: %s", exc)
-            funder_prices = {}
+            logger.warning("auto_sell: funder position fetch failed: %s", exc)
+            wallet_positions = []
 
     # Fetch complement token IDs for binary markets so we can compute
     # effective sell price = 1 - best_ask(complement).
@@ -333,9 +341,24 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
     except Exception as exc:
         logger.warning("auto_sell: complement token fetch failed: %s", exc)
 
+    # Also include tokens that are in the wallet but not in DB
+    # (pre-existing positions or manually bought)
+    for tid, wallet_size in funder_sizes.items():
+        if wallet_size > 0 and not any(tid == t for (_, t) in token_trader_map):
+            # Find a trader_id to associate with (use first active trader)
+            if token_trader_map:
+                sample_trader_id = next(iter(token_trader_map))[0]
+            else:
+                continue
+            token_trader_map[(sample_trader_id, tid)] = []
+
     sold = 0
     for (trader_id, token_id), buys in token_trader_map.items():
-        net_shares = _get_net_holdings(session, trader_id, token_id)
+        # Use wallet's actual position size as source of truth.
+        # Falls back to DB net holdings if wallet data unavailable.
+        wallet_size = funder_sizes.get(token_id, 0.0)
+        db_net = _get_net_holdings(session, trader_id, token_id)
+        net_shares = wallet_size if wallet_size > 0 else db_net
         if net_shares <= 0:
             continue
 
@@ -391,7 +414,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
 
         # Always sell at threshold price — let CLOB find the best match
         sell_price = threshold
-        sample = buys[0]
+        sample = buys[0] if buys else None
         avg_buy = _get_avg_buy_price(session, trader_id, token_id)
         pnl = round((sell_price - avg_buy) * net_shares, 4)
 
@@ -446,10 +469,10 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         sell_record = CopyTrade(
             trader_id=trader_id,
             original_trade_id=f"auto_sell:{token_id[:24]}",
-            original_market=sample.original_market,
+            original_market=sample.original_market if sample else "",
             original_token_id=token_id,
-            market_title=sample.market_title,
-            outcome=sample.outcome,
+            market_title=sample.market_title if sample else "",
+            outcome=sample.outcome if sample else "",
             original_side="SELL",
             original_size=net_shares,
             original_price=sell_price,
