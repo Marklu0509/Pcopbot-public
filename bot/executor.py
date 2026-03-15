@@ -435,27 +435,56 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
             from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
 
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=round(sell_price, 4),
-                size=round(net_shares, 4),
-                side=_SELL,
-            )
-            signed_order = client.create_order(order_args)
-            resp = client.post_order(signed_order, OrderType.FOK)
-            order_id = str(resp.get("orderID") or resp.get("order_id") or "")
-            recorded_price = _get_filled_price(client, order_id or "", sell_price)
-            pnl = round((recorded_price - avg_buy) * net_shares, 4)
-            status = "success"
-            logger.info(
-                "auto_sell SUCCESS: token=%s size=%.4f filled_price=%.4f pnl=%.4f order_id=%s",
-                token_id[:16], net_shares, recorded_price, pnl, order_id,
-            )
+            # Try sell_price first; if CLOB rejects due to price bounds
+            # (max 0.99 for some tokens), retry with capped price.
+            prices_to_try = [round(sell_price, 4)]
+            if sell_price > 0.99:
+                prices_to_try.append(0.99)
+
+            last_exc: Exception | None = None
+            for attempt_price in prices_to_try:
+                try:
+                    order_args = OrderArgs(
+                        token_id=token_id,
+                        price=attempt_price,
+                        size=round(net_shares, 4),
+                        side=_SELL,
+                    )
+                    signed_order = client.create_order(order_args)
+                    resp = client.post_order(signed_order, OrderType.FOK)
+                    order_id = str(resp.get("orderID") or resp.get("order_id") or "")
+                    recorded_price = _get_filled_price(client, order_id or "", attempt_price)
+                    pnl = round((recorded_price - avg_buy) * net_shares, 4)
+                    status = "success"
+                    logger.info(
+                        "auto_sell SUCCESS: token=%s size=%.4f price=%.4f filled=%.4f pnl=%.4f order_id=%s",
+                        token_id[:16], net_shares, attempt_price, recorded_price, pnl, order_id,
+                    )
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    err_str = str(exc)
+                    # If price bounds error ("min: 0.01 - max: 0.99"), retry with lower price
+                    if "max: 0.99" in err_str or "max:0.99" in err_str:
+                        logger.info(
+                            "auto_sell: price %.4f rejected (bounds), retrying at next price for token=%s",
+                            attempt_price, token_id[:16],
+                        )
+                        continue
+                    # Other errors: don't retry
+                    break
+
+            if last_exc is not None:
+                status = "failed"
+                error_msg = str(last_exc)
+                logger.info(
+                    "auto_sell FOK not filled for token=%s (will retry next cycle): %s",
+                    token_id[:16], last_exc,
+                )
         except Exception as exc:
             status = "failed"
             error_msg = str(exc)
-            # FOK not filling is expected when attempting below visible price.
-            # Only log at INFO to avoid noisy error logs on every cycle.
             logger.info(
                 "auto_sell FOK not filled for token=%s (will retry next cycle): %s",
                 token_id[:16], exc,
