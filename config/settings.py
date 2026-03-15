@@ -66,6 +66,9 @@ LOG_LEVEL: str = _get("LOG_LEVEL", "INFO")
 STREAMLIT_PORT: int = _get_int("STREAMLIT_PORT", 8501)
 DASHBOARD_PASSWORD: str = _get("DASHBOARD_PASSWORD")
 
+# Polygon RPC (override to use a private/reliable endpoint, e.g. Alchemy or QuickNode)
+POLYGON_RPC_URL: str = _get("POLYGON_RPC_URL", "")
+
 # External API base URLs
 GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"
 DATA_API_BASE: str = "https://data-api.polymarket.com"

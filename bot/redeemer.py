@@ -32,6 +32,13 @@ USDC_ADDRESS     = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # Polygon USDC
 CTF_ADDRESS      = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # Gnosis CTF
 NEG_RISK_ADDRESS = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296"  # NegRiskAdapter
 POLYGON_RPC      = "https://polygon-rpc.com"
+# Public fallback RPCs tried in order when the primary is unreachable
+_POLYGON_RPC_FALLBACKS = [
+    "https://rpc-mainnet.matic.quiknode.pro",
+    "https://polygon.llamarpc.com",
+    "https://polygon.drpc.org",
+    "https://rpc.ankr.com/polygon",
+]
 
 # ── Minimal ABIs ─────────────────────────────────────────────────────────────
 _CTF_ABI = [
@@ -93,10 +100,25 @@ def _condition_bytes(condition_id: str) -> bytes:
 
 def _get_web3():
     from web3 import Web3
-    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-    if not w3.is_connected():
-        raise RuntimeError("Cannot connect to Polygon RPC")
-    return w3
+
+    # Build ordered list: env override first, then hardcoded primary, then fallbacks
+    rpc_primary = (settings.POLYGON_RPC_URL or "").strip() or POLYGON_RPC
+    candidates = [rpc_primary] + [r for r in _POLYGON_RPC_FALLBACKS if r != rpc_primary]
+
+    last_err: Exception | None = None
+    for rpc_url in candidates:
+        try:
+            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+            if w3.is_connected():
+                if rpc_url != rpc_primary:
+                    logger.info("Connected to Polygon RPC via fallback: %s", rpc_url)
+                return w3
+            last_err = RuntimeError(f"is_connected() returned False for {rpc_url}")
+        except Exception as exc:
+            last_err = exc
+            logger.debug("Polygon RPC %s unreachable: %s", rpc_url, exc)
+
+    raise RuntimeError(f"Cannot connect to any Polygon RPC. Last error: {last_err}")
 
 
 def _get_account(w3, use_funder_key: bool = False):
