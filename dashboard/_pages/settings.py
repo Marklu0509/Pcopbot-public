@@ -16,6 +16,7 @@ _SessionLocal = get_session_factory()
 _DEFAULTS = {
     "poll_interval_seconds": {"default": "15.0", "label": "Poll Interval (seconds)", "help": "How often the bot polls for new trades. Supports decimals, e.g. 0.5."},
     "dry_run": {"default": "true", "label": "Dry Run Mode", "help": "When enabled, the bot simulates trades without placing real orders."},
+    "auto_sell_enabled": {"default": "true", "label": "Auto-Sell", "help": "When enabled, automatically sells positions at $0.999 when price >= $0.95. When disabled, waits for market resolution and auto-redeems at $1.00 (free, but slower)."},
     "log_level": {"default": "INFO", "label": "Log Level", "help": "Logging verbosity: DEBUG, INFO, WARNING, ERROR."},
 }
 
@@ -64,6 +65,14 @@ def render() -> None:
             help=_DEFAULTS["dry_run"]["help"],
         )
 
+        # Auto-Sell
+        current_auto_sell = _get_setting("auto_sell_enabled").lower() in ("true", "1", "yes")
+        auto_sell = st.toggle(
+            _DEFAULTS["auto_sell_enabled"]["label"],
+            value=current_auto_sell,
+            help=_DEFAULTS["auto_sell_enabled"]["help"],
+        )
+
         # Log Level
         log_levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
         current_log_level = _get_setting("log_level").upper()
@@ -79,6 +88,7 @@ def render() -> None:
         if st.form_submit_button("💾 Save Settings"):
             _set_setting("poll_interval_seconds", str(poll_interval))
             _set_setting("dry_run", str(dry_run).lower())
+            _set_setting("auto_sell_enabled", str(auto_sell).lower())
             _set_setting("log_level", log_level)
             st.success("Settings saved! Changes will apply on the next poll cycle.")
 

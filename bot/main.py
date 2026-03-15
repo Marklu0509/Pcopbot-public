@@ -393,13 +393,22 @@ def run() -> None:
 
             # Auto-sell positions at threshold price every poll cycle (live only)
             if not settings.DRY_RUN:
+                # Check DB toggle (dashboard Settings page)
+                auto_sell_on = True
                 try:
-                    from bot.executor import auto_sell_winning_positions
-                    sold = auto_sell_winning_positions(session)
-                    if sold:
-                        logger.info("Auto-sold %d winning position(s) at threshold.", sold)
-                except Exception as exc:
-                    logger.error("Error during auto-sell: %s", exc)
+                    row = session.query(BotSetting).filter(BotSetting.key == "auto_sell_enabled").first()
+                    if row and row.value.lower() in ("false", "0", "no"):
+                        auto_sell_on = False
+                except Exception:
+                    pass
+                if auto_sell_on:
+                    try:
+                        from bot.executor import auto_sell_winning_positions
+                        sold = auto_sell_winning_positions(session)
+                        if sold:
+                            logger.info("Auto-sold %d winning position(s) at threshold.", sold)
+                    except Exception as exc:
+                        logger.error("Error during auto-sell: %s", exc)
 
             # Auto-redeem resolved winning positions every 20 poll cycles
             if _poll_count % 20 == 0:
