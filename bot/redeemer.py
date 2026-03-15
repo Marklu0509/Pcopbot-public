@@ -204,12 +204,14 @@ def _submit_via_relayer(
         "type": "SAFE",
     }
 
+    key_address = (settings.POLYMARKET_RELAYER_API_KEY_ADDRESS or "").strip() or from_addr
+
     resp = _req.post(
         _RELAYER_URL,
         json=payload,
         headers={
             "RELAYER_API_KEY": relayer_key,
-            "RELAYER_API_KEY_ADDRESS": from_addr,
+            "RELAYER_API_KEY_ADDRESS": key_address,
             "Content-Type": "application/json",
         },
         timeout=30,
