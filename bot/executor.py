@@ -249,15 +249,15 @@ def _get_filled_price(client, order_id: str, fallback_price: float) -> float:
 def auto_sell_winning_positions(session: Session, threshold: float | None = None) -> int:
     """Sell open positions when price >= threshold.
 
-    Three trigger sources (any one suffices):
+    Four trigger sources (any one suffices):
     1. CLOB orderbook best-bid >= threshold (direct bids)
-    2. Gamma outcomePrices >= threshold
-    3. Data API funder position curPrice >= threshold (complement-aware)
+    2. Complement price >= threshold: 1 - best_ask(complement token)
+       This is how Polymarket UI calculates sell price for binary markets.
+    3. Gamma outcomePrices >= threshold
+    4. Data API funder position curPrice >= threshold
 
-    Source #3 is the most reliable for binary markets where selling Yes
-    is matched via complement (BUY No). When triggered by Gamma/Funder
-    but CLOB direct bids are low, posts FOK SELL at threshold price —
-    CLOB handles complement matching internally.
+    Source #2 is the most reliable — it matches the Polymarket UI sell price.
+    In binary markets, selling Yes@0.999 is matched via BUY No@0.001.
 
     Returns count of positions successfully sold.
     """
@@ -302,8 +302,6 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         gamma_prices = {}
 
     # Fetch funder wallet position prices (Data API curPrice).
-    # This is the most reliable source: it accounts for complement matching
-    # in binary markets (selling Yes@0.999 via BUY No@0.001).
     funder_prices: dict[str, float] = {}
     funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
     if funder:
@@ -313,6 +311,17 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         except Exception as exc:
             logger.warning("auto_sell: funder position price fetch failed: %s", exc)
             funder_prices = {}
+
+    # Fetch complement token IDs for binary markets so we can compute
+    # effective sell price = 1 - best_ask(complement).
+    # This is the most reliable method: it's exactly how Polymarket UI
+    # calculates the sell price.
+    complement_map: dict[str, str] = {}
+    try:
+        from bot.tracker import fetch_complement_token_ids
+        complement_map = fetch_complement_token_ids(unique_token_ids)
+    except Exception as exc:
+        logger.warning("auto_sell: complement token fetch failed: %s", exc)
 
     sold = 0
     for (trader_id, token_id), buys in token_trader_map.items():
@@ -324,60 +333,65 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
         gamma_price = gamma_prices.get(token_id, 0.0)
         funder_price = funder_prices.get(token_id, 0.0)
 
+        # Compute complement-matched effective price:
+        # Selling Yes = matching with BUY No. Effective price = 1 - best_ask(No).
+        complement_price = 0.0
+        comp_token = complement_map.get(token_id)
+        if comp_token:
+            comp_best_ask = _get_best_price(client, comp_token, "BUY")
+            if comp_best_ask is not None and comp_best_ask > 0:
+                complement_price = round(1.0 - comp_best_ask, 4)
+
         clob_triggered = best_bid is not None and best_bid >= threshold
         gamma_triggered = gamma_price >= threshold
         funder_triggered = funder_price >= threshold
+        complement_triggered = complement_price >= threshold
 
-        if not clob_triggered and not gamma_triggered and not funder_triggered:
-            # Log at INFO when price is close (>= 0.95) so user can see monitoring
-            effective = max(gamma_price, funder_price, best_bid or 0.0)
+        if not clob_triggered and not gamma_triggered and not funder_triggered and not complement_triggered:
+            effective = max(gamma_price, funder_price, complement_price, best_bid or 0.0)
             if effective >= 0.95:
                 logger.info(
-                    "auto_sell skip: token=%s CLOB_bid=%s Gamma=%.4f Funder=%.4f < threshold=%.4f",
+                    "auto_sell skip: token=%s CLOB_bid=%s Comp=%.4f Gamma=%.4f Funder=%.4f < threshold=%.4f",
                     token_id[:16],
                     f"{best_bid:.4f}" if best_bid is not None else "None",
+                    complement_price,
                     gamma_price,
                     funder_price,
                     threshold,
                 )
             continue
 
-        if not best_bid or best_bid < threshold:
-            # Price source (Gamma/Funder) says winning but CLOB direct bids are low.
-            # This happens in binary markets where selling Yes is done via complement
-            # matching (BUY No). Post FOK SELL at threshold price — CLOB handles
-            # complement matching internally.
-            if funder_triggered or gamma_triggered:
-                logger.info(
-                    "auto_sell: token=%s using threshold price %.4f (CLOB_bid=%s, "
-                    "Gamma=%.4f, Funder=%.4f — complement matching expected)",
-                    token_id[:16],
-                    threshold,
-                    f"{best_bid:.4f}" if best_bid is not None else "None",
-                    gamma_price,
-                    funder_price,
-                )
-                # Use threshold as sell price — CLOB will match via complement
-                sell_price = threshold
-            else:
-                logger.info(
-                    "auto_sell: token=%s CLOB has no usable bids, skipping",
-                    token_id[:16],
-                )
-                continue
-        else:
-            # CLOB direct bid is above threshold — use it as sell price
+        # Determine sell price: prefer complement price (most accurate for binary
+        # markets), then CLOB direct bid, then threshold as fallback
+        if complement_triggered:
+            sell_price = complement_price
+            logger.info(
+                "auto_sell: token=%s complement-matched price %.4f >= %.4f "
+                "(CLOB_bid=%s, No_ask=%.4f, Gamma=%.4f, Funder=%.4f)",
+                token_id[:16], complement_price, threshold,
+                f"{best_bid:.4f}" if best_bid is not None else "None",
+                1.0 - complement_price if complement_price else 0.0,
+                gamma_price, funder_price,
+            )
+        elif clob_triggered:
             sell_price = best_bid
+        else:
+            # Gamma/Funder triggered but no complement data — use threshold
+            sell_price = threshold
+            logger.info(
+                "auto_sell: token=%s using threshold %.4f (Gamma=%.4f, Funder=%.4f, no complement data)",
+                token_id[:16], threshold, gamma_price, funder_price,
+            )
         sample = buys[0]
         avg_buy = _get_avg_buy_price(session, trader_id, token_id)
         pnl = round((sell_price - avg_buy) * net_shares, 4)
 
         logger.info(
-            "auto_sell: token=%s net=%.4f sell_price=%.4f CLOB_bid=%s Gamma=%.4f "
-            "Funder=%.4f threshold=%.4f avg_buy=%.4f",
+            "auto_sell: token=%s net=%.4f sell_price=%.4f CLOB_bid=%s Comp=%.4f "
+            "Gamma=%.4f Funder=%.4f threshold=%.4f avg_buy=%.4f",
             token_id[:16], net_shares, sell_price,
             f"{best_bid:.4f}" if best_bid is not None else "None",
-            gamma_price, funder_price, threshold, avg_buy,
+            complement_price, gamma_price, funder_price, threshold, avg_buy,
         )
 
         order_id: str | None = None

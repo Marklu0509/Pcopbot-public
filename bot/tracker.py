@@ -208,6 +208,44 @@ def fetch_prices_by_token_ids(token_ids: list[str]) -> dict[str, float]:
     return price_map
 
 
+def fetch_complement_token_ids(token_ids: list[str]) -> dict[str, str]:
+    """Return a mapping of ``{token_id: complement_token_id}`` for binary markets.
+
+    In a binary market each token has a complement (Yes ↔ No).
+    Queries Gamma ``/markets?clob_token_ids=[...]`` and pairs up token IDs
+    from the same market.
+    """
+    if not token_ids:
+        return {}
+
+    import json as _json
+
+    complement_map: dict[str, str] = {}
+    try:
+        resp = _http.get(
+            f"{settings.GAMMA_API_BASE}/markets",
+            params={"clob_token_ids": _json.dumps(token_ids)},
+            timeout=15,
+        )
+        if not resp.ok:
+            return complement_map
+        markets = resp.json()
+        if not isinstance(markets, list):
+            markets = [markets]
+        for data in markets:
+            t_ids = data.get("clobTokenIds", [])
+            if isinstance(t_ids, str):
+                t_ids = _json.loads(t_ids)
+            # Binary market: exactly 2 tokens
+            if len(t_ids) == 2:
+                complement_map[str(t_ids[0])] = str(t_ids[1])
+                complement_map[str(t_ids[1])] = str(t_ids[0])
+    except Exception as exc:
+        logger.warning("Error fetching complement token IDs: %s", exc)
+
+    return complement_map
+
+
 def fetch_position_prices(wallet_address: str) -> dict[str, float]:
     """Fetch current prices from a wallet's Data API positions.
 
