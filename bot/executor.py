@@ -11,9 +11,33 @@ from sqlalchemy.orm import Session
 
 from bot import risk, watermark
 from config import settings
-from db.models import CopyTrade, Trader
+from db.models import BotSetting, CopyTrade, Trader
 
 logger = logging.getLogger(__name__)
+
+
+def is_trader_dry_run(trader: Trader, session: Session) -> bool:
+    """Resolve effective dry_run mode for a trader.
+
+    Priority: global DB override > env override > per-trader setting.
+    """
+    # 1. Check global override from bot_settings table
+    try:
+        row = session.query(BotSetting).filter(BotSetting.key == "dry_run").first()
+        if row and row.value.lower() in ("true", "1", "yes"):
+            return True
+    except Exception:
+        pass
+
+    # 2. Check env override
+    if settings.DRY_RUN:
+        return True
+
+    # 3. Per-trader setting (default True if column is None)
+    trader_dry_run = getattr(trader, "dry_run", None)
+    if trader_dry_run is None:
+        return True
+    return bool(trader_dry_run)
 
 # If a SELL would leave less than this USD value, close out the full position.
 SELL_DUST_CLOSEOUT_USD = 1.0
@@ -137,8 +161,20 @@ def _ensure_sell_approval(client, token_id: str) -> None:
             logger.error("Failed to send approval tx for %s: %s", exchange_addr[:10], exc)
 
 
-def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
-    """Return net share holdings for a trader+token from successful/dry_run copy trades."""
+def _get_net_holdings(
+    session: Session,
+    trader_id: int,
+    token_id: str,
+    status_filter: list[str] | None = None,
+) -> float:
+    """Return net share holdings for a trader+token.
+
+    status_filter controls which trade statuses to count.
+    Defaults to ["success", "dry_run"] for backward compatibility.
+    Pass ["success"] for live-only or ["dry_run"] for dry-run-only.
+    """
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
     from sqlalchemy import func
     buy_total = (
         session.query(func.coalesce(func.sum(CopyTrade.copy_size), 0.0))
@@ -146,7 +182,7 @@ def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
             CopyTrade.trader_id == trader_id,
             CopyTrade.original_token_id == token_id,
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
@@ -156,19 +192,26 @@ def _get_net_holdings(session: Session, trader_id: int, token_id: str) -> float:
             CopyTrade.trader_id == trader_id,
             CopyTrade.original_token_id == token_id,
             CopyTrade.original_side == "SELL",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
     return max(buy_total - sell_total, 0.0)
 
 
-def _get_avg_buy_price(session: Session, trader_id: int, token_id: str) -> float:
+def _get_avg_buy_price(
+    session: Session,
+    trader_id: int,
+    token_id: str,
+    status_filter: list[str] | None = None,
+) -> float:
     """Return the weighted-average buy price for a trader+token.
 
     Weighted average = SUM(copy_size * copy_price) / SUM(copy_size) across
-    all successful/dry_run BUY trades for that token.
+    BUY trades matching the given status_filter.
     """
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
     from sqlalchemy import func
     result = (
         session.query(
@@ -179,7 +222,7 @@ def _get_avg_buy_price(session: Session, trader_id: int, token_id: str) -> float
             CopyTrade.trader_id == trader_id,
             CopyTrade.original_token_id == token_id,
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .first()
     )
@@ -383,14 +426,15 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
 
     if threshold is None:
         threshold = settings.AUTO_SELL_THRESHOLD
-    if threshold <= 0 or settings.DRY_RUN:
+    if threshold <= 0:
         return 0
 
+    # Only auto-sell live trades (status="success")
     open_buys = (
         session.query(CopyTrade)
         .filter(
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status == "success",
         )
         .all()
     )
@@ -720,11 +764,16 @@ def execute_copy_trade(
     expected_price = trade["price"]
     copy_size = _calculate_copy_size(trader, trade["size"], expected_price)
 
+    # Resolve per-trader dry_run mode
+    dry_run = is_trader_dry_run(trader, session)
+    # Status filter ensures dry_run and live trades are counted separately
+    mode_status = ["dry_run"] if dry_run else ["success"]
+
     # For SELL trades, cap the size at what we actually hold to avoid
     # selling more shares than we own (can happen when some BUYs were
     # filtered out by risk checks).
     if trade["side"] == "SELL":
-        holdings = _get_net_holdings(session, trader.id, trade["token_id"])
+        holdings = _get_net_holdings(session, trader.id, trade["token_id"], status_filter=mode_status)
         if holdings <= 0:
             logger.info(
                 "SELL skipped for trader %s token %s: no holdings to sell.",
@@ -785,7 +834,7 @@ def execute_copy_trade(
     # In live mode, query orderbook for real best price (for slippage risk check)
     best_price = expected_price
     client = None
-    if not settings.DRY_RUN:
+    if not dry_run:
         try:
             client = _get_clob_client()
             real_price = _get_best_price(client, trade["token_id"], trade["side"])
@@ -805,13 +854,14 @@ def execute_copy_trade(
         original_size=trade["size"],
         original_price=trade["price"],
         side=trade["side"],
+        status_filter=mode_status,
     )
 
-    status = rejection or ("dry_run" if settings.DRY_RUN else "pending")
+    status = rejection or ("dry_run" if dry_run else "pending")
     order_id: str | None = None
     error_msg: str | None = None
 
-    if rejection is None and not settings.DRY_RUN:
+    if rejection is None and not dry_run:
         try:
             if client is None:
                 client = _get_clob_client()
@@ -887,7 +937,7 @@ def execute_copy_trade(
                 trader.wallet_address,
                 exc,
             )
-    elif rejection is None and settings.DRY_RUN:
+    elif rejection is None and dry_run:
         logger.info(
             "[DRY RUN] Would copy trade for trader %s: market=%s side=%s size=%.4f "
             "price=%.4f (limit=%.4f, slippage=%.1f%%) order_type=%s",
@@ -911,7 +961,7 @@ def execute_copy_trade(
     # - dry run: expected_price (simulated fill)
     # - live success: actual filled/average price from order details
     # - fallback: order_price when actual fill price is unavailable
-    if settings.DRY_RUN:
+    if dry_run:
         recorded_price = expected_price
     elif status == "success":
         recorded_price = _get_filled_price(client, order_id or "", order_price)
@@ -921,7 +971,7 @@ def execute_copy_trade(
     # Calculate realized PnL for SELL trades at execution time
     realized_pnl = 0.0
     if trade["side"] == "SELL" and status in ("success", "dry_run") and copy_size > 0:
-        avg_buy = _get_avg_buy_price(session, trader.id, trade["token_id"])
+        avg_buy = _get_avg_buy_price(session, trader.id, trade["token_id"], status_filter=mode_status)
         realized_pnl = round((recorded_price - avg_buy) * copy_size, 4)
 
     copy_trade = CopyTrade(

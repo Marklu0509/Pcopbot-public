@@ -168,8 +168,8 @@ def _refresh_copy_trade_fill_prices(session) -> None:
     trade activity from the Data API and match each BUY copy trade by
     token_id + execution timestamp (within a 10-minute window).
     """
-    if settings.DRY_RUN:
-        return
+    # Only refresh fill prices for live trades (dry_run trades use simulated prices)
+    # No global gate — individual trades are already filtered by status="success"
 
     funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
     if not funder:
@@ -391,24 +391,24 @@ def run() -> None:
                 except Exception as exc:
                     logger.error("Error syncing positions/PnL: %s", exc)
 
-            # Auto-sell positions at threshold price every poll cycle (live only)
-            if not settings.DRY_RUN:
-                # Check DB toggle (dashboard Settings page)
-                auto_sell_on = True
+            # Auto-sell positions at threshold price every poll cycle
+            # Per-trader dry_run filtering is handled inside auto_sell_winning_positions
+            # (only live trades with status="success" are considered)
+            auto_sell_on = True
+            try:
+                row = session.query(BotSetting).filter(BotSetting.key == "auto_sell_enabled").first()
+                if row and row.value.lower() in ("false", "0", "no"):
+                    auto_sell_on = False
+            except Exception:
+                pass
+            if auto_sell_on:
                 try:
-                    row = session.query(BotSetting).filter(BotSetting.key == "auto_sell_enabled").first()
-                    if row and row.value.lower() in ("false", "0", "no"):
-                        auto_sell_on = False
-                except Exception:
-                    pass
-                if auto_sell_on:
-                    try:
-                        from bot.executor import auto_sell_winning_positions
-                        sold = auto_sell_winning_positions(session)
-                        if sold:
-                            logger.info("Auto-sold %d winning position(s) at threshold.", sold)
-                    except Exception as exc:
-                        logger.error("Error during auto-sell: %s", exc)
+                    from bot.executor import auto_sell_winning_positions
+                    sold = auto_sell_winning_positions(session)
+                    if sold:
+                        logger.info("Auto-sold %d winning position(s) at threshold.", sold)
+                except Exception as exc:
+                    logger.error("Error during auto-sell: %s", exc)
 
             # Auto-redeem resolved winning positions every 20 poll cycles
             if _poll_count % 20 == 0:

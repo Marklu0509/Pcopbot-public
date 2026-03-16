@@ -72,6 +72,11 @@ def render() -> None:
         st.markdown("##### Target Wallet")
         wallet_address = st.text_input("Wallet Address *")
         label = st.text_input("Tag (Label)")
+        dry_run = st.toggle(
+            "Dry Run Mode",
+            value=True,
+            help="Simulate trades without placing real orders. Turn off when ready to go live.",
+        )
 
         st.markdown("##### Sizing")
         sizing_mode = st.selectbox("Sizing mode", ["fixed", "proportional"])
@@ -155,6 +160,7 @@ def render() -> None:
                         "limit_fallback_market": limit_fallback_market,
                         "max_slippage": buy_slippage,
                         "min_trade_threshold": min_per_trade,
+                        "dry_run": dry_run,
                         "is_active": True,
                     }
                 )

@@ -30,6 +30,7 @@ def trader(session):
         min_trade_threshold=1.0,
         max_position_limit=1000.0,
         max_slippage=5.0,
+        dry_run=False,
     )
     session.add(t)
     session.commit()

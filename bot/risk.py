@@ -74,8 +74,13 @@ def cap_per_trade_limit(copy_size: float, price: float, trader: Trader) -> float
     return copy_size
 
 
-def cap_total_spend_limit(session: Session, trader: Trader, copy_size: float, price: float) -> float:
+def cap_total_spend_limit(
+    session: Session, trader: Trader, copy_size: float, price: float,
+    status_filter: list[str] | None = None,
+) -> float:
     """Cap copy_size so cumulative spend does not exceed total_spend_limit."""
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
     if trader.total_spend_limit <= 0 or price <= 0:
         return copy_size
     total_spent = (
@@ -83,7 +88,7 @@ def cap_total_spend_limit(session: Session, trader: Trader, copy_size: float, pr
         .filter(
             CopyTrade.trader_id == trader.id,
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
@@ -101,8 +106,13 @@ def cap_total_spend_limit(session: Session, trader: Trader, copy_size: float, pr
     return copy_size
 
 
-def cap_max_per_market(session: Session, trader: Trader, market: str, copy_size: float, price: float) -> float:
+def cap_max_per_market(
+    session: Session, trader: Trader, market: str, copy_size: float, price: float,
+    status_filter: list[str] | None = None,
+) -> float:
     """Cap copy_size so total market exposure does not exceed max_per_market."""
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
     if trader.max_per_market <= 0 or price <= 0:
         return copy_size
     existing = (
@@ -111,7 +121,7 @@ def cap_max_per_market(session: Session, trader: Trader, market: str, copy_size:
             CopyTrade.trader_id == trader.id,
             CopyTrade.original_market == market,
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
@@ -129,8 +139,13 @@ def cap_max_per_market(session: Session, trader: Trader, market: str, copy_size:
     return copy_size
 
 
-def cap_max_per_yes_no(session: Session, trader: Trader, token_id: str, copy_size: float, price: float) -> float:
+def cap_max_per_yes_no(
+    session: Session, trader: Trader, token_id: str, copy_size: float, price: float,
+    status_filter: list[str] | None = None,
+) -> float:
     """Cap copy_size so total outcome exposure does not exceed max_per_yes_no."""
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
     if trader.max_per_yes_no <= 0 or price <= 0:
         return copy_size
     existing = (
@@ -139,7 +154,7 @@ def cap_max_per_yes_no(session: Session, trader: Trader, token_id: str, copy_siz
             CopyTrade.trader_id == trader.id,
             CopyTrade.original_token_id == token_id,
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
@@ -163,8 +178,11 @@ def cap_position_limit(
     token_id: str,
     copy_size: float,
     price: float,
+    status_filter: list[str] | None = None,
 ) -> float:
     """Cap copy_size so net position exposure does not exceed max_position_limit."""
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
     if trader.max_position_limit <= 0 or price <= 0:
         return copy_size
     buy_total = (
@@ -173,7 +191,7 @@ def cap_position_limit(
             CopyTrade.trader_id == trader.id,
             CopyTrade.original_token_id == token_id,
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
@@ -183,7 +201,7 @@ def cap_position_limit(
             CopyTrade.trader_id == trader.id,
             CopyTrade.original_token_id == token_id,
             CopyTrade.original_side == "SELL",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .scalar()
     )
@@ -239,12 +257,17 @@ def cap_and_check(
     original_size: float,
     original_price: float,
     side: str,
+    status_filter: list[str] | None = None,
 ) -> tuple[float, Optional[str]]:
     """Run all risk checks: cap copy_size to limits, then reject if below minimum.
 
     Returns (capped_copy_size, rejection_status).
     rejection_status is None if the trade should proceed.
+    status_filter controls which trade statuses to count for limit checks.
     """
+    if status_filter is None:
+        status_filter = ["success", "dry_run"]
+
     # ── Filters that apply to ALL trades (BUY and SELL) ──
     rejection = check_ignore_trades_under(original_size, original_price, trader)
     if rejection:
@@ -257,10 +280,10 @@ def cap_and_check(
     # ── Buy-side: cap to limits instead of rejecting ──
     if side == "BUY":
         copy_size = cap_per_trade_limit(copy_size, expected_price, trader)
-        copy_size = cap_total_spend_limit(session, trader, copy_size, expected_price)
-        copy_size = cap_max_per_market(session, trader, market, copy_size, expected_price)
-        copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, expected_price)
-        copy_size = cap_position_limit(session, trader, token_id, copy_size, expected_price)
+        copy_size = cap_total_spend_limit(session, trader, copy_size, expected_price, status_filter=status_filter)
+        copy_size = cap_max_per_market(session, trader, market, copy_size, expected_price, status_filter=status_filter)
+        copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, expected_price, status_filter=status_filter)
+        copy_size = cap_position_limit(session, trader, token_id, copy_size, expected_price, status_filter=status_filter)
 
     # ── Check min_per_trade (reject if below, after capping) ──
     if side == "BUY":

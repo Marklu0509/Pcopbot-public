@@ -29,6 +29,9 @@ class Trader(Base):
     # Sell-only mode: only copy SELL trades, skip BUY
     sell_only = Column(Boolean, default=False)
 
+    # Per-trader dry run mode (True = simulate, False = live trading)
+    dry_run = Column(Boolean, default=True)
+
     # Sizing — "fixed" or "proportional"
     sizing_mode = Column(String, default="fixed")
     fixed_amount = Column(Float, default=50.0)

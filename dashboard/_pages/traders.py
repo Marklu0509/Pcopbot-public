@@ -304,7 +304,11 @@ def _load_realized_pnl(
 def _render_trader_detail(t) -> None:
     """Render the detail view for a single trader inside its tab."""
     # ── Info card ──
-    st.markdown(f"### {'🟢' if t.is_active else '🔴'} {t.label or 'Unnamed'}")
+    _dry = getattr(t, "dry_run", None)
+    _dry = True if _dry is None else bool(_dry)
+    _mode_badge = "🔵 DRY RUN" if _dry else "🟢 LIVE"
+    _active_badge = "Active" if t.is_active else "Inactive"
+    st.markdown(f"### {'🟢' if t.is_active else '🔴'} {t.label or 'Unnamed'} &nbsp; `{_mode_badge}`")
     st.code(t.wallet_address, language=None)
 
     # ── Summary metrics ──
@@ -323,13 +327,22 @@ def _render_trader_detail(t) -> None:
     c8.metric("Sell Order", f"{_sell_ot.upper()} ({t.sell_slippage:.0f}%)")
 
     # ── Toggles ──
-    tc1, tc2 = st.columns(2)
+    tc1, tc2, tc3 = st.columns(3)
     with tc1:
         new_active = st.toggle("Active", value=t.is_active, key=f"toggle_{t.id}")
         if new_active != t.is_active:
             _toggle_trader(t.id, new_active)
             st.rerun()
     with tc2:
+        cur_dry_run = True if getattr(t, "dry_run", None) is None else bool(t.dry_run)
+        new_dry_run = st.toggle(
+            "Dry Run", value=cur_dry_run, key=f"dry_run_{t.id}",
+            help="Simulate trades without placing real orders. Turn off to go live.",
+        )
+        if new_dry_run != cur_dry_run:
+            _update_trader(t.id, {"dry_run": new_dry_run})
+            st.rerun()
+    with tc3:
         cur_sell_only = bool(getattr(t, "sell_only", False))
         new_sell_only = st.toggle(
             "Sell Only (skip BUY)", value=cur_sell_only, key=f"sell_only_{t.id}",
@@ -654,10 +667,13 @@ def render() -> None:
     traders = _get_all_traders()
 
     if traders:
-        tab_labels = [
-            f"{'🟢' if t.is_active else '🔴'} {t.label or t.wallet_address[:10]}…"
-            for t in traders
-        ]
+        tab_labels = []
+        for t in traders:
+            _dr = getattr(t, "dry_run", None)
+            _dr = True if _dr is None else bool(_dr)
+            _icon = "🔴" if not t.is_active else ("🔵" if _dr else "🟢")
+            _mode = "[DRY]" if _dr else "[LIVE]"
+            tab_labels.append(f"{_icon} {t.label or t.wallet_address[:10]}… {_mode}")
         tabs = st.tabs(tab_labels)
         for tab, t in zip(tabs, traders):
             with tab:

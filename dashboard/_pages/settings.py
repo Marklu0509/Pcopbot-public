@@ -15,7 +15,7 @@ _SessionLocal = get_session_factory()
 # Default settings and their descriptions
 _DEFAULTS = {
     "poll_interval_seconds": {"default": "15.0", "label": "Poll Interval (seconds)", "help": "How often the bot polls for new trades. Supports decimals, e.g. 0.5."},
-    "dry_run": {"default": "true", "label": "Dry Run Mode", "help": "When enabled, the bot simulates trades without placing real orders."},
+    "dry_run": {"default": "false", "label": "Global Dry Run Override", "help": "When enabled, ALL traders are forced into dry run mode regardless of their individual setting. When disabled, each trader uses its own dry_run setting."},
     "auto_sell_enabled": {"default": "true", "label": "Auto-Sell", "help": "When enabled, automatically sells positions at $0.999 when price >= $0.95. When disabled, waits for market resolution and auto-redeems at $1.00 (free, but slower)."},
     "log_level": {"default": "INFO", "label": "Log Level", "help": "Logging verbosity: DEBUG, INFO, WARNING, ERROR."},
 }

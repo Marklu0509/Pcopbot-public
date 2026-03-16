@@ -55,9 +55,18 @@ def render() -> None:
             st.rerun()
         return
 
+    # Trade mode filter
+    pnl_mode = st.radio("Show", ["Live", "Dry Run", "All"], horizontal=True)
+    if pnl_mode == "Live":
+        mode_statuses = ["success"]
+    elif pnl_mode == "Dry Run":
+        mode_statuses = ["dry_run"]
+    else:
+        mode_statuses = ["success", "dry_run"]
+
     total_pnl = df["pnl"].sum()
     total_trades = len(df)
-    executed = df[df["status"].isin(["success", "dry_run"])]
+    executed = df[df["status"].isin(mode_statuses)]
     success_count = len(executed)
     success_rate = success_count / total_trades * 100 if total_trades else 0.0
 

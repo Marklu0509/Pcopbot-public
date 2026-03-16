@@ -653,9 +653,7 @@ def redeem_resolved_positions(session: "Session") -> int:
 
     Returns the number of positions successfully redeemed.
     """
-    if settings.DRY_RUN:
-        logger.debug("DRY_RUN: skipping auto-redemption check")
-        return 0
+    # Per-trader dry_run is checked per-group below; no global gate needed
 
     if not settings.POLYMARKET_PRIVATE_KEY:
         logger.warning("POLYMARKET_PRIVATE_KEY not set — cannot auto-redeem")
@@ -663,12 +661,12 @@ def redeem_resolved_positions(session: "Session") -> int:
 
     funder_address = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
 
-    # ── Collect all open BUY positions ────────────────────────────────────────
+    # ── Collect all open BUY positions (live trades only) ─────────────────────
     open_buys = (
         session.query(CopyTrade)
         .filter(
             CopyTrade.original_side == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status == "success",
             CopyTrade.original_market.is_not(None),
             CopyTrade.original_token_id.is_not(None),
         )
@@ -749,6 +747,13 @@ def redeem_resolved_positions(session: "Session") -> int:
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
 
     for trader_id, condition_id, token_id, trades, net_shares in active:
+        # Skip dry_run traders — they have no real on-chain positions
+        trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
+        if trader_obj:
+            from bot.executor import is_trader_dry_run
+            if is_trader_dry_run(trader_obj, session):
+                continue
+
         # For wallet-only positions, try to find condition_id from CLOB API
         if not condition_id:
             try:
