@@ -217,7 +217,12 @@ def _submit_via_relayer(
         timeout=30,
     )
     if not resp.ok:
-        raise RuntimeError(f"Relayer API error {resp.status_code}: {resp.text[:300]}")
+        # Sanitize error body to avoid leaking internal details in logs
+        body = resp.text[:200] if resp.text else ""
+        # Redact any accidentally echoed API keys
+        if relayer_key and relayer_key in body:
+            body = body.replace(relayer_key, "[REDACTED]")
+        raise RuntimeError(f"Relayer API error {resp.status_code}: {body}")
 
     result = resp.json()
     return result.get("transactionID") or result.get("transactionHash") or ""

@@ -74,8 +74,20 @@ def render() -> None:
             st.rerun()
     with col_b:
         if st.button("🗑️ Clear Logs"):
-            with _SessionLocal() as session:
-                session.query(BotLog).delete()
-                session.commit()
-            st.success("Logs cleared.")
-            st.rerun()
+            st.session_state["confirm_clear_logs"] = True
+
+    if st.session_state.get("confirm_clear_logs"):
+        st.warning("This will permanently delete all logs. Are you sure?")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Yes, delete all logs"):
+                with _SessionLocal() as session:
+                    session.query(BotLog).delete()
+                    session.commit()
+                st.session_state["confirm_clear_logs"] = False
+                st.success("Logs cleared.")
+                st.rerun()
+        with c2:
+            if st.button("Cancel"):
+                st.session_state["confirm_clear_logs"] = False
+                st.rerun()
