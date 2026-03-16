@@ -57,24 +57,27 @@ def check_price_filter(price: float, trader: Trader) -> Optional[str]:
     return None
 
 
-def check_per_trade_limit(copy_size: float, price: float, trader: Trader) -> Optional[str]:
-    """Reject if this trade's USD value exceeds max_per_trade or is below min_per_trade."""
-    trade_value = copy_size * price
-    if trader.min_per_trade > 0 and trade_value < trader.min_per_trade:
-        logger.info("Trade value $%.2f below min_per_trade $%.2f for trader %s",
-                     trade_value, trader.min_per_trade, trader.wallet_address)
-        return STATUS_BELOW_THRESHOLD
-    if trader.max_per_trade > 0 and trade_value > trader.max_per_trade:
-        logger.info("Trade value $%.2f exceeds max_per_trade $%.2f for trader %s",
-                     trade_value, trader.max_per_trade, trader.wallet_address)
-        return STATUS_POSITION_LIMIT
-    return None
+def cap_per_trade_limit(copy_size: float, price: float, trader: Trader) -> float:
+    """Cap copy_size so trade value does not exceed max_per_trade.
+
+    Returns the (possibly reduced) copy_size. Does NOT reject.
+    min_per_trade rejection is handled separately in run_all_checks.
+    """
+    if trader.max_per_trade > 0 and price > 0:
+        max_shares = trader.max_per_trade / price
+        if copy_size > max_shares:
+            logger.info(
+                "Capping trade from %.4f to %.4f shares (max $%.2f) for trader %s",
+                copy_size, max_shares, trader.max_per_trade, trader.wallet_address,
+            )
+            return max_shares
+    return copy_size
 
 
-def check_total_spend_limit(session: Session, trader: Trader, copy_size: float, price: float) -> Optional[str]:
-    """Reject if adding this trade would exceed the trader's total spend limit."""
-    if trader.total_spend_limit <= 0:
-        return None
+def cap_total_spend_limit(session: Session, trader: Trader, copy_size: float, price: float) -> float:
+    """Cap copy_size so cumulative spend does not exceed total_spend_limit."""
+    if trader.total_spend_limit <= 0 or price <= 0:
+        return copy_size
     total_spent = (
         session.query(func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0))
         .filter(
@@ -84,18 +87,24 @@ def check_total_spend_limit(session: Session, trader: Trader, copy_size: float, 
         )
         .scalar()
     )
-    new_cost = copy_size * price
-    if total_spent + new_cost > trader.total_spend_limit:
-        logger.info("Total spend $%.2f + $%.2f would exceed limit $%.2f for trader %s",
-                     total_spent, new_cost, trader.total_spend_limit, trader.wallet_address)
-        return STATUS_POSITION_LIMIT
-    return None
+    remaining = trader.total_spend_limit - total_spent
+    if remaining <= 0:
+        logger.info("Total spend limit $%.2f reached for trader %s", trader.total_spend_limit, trader.wallet_address)
+        return 0.0
+    max_shares = remaining / price
+    if copy_size > max_shares:
+        logger.info(
+            "Capping trade from %.4f to %.4f shares (remaining budget $%.2f) for trader %s",
+            copy_size, max_shares, remaining, trader.wallet_address,
+        )
+        return max_shares
+    return copy_size
 
 
-def check_max_per_market(session: Session, trader: Trader, market: str, copy_size: float, price: float) -> Optional[str]:
-    """Reject if total USD exposure on this market would exceed max_per_market."""
-    if trader.max_per_market <= 0:
-        return None
+def cap_max_per_market(session: Session, trader: Trader, market: str, copy_size: float, price: float) -> float:
+    """Cap copy_size so total market exposure does not exceed max_per_market."""
+    if trader.max_per_market <= 0 or price <= 0:
+        return copy_size
     existing = (
         session.query(func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0))
         .filter(
@@ -106,18 +115,24 @@ def check_max_per_market(session: Session, trader: Trader, market: str, copy_siz
         )
         .scalar()
     )
-    new_cost = copy_size * price
-    if existing + new_cost > trader.max_per_market:
-        logger.info("Market exposure $%.2f + $%.2f would exceed max_per_market $%.2f for trader %s",
-                     existing, new_cost, trader.max_per_market, trader.wallet_address)
-        return STATUS_POSITION_LIMIT
-    return None
+    remaining = trader.max_per_market - existing
+    if remaining <= 0:
+        logger.info("Max per market $%.2f reached for trader %s", trader.max_per_market, trader.wallet_address)
+        return 0.0
+    max_shares = remaining / price
+    if copy_size > max_shares:
+        logger.info(
+            "Capping trade from %.4f to %.4f shares (market remaining $%.2f) for trader %s",
+            copy_size, max_shares, remaining, trader.wallet_address,
+        )
+        return max_shares
+    return copy_size
 
 
-def check_max_per_yes_no(session: Session, trader: Trader, token_id: str, copy_size: float, price: float) -> Optional[str]:
-    """Reject if total USD exposure on this outcome (token_id) would exceed max_per_yes_no."""
-    if trader.max_per_yes_no <= 0:
-        return None
+def cap_max_per_yes_no(session: Session, trader: Trader, token_id: str, copy_size: float, price: float) -> float:
+    """Cap copy_size so total outcome exposure does not exceed max_per_yes_no."""
+    if trader.max_per_yes_no <= 0 or price <= 0:
+        return copy_size
     existing = (
         session.query(func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0))
         .filter(
@@ -128,26 +143,30 @@ def check_max_per_yes_no(session: Session, trader: Trader, token_id: str, copy_s
         )
         .scalar()
     )
-    new_cost = copy_size * price
-    if existing + new_cost > trader.max_per_yes_no:
-        logger.info("Token exposure $%.2f + $%.2f would exceed max_per_yes_no $%.2f for trader %s",
-                     existing, new_cost, trader.max_per_yes_no, trader.wallet_address)
-        return STATUS_POSITION_LIMIT
-    return None
+    remaining = trader.max_per_yes_no - existing
+    if remaining <= 0:
+        logger.info("Max per yes/no $%.2f reached for trader %s", trader.max_per_yes_no, trader.wallet_address)
+        return 0.0
+    max_shares = remaining / price
+    if copy_size > max_shares:
+        logger.info(
+            "Capping trade from %.4f to %.4f shares (yes/no remaining $%.2f) for trader %s",
+            copy_size, max_shares, remaining, trader.wallet_address,
+        )
+        return max_shares
+    return copy_size
 
 
-def check_position_limit(
+def cap_position_limit(
     session: Session,
     trader: Trader,
     token_id: str,
     copy_size: float,
     price: float,
-) -> Optional[str]:
-    """Return a rejection status if adding copy_size would exceed the max position limit ($).
-
-    Current exposure is the sum of (copy_size * copy_price) for all successful or dry_run
-    BUY trades minus SELL trades for the same trader + token.
-    """
+) -> float:
+    """Cap copy_size so net position exposure does not exceed max_position_limit."""
+    if trader.max_position_limit <= 0 or price <= 0:
+        return copy_size
     buy_total = (
         session.query(func.coalesce(func.sum(CopyTrade.copy_size * CopyTrade.copy_price), 0.0))
         .filter(
@@ -169,14 +188,21 @@ def check_position_limit(
         .scalar()
     )
     net_exposure = buy_total - sell_total
-    new_cost = copy_size * price
-    if net_exposure + new_cost > trader.max_position_limit:
+    remaining = trader.max_position_limit - net_exposure
+    if remaining <= 0:
         logger.info(
-            "Position limit exceeded for trader %s token %s: net=$%.2f new=$%.2f limit=$%.2f",
-            trader.wallet_address, token_id, net_exposure, new_cost, trader.max_position_limit,
+            "Position limit $%.2f reached for trader %s token %s",
+            trader.max_position_limit, trader.wallet_address, token_id,
         )
-        return STATUS_POSITION_LIMIT
-    return None
+        return 0.0
+    max_shares = remaining / price
+    if copy_size > max_shares:
+        logger.info(
+            "Capping trade from %.4f to %.4f shares (position remaining $%.2f) for trader %s",
+            copy_size, max_shares, remaining, trader.wallet_address,
+        )
+        return max_shares
+    return copy_size
 
 
 def check_slippage(
@@ -202,6 +228,68 @@ def check_slippage(
     return None
 
 
+def cap_and_check(
+    session: Session,
+    trader: Trader,
+    token_id: str,
+    market: str,
+    copy_size: float,
+    best_price: float,
+    expected_price: float,
+    original_size: float,
+    original_price: float,
+    side: str,
+) -> tuple[float, Optional[str]]:
+    """Run all risk checks: cap copy_size to limits, then reject if below minimum.
+
+    Returns (capped_copy_size, rejection_status).
+    rejection_status is None if the trade should proceed.
+    """
+    # ── Filters that apply to ALL trades (BUY and SELL) ──
+    rejection = check_ignore_trades_under(original_size, original_price, trader)
+    if rejection:
+        return copy_size, rejection
+
+    rejection = check_price_filter(expected_price, trader)
+    if rejection:
+        return copy_size, rejection
+
+    # ── Buy-side: cap to limits instead of rejecting ──
+    if side == "BUY":
+        copy_size = cap_per_trade_limit(copy_size, expected_price, trader)
+        copy_size = cap_total_spend_limit(session, trader, copy_size, expected_price)
+        copy_size = cap_max_per_market(session, trader, market, copy_size, expected_price)
+        copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, expected_price)
+        copy_size = cap_position_limit(session, trader, token_id, copy_size, expected_price)
+
+    # ── Check min_per_trade (reject if below, after capping) ──
+    if side == "BUY":
+        trade_value = copy_size * expected_price
+        if trader.min_per_trade > 0 and trade_value < trader.min_per_trade:
+            logger.info(
+                "Trade value $%.2f below min_per_trade $%.2f for trader %s (after capping)",
+                trade_value, trader.min_per_trade, trader.wallet_address,
+            )
+            return copy_size, STATUS_BELOW_THRESHOLD
+
+    # ── Minimum order value $1 USD hard floor ──
+    order_value = copy_size * expected_price
+    if order_value < MINIMUM_ORDER_VALUE_USD:
+        logger.info(
+            "Order value $%.2f below $%.2f minimum for trader %s",
+            order_value, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
+        )
+        return copy_size, STATUS_BELOW_MINIMUM_ORDER
+
+    # ── Slippage (applies to all) ──
+    rejection = check_slippage(best_price, expected_price, trader)
+    if rejection:
+        return copy_size, rejection
+
+    return copy_size, None
+
+
+# Keep backward-compatible alias
 def run_all_checks(
     session: Session,
     trader: Trader,
@@ -214,50 +302,9 @@ def run_all_checks(
     original_price: float,
     side: str,
 ) -> Optional[str]:
-    """Run all risk checks in order and return the first rejection status, or None if OK."""
-    # ── Filters that apply to ALL trades (BUY and SELL) ──
-    rejection = check_ignore_trades_under(original_size, original_price, trader)
-    if rejection:
-        return rejection
-
-    rejection = check_price_filter(expected_price, trader)
-    if rejection:
-        return rejection
-
-    # ── Buy-side spending / position limits (only on BUY) ──
-    if side == "BUY":
-        rejection = check_per_trade_limit(copy_size, expected_price, trader)
-        if rejection:
-            return rejection
-
-        rejection = check_total_spend_limit(session, trader, copy_size, expected_price)
-        if rejection:
-            return rejection
-
-        rejection = check_max_per_market(session, trader, market, copy_size, expected_price)
-        if rejection:
-            return rejection
-
-        rejection = check_max_per_yes_no(session, trader, token_id, copy_size, expected_price)
-        if rejection:
-            return rejection
-
-        rejection = check_position_limit(session, trader, token_id, copy_size, expected_price)
-        if rejection:
-            return rejection
-
-    # ── Minimum order value $1 USD hard floor ──
-    order_value = copy_size * expected_price
-    if order_value < MINIMUM_ORDER_VALUE_USD:
-        logger.info(
-            "Order value $%.2f below $%.2f minimum for trader %s",
-            order_value, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
-        )
-        return STATUS_BELOW_MINIMUM_ORDER
-
-    # ── Slippage (applies to all) ──
-    rejection = check_slippage(best_price, expected_price, trader)
-    if rejection:
-        return rejection
-
-    return None
+    """Legacy wrapper — returns rejection only (does not cap)."""
+    _, rejection = cap_and_check(
+        session, trader, token_id, market, copy_size,
+        best_price, expected_price, original_size, original_price, side,
+    )
+    return rejection

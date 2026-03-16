@@ -794,7 +794,7 @@ def execute_copy_trade(
         except Exception as exc:
             logger.warning("Could not query orderbook: %s", exc)
 
-    rejection = risk.run_all_checks(
+    copy_size, rejection = risk.cap_and_check(
         session=session,
         trader=trader,
         token_id=trade["token_id"],
