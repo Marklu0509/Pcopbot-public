@@ -916,7 +916,7 @@ def execute_copy_trade(
     elif status == "success":
         recorded_price = _get_filled_price(client, order_id or "", order_price)
     else:
-        recorded_price = order_price
+        recorded_price = expected_price
 
     # Calculate realized PnL for SELL trades at execution time
     realized_pnl = 0.0
