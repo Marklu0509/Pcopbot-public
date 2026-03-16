@@ -171,6 +171,7 @@ def fetch_prices_by_token_ids(token_ids: list[str]) -> dict[str, float]:
     and recently-resolved markets (unlike the ``/markets/{condition_id}``
     path which returns 422 for resolved markets).
 
+    Batches requests in chunks of 5 to avoid URL length limits.
     Returns ``{token_id: price}`` for every token found.
     """
     if not token_ids:
@@ -179,31 +180,34 @@ def fetch_prices_by_token_ids(token_ids: list[str]) -> dict[str, float]:
     import json as _json
 
     price_map: dict[str, float] = {}
-    try:
-        resp = _http.get(
-            f"{settings.GAMMA_API_BASE}/markets",
-            params={"clob_token_ids": _json.dumps(token_ids)},
-            timeout=15,
-        )
-        if not resp.ok:
-            return price_map
-        markets = resp.json()
-        if not isinstance(markets, list):
-            markets = [markets]
-        for data in markets:
-            t_ids = data.get("clobTokenIds", [])
-            prices = data.get("outcomePrices", [])
-            if isinstance(t_ids, str):
-                t_ids = _json.loads(t_ids)
-            if isinstance(prices, str):
-                prices = _json.loads(prices)
-            for tid, p in zip(t_ids, prices):
-                try:
-                    price_map[str(tid)] = float(p)
-                except (ValueError, TypeError):
-                    pass
-    except Exception as exc:
-        logger.warning("Error fetching prices by token IDs: %s", exc)
+    chunk_size = 5
+    for i in range(0, len(token_ids), chunk_size):
+        chunk = token_ids[i : i + chunk_size]
+        try:
+            resp = _http.get(
+                f"{settings.GAMMA_API_BASE}/markets",
+                params={"clob_token_ids": _json.dumps(chunk)},
+                timeout=15,
+            )
+            if not resp.ok:
+                continue
+            markets = resp.json()
+            if not isinstance(markets, list):
+                markets = [markets]
+            for data in markets:
+                t_ids = data.get("clobTokenIds", [])
+                prices = data.get("outcomePrices", [])
+                if isinstance(t_ids, str):
+                    t_ids = _json.loads(t_ids)
+                if isinstance(prices, str):
+                    prices = _json.loads(prices)
+                for tid, p in zip(t_ids, prices):
+                    try:
+                        price_map[str(tid)] = float(p)
+                    except (ValueError, TypeError):
+                        pass
+        except Exception as exc:
+            logger.warning("Error fetching prices by token IDs (chunk %d): %s", i, exc)
 
     return price_map
 

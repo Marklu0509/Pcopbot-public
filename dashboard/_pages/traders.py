@@ -248,9 +248,11 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
         except Exception as exc:
             _logger.warning("Gamma price fetch failed: %s", exc)
 
-    # Fallback 2: CLOB orderbook mid-price for any still-missing tokens (max 10)
+    # Fallback 2: CLOB orderbook best_bid for any still-missing tokens (max 20)
+    # Use best_bid (not mid-price) — it's the actual price you'd get if you sold.
+    # Wide spreads like bid=0.001/ask=0.999 would give misleading mid=0.5.
     still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
-    for tid in still_missing[:10]:
+    for tid in still_missing[:20]:
         try:
             resp = _req.get(
                 "https://clob.polymarket.com/book",
@@ -261,13 +263,8 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
                 continue
             book = resp.json()
             best_bid = float(book.get("bids", [{}])[0].get("price", 0) or 0) if book.get("bids") else 0.0
-            best_ask = float(book.get("asks", [{}])[0].get("price", 0) or 0) if book.get("asks") else 0.0
-            if best_bid > 0 and best_ask > 0:
-                price_map[tid] = round((best_bid + best_ask) / 2, 4)
-            elif best_bid > 0:
+            if best_bid > 0:
                 price_map[tid] = best_bid
-            elif best_ask > 0:
-                price_map[tid] = best_ask
         except Exception as exc:
             _logger.warning("CLOB book price fetch failed for %s: %s", tid[:12], exc)
 
