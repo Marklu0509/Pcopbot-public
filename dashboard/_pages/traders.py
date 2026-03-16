@@ -92,42 +92,47 @@ def _delete_trader(trader_id: int) -> int:
 def _reset_trade_history(trader_id: int, is_dry_run: bool) -> int:
     """Clear trade records for a trader. Returns count of deleted rows.
 
-    DRY_RUN: deletes ALL dry_run CopyTrade records.
-    LIVE: deletes SELL records + fully-closed BUY groups; keeps open-position BUY records.
+    DRY_RUN: deletes ALL CopyTrade records (everything is simulated).
+    LIVE: keeps only BUY success records with open positions; deletes everything else.
     """
     with _SessionLocal() as session:
         if is_dry_run:
+            # Wipe everything — all statuses (dry_run, below_threshold, failed, etc.)
             deleted = session.query(CopyTrade).filter(
                 CopyTrade.trader_id == trader_id,
-                CopyTrade.status == "dry_run",
             ).delete()
-            # Reset watermark so bot re-establishes it
             trader = session.get(Trader, trader_id)
             if trader:
                 trader.watermark_timestamp = None
             session.commit()
             return deleted
 
-        # LIVE: keep BUY records for open positions
-        trades = (
+        # LIVE: keep only BUY success records that still have open positions
+        all_trades = (
             session.query(CopyTrade)
-            .filter(
-                CopyTrade.trader_id == trader_id,
-                CopyTrade.status == "success",
-            )
+            .filter(CopyTrade.trader_id == trader_id)
             .all()
         )
-        if not trades:
+        if not all_trades:
             return 0
 
-        # Group by (market, token_id) — same key as _load_trader_holdings
+        # First, delete all non-success records (failed, below_threshold, etc.)
+        deleted = 0
+        success_trades: list[CopyTrade] = []
+        for ct in all_trades:
+            if ct.status != "success":
+                session.delete(ct)
+                deleted += 1
+            else:
+                success_trades.append(ct)
+
+        # Group success trades by (market, token_id) to find open positions
         from collections import defaultdict
         groups: dict[tuple, list[CopyTrade]] = defaultdict(list)
-        for ct in trades:
+        for ct in success_trades:
             key = (ct.original_market or "", ct.original_token_id or "")
             groups[key].append(ct)
 
-        deleted = 0
         for (_market, _token), group_trades in groups.items():
             buy_size = sum((ct.copy_size or 0) for ct in group_trades if ct.original_side == "BUY")
             sell_size = sum((ct.copy_size or 0) for ct in group_trades if ct.original_side == "SELL")
@@ -748,10 +753,8 @@ def _render_trader_detail(t) -> None:
 
         # Get record counts for display
         with _SessionLocal() as _sess:
-            status_filter = "dry_run" if _dry else "success"
             trade_count = _sess.query(CopyTrade).filter(
                 CopyTrade.trader_id == t.id,
-                CopyTrade.status == status_filter,
             ).count()
             pos_count = _sess.query(Position).filter(Position.trader_id == t.id).count()
 
