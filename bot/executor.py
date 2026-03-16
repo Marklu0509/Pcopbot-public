@@ -592,7 +592,31 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                     signed_order = client.create_order(order_args)
                     resp = client.post_order(signed_order, OrderType.FOK)
                     order_id = str(resp.get("orderID") or resp.get("order_id") or "")
-                    recorded_price = _get_filled_price(client, order_id or "", attempt_price)
+
+                    # FOK orders fill instantly or cancel — verify fill status
+                    filled = False
+                    if order_id:
+                        try:
+                            order_info = client.get_order(order_id)
+                            raw_status = ""
+                            if isinstance(order_info, dict):
+                                raw_status = (order_info.get("status") or "").upper()
+                            else:
+                                raw_status = (getattr(order_info, "status", "") or "").upper()
+                            filled = raw_status in ("FILLED", "MATCHED")
+                        except Exception:
+                            # Order may not exist yet (FOK cancelled immediately)
+                            filled = False
+
+                    if not filled:
+                        logger.info(
+                            "auto_sell FOK not filled (order cancelled): token=%s price=%.4f order_id=%s",
+                            token_id[:16], attempt_price, order_id,
+                        )
+                        last_exc = Exception("FOK not filled")
+                        continue
+
+                    recorded_price = _get_filled_price(client, order_id, attempt_price)
                     pnl = round((recorded_price - avg_buy) * net_shares, 4)
                     status = "success"
                     logger.info(
