@@ -1159,20 +1159,21 @@ def detect_expired_losses(session: "Session") -> int:
         return 0
 
     # Fetch market data via Gamma — works for both active and recently-resolved
+    markets_data: list = []
     try:
         resp = _req.get(
             f"{settings.GAMMA_API_BASE}/markets",
             params={"clob_token_ids": _json.dumps(all_token_ids)},
             timeout=15,
         )
-        if not resp.ok:
-            return 0
-        markets_data = resp.json()
-        if not isinstance(markets_data, list):
-            markets_data = [markets_data]
+        if resp.ok:
+            markets_data = resp.json()
+            if not isinstance(markets_data, list):
+                markets_data = [markets_data]
+        else:
+            logger.info("detect_expired_losses: Gamma returned %s, using wallet fallback", resp.status_code)
     except Exception as exc:
-        logger.warning("detect_expired_losses: failed to fetch Gamma market data: %s", exc)
-        return 0
+        logger.warning("detect_expired_losses: Gamma fetch failed: %s, using wallet fallback", exc)
 
     # Build token_id -> {price, closed}
     token_info: dict[str, dict] = {}
