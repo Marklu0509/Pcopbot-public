@@ -19,7 +19,8 @@ services:
       --server.enableCORS=false
       --server.enableXsrfProtection=true
       --server.enableWebsocketCompression=false
-    env_file: .env
+    env_file:
+      - .env.dashboard
     volumes:
       - db-data:/app/data
     restart: unless-stopped
