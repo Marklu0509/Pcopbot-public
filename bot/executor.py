@@ -429,12 +429,12 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
     if threshold <= 0:
         return 0
 
-    # Only auto-sell live trades (status="success")
+    # Fetch both live and dry_run BUY trades
     open_buys = (
         session.query(CopyTrade)
         .filter(
             CopyTrade.original_side == "BUY",
-            CopyTrade.status == "success",
+            CopyTrade.status.in_(["success", "dry_run"]),
         )
         .all()
     )
@@ -509,26 +509,55 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                 continue
             token_trader_map[(sample_trader_id, tid)] = []
 
-    sold = 0
+    # ── Regroup by token_id to sell once per token, then distribute ──────────
+    # Build per-token structures: all (trader_id, buys) pairs for each token
+    token_groups: dict[str, list[tuple[int, list[CopyTrade]]]] = {}
     for (trader_id, token_id), buys in token_trader_map.items():
+        token_groups.setdefault(token_id, []).append((trader_id, buys))
+
+    sold = 0
+    for token_id, trader_entries in token_groups.items():
         # Use wallet's actual position size as source of truth.
-        # Only fall back to DB if funder position data was not loaded at all.
         wallet_size = funder_sizes.get(token_id, 0.0)
         if funder_sizes and wallet_size <= 0:
             # Wallet data is available and shows no holdings — trust it.
-            # The position was likely sold manually or redeemed outside the bot.
-            continue
-        db_net = _get_net_holdings(session, trader_id, token_id)
-        net_shares = wallet_size if wallet_size > 0 else db_net
-        if net_shares <= 0:
+            # But dry_run traders may still have simulated holdings (no wallet).
+            # Check if ANY trader has dry_run holdings.
+            has_dry_run = False
+            for trader_id, _ in trader_entries:
+                dry_net = _get_net_holdings(session, trader_id, token_id, status_filter=["dry_run"])
+                if dry_net > 0:
+                    has_dry_run = True
+                    break
+            if not has_dry_run:
+                continue
+
+        # Classify traders into live vs dry_run for this token
+        live_traders: list[tuple[int, float]] = []   # (trader_id, db_net)
+        dry_traders: list[tuple[int, float]] = []     # (trader_id, db_net)
+        sample_buy: CopyTrade | None = None
+        for trader_id, buys in trader_entries:
+            if not sample_buy and buys:
+                sample_buy = buys[0]
+            trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
+            is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
+            status_f = ["dry_run"] if is_dry else ["success"]
+            db_net = _get_net_holdings(session, trader_id, token_id, status_filter=status_f)
+            if db_net <= 0:
+                continue
+            if is_dry:
+                dry_traders.append((trader_id, db_net))
+            else:
+                live_traders.append((trader_id, db_net))
+
+        if not live_traders and not dry_traders:
             continue
 
+        # ── Price check (shared across all traders for this token) ─────────
         best_bid = _get_best_price(client, token_id, "SELL")
         gamma_price = gamma_prices.get(token_id, 0.0)
         funder_price = funder_prices.get(token_id, 0.0)
 
-        # Compute complement-matched effective price:
-        # Selling Yes = matching with BUY No. Effective price = 1 - best_ask(No).
         complement_price = 0.0
         comp_token = complement_map.get(token_id)
         if comp_token:
@@ -536,34 +565,27 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             if comp_best_ask is not None and comp_best_ask > 0:
                 complement_price = round(1.0 - comp_best_ask, 4)
 
-        # Best observed price from all sources
         effective = max(gamma_price, funder_price, complement_price, best_bid or 0.0)
-
-        # Strategy: CLOB handles complement matching transparently.
-        # FOK orders are free (off-chain, auto-cancel if no fill).
-        # When price is close (>= ATTEMPT_FLOOR), attempt FOK SELL at
-        # threshold price — CLOB may fill via complement matching even
-        # though the visible orderbook shows a lower price.
         attempt_floor = 0.95
 
-        # Always log price info for tokens with holdings
+        total_net = wallet_size if wallet_size > 0 else sum(n for _, n in live_traders)
         logger.info(
             "auto_sell check: token=%s net=%.4f effective=%.4f "
-            "CLOB_bid=%s Comp=%.4f Gamma=%.4f Funder=%.4f",
-            token_id[:16], net_shares, effective,
+            "CLOB_bid=%s Comp=%.4f Gamma=%.4f Funder=%.4f live=%d dry=%d",
+            token_id[:16], total_net, effective,
             f"{best_bid:.4f}" if best_bid is not None else "None",
             complement_price, gamma_price, funder_price,
+            len(live_traders), len(dry_traders),
         )
 
         if effective < attempt_floor:
-            continue  # Price too far from threshold
+            continue
 
-        # Cooldown: don't spam FOK attempts every cycle when price < threshold
         if effective < threshold:
             now_ts = time.monotonic()
             last = _auto_sell_last_attempt.get(token_id, 0.0)
             if now_ts - last < _AUTO_SELL_COOLDOWN:
-                continue  # Still in cooldown, skip
+                continue
             _auto_sell_last_attempt[token_id] = now_ts
             logger.info(
                 "auto_sell ATTEMPT: token=%s effective=%.4f < threshold=%.4f, "
@@ -573,178 +595,188 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                 complement_price, gamma_price, funder_price,
             )
 
-        # Use funder cur_price as the primary sell price when it's high,
-        # then fall back to lower prices if CLOB rejects.
-        # Priority: cur_price → 0.999 → 0.99
         sell_price = threshold
         if funder_price >= 0.995:
             sell_price = round(funder_price, 4)
 
-        sample = buys[0] if buys else None
-        avg_buy = _get_avg_buy_price(session, trader_id, token_id)
-        pnl = round((sell_price - avg_buy) * net_shares, 4)
-
-        logger.info(
-            "auto_sell: token=%s net=%.4f sell_price=%.4f CLOB_bid=%s Comp=%.4f "
-            "Gamma=%.4f Funder=%.4f threshold=%.4f avg_buy=%.4f",
-            token_id[:16], net_shares, sell_price,
-            f"{best_bid:.4f}" if best_bid is not None else "None",
-            complement_price, gamma_price, funder_price, threshold, avg_buy,
-        )
-
+        # ── Execute live sell (one order for the entire wallet position) ────
+        live_sell_ok = False
         order_id: str | None = None
-        status = "failed"
-        error_msg: str | None = None
         recorded_price = sell_price
 
-        # Ensure ERC-1155 approval before attempting sell
-        try:
-            _ensure_sell_approval(client, token_id)
-        except Exception as exc:
-            logger.warning("auto_sell: approval check failed for token=%s: %s", token_id[:16], exc)
+        if live_traders and total_net > 0:
+            try:
+                _ensure_sell_approval(client, token_id)
+            except Exception as exc:
+                logger.warning("auto_sell: approval check failed for token=%s: %s", token_id[:16], exc)
 
-        try:
-            from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
-            from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
+            try:
+                from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+                from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
 
-            # Build descending price list: cur_price → 0.999
-            # CLOB rejects prices > 0.99 for some tokens, so we cascade.
-            # If both fail, skip — let auto-redeem handle it at $1.00 for free.
-            prices_to_try: list[float] = []
-            if sell_price > 0.999:
-                prices_to_try.append(round(sell_price, 4))
-            prices_to_try.append(0.999)
-            # Deduplicate while preserving order
-            seen: set[float] = set()
-            unique_prices: list[float] = []
-            for p in prices_to_try:
-                if p not in seen:
-                    seen.add(p)
-                    unique_prices.append(p)
-            prices_to_try = unique_prices
+                prices_to_try: list[float] = []
+                if sell_price > 0.999:
+                    prices_to_try.append(round(sell_price, 4))
+                prices_to_try.append(0.999)
+                seen: set[float] = set()
+                unique_prices: list[float] = []
+                for p in prices_to_try:
+                    if p not in seen:
+                        seen.add(p)
+                        unique_prices.append(p)
+                prices_to_try = unique_prices
 
-            last_exc: Exception | None = None
-            approval_retried = False
-            for attempt_price in prices_to_try:
-                try:
-                    order_args = OrderArgs(
-                        token_id=token_id,
-                        price=attempt_price,
-                        size=round(net_shares, 4),
-                        side=_SELL,
-                    )
-                    signed_order = client.create_order(order_args)
-                    resp = client.post_order(signed_order, OrderType.FOK)
-                    order_id = str(resp.get("orderID") or resp.get("order_id") or "")
-
-                    # FOK orders fill instantly or cancel — verify fill status
-                    filled = False
-                    if order_id:
-                        try:
-                            order_info = client.get_order(order_id)
-                            raw_status = ""
-                            if isinstance(order_info, dict):
-                                raw_status = (order_info.get("status") or "").upper()
-                            else:
-                                raw_status = (getattr(order_info, "status", "") or "").upper()
-                            filled = raw_status in ("FILLED", "MATCHED")
-                        except Exception:
-                            # Order may not exist yet (FOK cancelled immediately)
-                            filled = False
-
-                    if not filled:
-                        logger.info(
-                            "auto_sell FOK not filled (order cancelled): token=%s price=%.4f order_id=%s",
-                            token_id[:16], attempt_price, order_id,
+                last_exc: Exception | None = None
+                approval_retried = False
+                for attempt_price in prices_to_try:
+                    try:
+                        order_args = OrderArgs(
+                            token_id=token_id,
+                            price=attempt_price,
+                            size=round(total_net, 4),
+                            side=_SELL,
                         )
-                        last_exc = Exception("FOK not filled")
-                        continue
+                        signed_order = client.create_order(order_args)
+                        resp = client.post_order(signed_order, OrderType.FOK)
+                        order_id = str(resp.get("orderID") or resp.get("order_id") or "")
 
-                    recorded_price = _get_filled_price(client, order_id, attempt_price)
-                    pnl = round((recorded_price - avg_buy) * net_shares, 4)
-                    status = "success"
-                    logger.info(
-                        "auto_sell SUCCESS: token=%s size=%.4f price=%.4f filled=%.4f pnl=%.4f order_id=%s",
-                        token_id[:16], net_shares, attempt_price, recorded_price, pnl, order_id,
-                    )
-                    last_exc = None
-                    break
-                except Exception as exc:
-                    last_exc = exc
-                    err_str = str(exc)
-                    # If price bounds error, retry with lower price
-                    if "max: 0.99" in err_str or "max:0.99" in err_str:
-                        logger.info(
-                            "auto_sell: price %.4f rejected (bounds), retrying at next price for token=%s",
-                            attempt_price, token_id[:16],
-                        )
-                        continue
-                    # If balance/allowance error, try setting approval and retry once
-                    if "balance" in err_str.lower() and "allowance" in err_str.lower() and not approval_retried:
-                        approval_retried = True
-                        logger.info(
-                            "auto_sell: balance/allowance error for token=%s, forcing approval and retrying…",
-                            token_id[:16],
-                        )
-                        # Clear cache so _ensure_sell_approval re-checks on-chain
-                        _approved_exchanges.clear()
-                        try:
-                            _ensure_sell_approval(client, token_id)
-                        except Exception:
-                            pass
-                        # Also refresh CLOB's cached balance/allowance
-                        try:
-                            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore
-                            client.update_balance_allowance(
-                                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                        filled = False
+                        if order_id:
+                            try:
+                                order_info = client.get_order(order_id)
+                                raw_status = ""
+                                if isinstance(order_info, dict):
+                                    raw_status = (order_info.get("status") or "").upper()
+                                else:
+                                    raw_status = (getattr(order_info, "status", "") or "").upper()
+                                filled = raw_status in ("FILLED", "MATCHED")
+                            except Exception:
+                                filled = False
+
+                        if not filled:
+                            logger.info(
+                                "auto_sell FOK not filled (order cancelled): token=%s price=%.4f order_id=%s",
+                                token_id[:16], attempt_price, order_id,
                             )
-                        except Exception:
-                            pass
-                        continue  # Retry same price after approval
-                    # Other errors: don't retry
-                    break
+                            last_exc = Exception("FOK not filled")
+                            continue
 
-            if last_exc is not None:
-                status = "failed"
-                error_msg = str(last_exc)
+                        recorded_price = _get_filled_price(client, order_id, attempt_price)
+                        live_sell_ok = True
+                        logger.info(
+                            "auto_sell SUCCESS: token=%s size=%.4f price=%.4f filled=%.4f order_id=%s",
+                            token_id[:16], total_net, attempt_price, recorded_price, order_id,
+                        )
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        err_str = str(exc)
+                        if "max: 0.99" in err_str or "max:0.99" in err_str:
+                            logger.info(
+                                "auto_sell: price %.4f rejected (bounds), retrying at next price for token=%s",
+                                attempt_price, token_id[:16],
+                            )
+                            continue
+                        if "balance" in err_str.lower() and "allowance" in err_str.lower() and not approval_retried:
+                            approval_retried = True
+                            logger.info(
+                                "auto_sell: balance/allowance error for token=%s, forcing approval and retrying…",
+                                token_id[:16],
+                            )
+                            _approved_exchanges.clear()
+                            try:
+                                _ensure_sell_approval(client, token_id)
+                            except Exception:
+                                pass
+                            try:
+                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType  # type: ignore
+                                client.update_balance_allowance(
+                                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                                )
+                            except Exception:
+                                pass
+                            continue
+                        break
+
+                if last_exc is not None:
+                    logger.info(
+                        "auto_sell FOK not filled for token=%s (will retry next cycle): %s",
+                        token_id[:16], last_exc,
+                    )
+            except Exception as exc:
                 logger.info(
                     "auto_sell FOK not filled for token=%s (will retry next cycle): %s",
-                    token_id[:16], last_exc,
+                    token_id[:16], exc,
                 )
-        except Exception as exc:
-            status = "failed"
-            error_msg = str(exc)
-            logger.info(
-                "auto_sell FOK not filled for token=%s (will retry next cycle): %s",
-                token_id[:16], exc,
-            )
 
-        if status != "success":
-            # Don't persist failed attempts — they pollute trade history
-            # and create spurious records on retries.
-            continue
+        # ── Distribute SELL records across live traders proportionally ──────
+        if live_sell_ok and live_traders:
+            live_total_db = sum(n for _, n in live_traders)
+            for trader_id, db_net in live_traders:
+                ratio = db_net / live_total_db if live_total_db > 0 else 1.0
+                trader_shares = round(db_net, 4)  # Each trader sells their own DB holdings
+                avg_buy = _get_avg_buy_price(session, trader_id, token_id, status_filter=["success"])
+                pnl = round((recorded_price - avg_buy) * trader_shares, 4)
 
-        sell_record = CopyTrade(
-            trader_id=trader_id,
-            original_trade_id=f"auto_sell:{token_id[:24]}",
-            original_market=sample.original_market if sample else "",
-            original_token_id=token_id,
-            market_title=sample.market_title if sample else "",
-            outcome=sample.outcome if sample else "",
-            original_side="SELL",
-            original_size=net_shares,
-            original_price=sell_price,
-            original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
-            copy_size=net_shares,
-            copy_price=recorded_price,
-            status="success",
-            order_id=order_id,
-            pnl=pnl,
-            executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
-        )
-        session.add(sell_record)
-        session.commit()
-        sold += 1
+                sell_record = CopyTrade(
+                    trader_id=trader_id,
+                    original_trade_id=f"auto_sell:{token_id[:24]}",
+                    original_market=sample_buy.original_market if sample_buy else "",
+                    original_token_id=token_id,
+                    market_title=sample_buy.market_title if sample_buy else "",
+                    outcome=sample_buy.outcome if sample_buy else "",
+                    original_side="SELL",
+                    original_size=trader_shares,
+                    original_price=sell_price,
+                    original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+                    copy_size=trader_shares,
+                    copy_price=recorded_price,
+                    status="success",
+                    order_id=order_id,
+                    pnl=pnl,
+                    executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                session.add(sell_record)
+                logger.info(
+                    "auto_sell record: trader=%d shares=%.4f pnl=%.4f (of total %.4f)",
+                    trader_id, trader_shares, pnl, total_net,
+                )
+            session.commit()
+            sold += 1
+
+        # ── Simulate SELL for dry_run traders (no real order) ──────────────
+        if dry_traders and effective >= attempt_floor:
+            sim_price = recorded_price if live_sell_ok else sell_price
+            for trader_id, db_net in dry_traders:
+                avg_buy = _get_avg_buy_price(session, trader_id, token_id, status_filter=["dry_run"])
+                pnl = round((sim_price - avg_buy) * db_net, 4)
+
+                sell_record = CopyTrade(
+                    trader_id=trader_id,
+                    original_trade_id=f"auto_sell_sim:{token_id[:24]}",
+                    original_market=sample_buy.original_market if sample_buy else "",
+                    original_token_id=token_id,
+                    market_title=sample_buy.market_title if sample_buy else "",
+                    outcome=sample_buy.outcome if sample_buy else "",
+                    original_side="SELL",
+                    original_size=db_net,
+                    original_price=sim_price,
+                    original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+                    copy_size=db_net,
+                    copy_price=sim_price,
+                    status="dry_run",
+                    order_id=None,
+                    pnl=pnl,
+                    executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                session.add(sell_record)
+                logger.info(
+                    "auto_sell DRY_RUN: trader=%d token=%s shares=%.4f sim_price=%.4f pnl=%.4f",
+                    trader_id, token_id[:16], db_net, sim_price, pnl,
+                )
+            session.commit()
+            sold += 1
 
     return sold
 

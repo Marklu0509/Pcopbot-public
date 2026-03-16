@@ -72,6 +72,87 @@ def _toggle_trader(trader_id: int, is_active: bool) -> None:
     _update_trader(trader_id, {"is_active": is_active})
 
 
+def _delete_trader(trader_id: int) -> int:
+    """Delete a trader and all related records. Returns count of deleted CopyTrade rows."""
+    with _SessionLocal() as session:
+        # Deactivate first to prevent bot race condition
+        trader = session.get(Trader, trader_id)
+        if trader:
+            trader.is_active = False
+            session.flush()
+
+        ct_count = session.query(CopyTrade).filter(CopyTrade.trader_id == trader_id).delete()
+        session.query(Position).filter(Position.trader_id == trader_id).delete()
+        if trader:
+            session.delete(trader)
+        session.commit()
+    return ct_count
+
+
+def _reset_trade_history(trader_id: int, is_dry_run: bool) -> int:
+    """Clear trade records for a trader. Returns count of deleted rows.
+
+    DRY_RUN: deletes ALL dry_run CopyTrade records.
+    LIVE: deletes SELL records + fully-closed BUY groups; keeps open-position BUY records.
+    """
+    with _SessionLocal() as session:
+        if is_dry_run:
+            deleted = session.query(CopyTrade).filter(
+                CopyTrade.trader_id == trader_id,
+                CopyTrade.status == "dry_run",
+            ).delete()
+            # Reset watermark so bot re-establishes it
+            trader = session.get(Trader, trader_id)
+            if trader:
+                trader.watermark_timestamp = None
+            session.commit()
+            return deleted
+
+        # LIVE: keep BUY records for open positions
+        trades = (
+            session.query(CopyTrade)
+            .filter(
+                CopyTrade.trader_id == trader_id,
+                CopyTrade.status == "success",
+            )
+            .all()
+        )
+        if not trades:
+            return 0
+
+        # Group by (market, token_id) — same key as _load_trader_holdings
+        from collections import defaultdict
+        groups: dict[tuple, list[CopyTrade]] = defaultdict(list)
+        for ct in trades:
+            key = (ct.original_market or "", ct.original_token_id or "")
+            groups[key].append(ct)
+
+        deleted = 0
+        for (_market, _token), group_trades in groups.items():
+            buy_size = sum((ct.copy_size or 0) for ct in group_trades if ct.original_side == "BUY")
+            sell_size = sum((ct.copy_size or 0) for ct in group_trades if ct.original_side == "SELL")
+            net = buy_size - sell_size
+
+            if net <= 0:
+                # Fully closed — delete all records in this group
+                for ct in group_trades:
+                    session.delete(ct)
+                    deleted += 1
+            else:
+                # Open position — delete only SELL records, keep BUYs
+                for ct in group_trades:
+                    if ct.original_side == "SELL":
+                        session.delete(ct)
+                        deleted += 1
+
+        # Reset watermark
+        trader = session.get(Trader, trader_id)
+        if trader:
+            trader.watermark_timestamp = None
+        session.commit()
+    return deleted
+
+
 def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame:
     """Load copy trades for a trader, newest first.
 
@@ -658,6 +739,92 @@ def _render_trader_detail(t) -> None:
                 "PnL": st.column_config.NumberColumn(format="$%.2f"),
             },
         )
+
+    # ── Danger Zone ──
+    st.divider()
+    with st.expander("Danger Zone", expanded=False):
+        _dry = getattr(t, "dry_run", None)
+        _dry = True if _dry is None else bool(_dry)
+
+        # Get record counts for display
+        with _SessionLocal() as _sess:
+            status_filter = "dry_run" if _dry else "success"
+            trade_count = _sess.query(CopyTrade).filter(
+                CopyTrade.trader_id == t.id,
+                CopyTrade.status == status_filter,
+            ).count()
+            pos_count = _sess.query(Position).filter(Position.trader_id == t.id).count()
+
+        dz_left, dz_right = st.columns(2)
+
+        # ── Reset Trade History ──
+        with dz_left:
+            reset_disabled = trade_count == 0
+            reset_key = f"confirm_reset_{t.id}"
+            if reset_key not in st.session_state:
+                st.session_state[reset_key] = False
+
+            if not st.session_state[reset_key]:
+                if st.button(
+                    "Reset Trade History",
+                    key=f"reset_btn_{t.id}",
+                    disabled=reset_disabled,
+                    help="No trade records to reset." if reset_disabled else None,
+                ):
+                    st.session_state[reset_key] = True
+                    st.rerun()
+            else:
+                if _dry:
+                    st.warning(
+                        f"This will delete **all {trade_count} dry-run** trade records "
+                        f"for this trader. Everything will be wiped clean."
+                    )
+                else:
+                    st.warning(
+                        f"This will delete SELL records and fully-closed positions "
+                        f"({trade_count} total records). Open positions (BUY records "
+                        f"with remaining holdings) will be preserved."
+                    )
+                rc1, rc2 = st.columns(2)
+                with rc1:
+                    if st.button("Confirm Reset", key=f"reset_confirm_{t.id}", type="primary"):
+                        deleted = _reset_trade_history(t.id, is_dry_run=_dry)
+                        st.session_state[reset_key] = False
+                        st.success(f"Deleted {deleted} trade records.")
+                        st.cache_data.clear()
+                        st.rerun()
+                with rc2:
+                    if st.button("Cancel", key=f"reset_cancel_{t.id}"):
+                        st.session_state[reset_key] = False
+                        st.rerun()
+
+        # ── Delete Trader ──
+        with dz_right:
+            delete_key = f"confirm_delete_{t.id}"
+            if delete_key not in st.session_state:
+                st.session_state[delete_key] = False
+
+            if not st.session_state[delete_key]:
+                if st.button("Delete Trader", key=f"delete_btn_{t.id}"):
+                    st.session_state[delete_key] = True
+                    st.rerun()
+            else:
+                st.warning(
+                    f"This will **permanently delete** this trader, "
+                    f"**{trade_count} trades**, and **{pos_count} positions**. "
+                    f"This cannot be undone."
+                )
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    if st.button("Confirm Delete", key=f"delete_confirm_{t.id}", type="primary"):
+                        _delete_trader(t.id)
+                        st.session_state[delete_key] = False
+                        st.cache_data.clear()
+                        st.rerun()
+                with dc2:
+                    if st.button("Cancel", key=f"delete_cancel_{t.id}"):
+                        st.session_state[delete_key] = False
+                        st.rerun()
 
 
 def render() -> None:

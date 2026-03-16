@@ -534,7 +534,7 @@ def _record_redemption(
             CopyTrade.trader_id         == sample.trader_id,
             CopyTrade.original_token_id == sample.original_token_id,
             CopyTrade.original_side     == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status            == "success",
         )
         .first()
     )
@@ -565,7 +565,7 @@ def _record_redemption(
 
     # Zero out unrealized PnL on BUY entries for THIS trader only
     for ct in buy_trades:
-        if ct.trader_id == sample.trader_id:
+        if ct.trader_id == sample.trader_id and ct.status == "success":
             ct.pnl = 0.0
 
     session.commit()
@@ -576,11 +576,66 @@ def _record_redemption(
     )
 
 
+def _record_simulated_redemption(
+    session: "Session",
+    buy_trades: list[CopyTrade],
+    trader_id: int,
+    token_id: str,
+    net_shares: float,
+    market_title: str,
+    outcome: str,
+) -> None:
+    """Create a simulated SELL record for dry_run trader redemptions."""
+    from sqlalchemy import func
+    from bot.executor import _get_avg_buy_price
+
+    # Check for duplicate
+    order_id_key = f"sim_redeem:{token_id[:20]}:t{trader_id}"
+    if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
+        return
+
+    avg_buy = _get_avg_buy_price(session, trader_id, token_id, status_filter=["dry_run"])
+    pnl = round((1.0 - avg_buy) * net_shares, 4)
+
+    sample = buy_trades[0] if buy_trades else None
+    redemption = CopyTrade(
+        trader_id           = trader_id,
+        original_trade_id   = f"sim_redemption:{token_id[:24]}",
+        original_market     = sample.original_market if sample else "",
+        original_token_id   = token_id,
+        market_title        = market_title or (sample.market_title if sample else ""),
+        outcome             = outcome or (sample.outcome if sample else ""),
+        original_side       = "SELL",
+        original_size       = net_shares,
+        original_price      = 1.0,
+        original_timestamp  = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+        copy_size           = net_shares,
+        copy_price          = 1.0,
+        status              = "dry_run",
+        order_id            = order_id_key,
+        pnl                 = pnl,
+        executed_at         = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+    )
+    session.add(redemption)
+
+    # Zero out unrealized PnL on dry_run BUY entries
+    for ct in buy_trades:
+        if ct.trader_id == trader_id and ct.status == "dry_run":
+            ct.pnl = 0.0
+
+    session.commit()
+    logger.info(
+        "Simulated redemption recorded: market=%s trader=%d shares=%.4f avg_buy=%.4f pnl=%.4f",
+        market_title, trader_id, net_shares, avg_buy, pnl,
+    )
+
+
 def _record_expired_loss(
     session: "Session",
     trader_id: int,
     buy_trades: list[CopyTrade],
     net_shares: float,
+    is_dry_run: bool = False,
 ) -> None:
     """Create a synthetic SELL at price=0 for a resolved losing position.
 
@@ -592,8 +647,12 @@ def _record_expired_loss(
     if not buy_trades:
         return
 
+    record_status = "dry_run" if is_dry_run else "success"
+    status_filter = ["dry_run"] if is_dry_run else ["success"]
     sample = buy_trades[0]
     order_id_key = f"expired_loss:{sample.original_market[:20]}:t{trader_id}:{sample.original_token_id[:12]}"
+    if is_dry_run:
+        order_id_key = f"sim_expired:{sample.original_market[:20]}:t{trader_id}:{sample.original_token_id[:12]}"
     if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
         return  # already recorded
 
@@ -606,7 +665,7 @@ def _record_expired_loss(
             CopyTrade.trader_id         == trader_id,
             CopyTrade.original_token_id == sample.original_token_id,
             CopyTrade.original_side     == "BUY",
-            CopyTrade.status.in_(["success", "dry_run"]),
+            CopyTrade.status.in_(status_filter),
         )
         .first()
     )
@@ -627,7 +686,7 @@ def _record_expired_loss(
         original_timestamp  = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
         copy_size           = net_shares,
         copy_price          = 0.0,
-        status              = "success",
+        status              = record_status,
         order_id            = order_id_key,
         pnl                 = pnl,
         executed_at         = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
@@ -635,14 +694,14 @@ def _record_expired_loss(
     session.add(loss_record)
 
     for ct in buy_trades:
-        if ct.trader_id == trader_id:
+        if ct.trader_id == trader_id and ct.status in status_filter:
             ct.pnl = 0.0
 
     session.commit()
     logger.info(
-        "Expired loss recorded: market=%s trader=%d shares=%.4f avg_buy=%.4f pnl=%.4f",
+        "Expired loss recorded: market=%s trader=%d shares=%.4f avg_buy=%.4f pnl=%.4f status=%s",
         sample.market_title or sample.original_market[:12],
-        trader_id, net_shares, avg_buy, pnl,
+        trader_id, net_shares, avg_buy, pnl, record_status,
     )
 
 
@@ -661,12 +720,12 @@ def redeem_resolved_positions(session: "Session") -> int:
 
     funder_address = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
 
-    # ── Collect all open BUY positions (live trades only) ─────────────────────
+    # ── Collect all open BUY positions (live + dry_run) ───────────────────────
     open_buys = (
         session.query(CopyTrade)
         .filter(
             CopyTrade.original_side == "BUY",
-            CopyTrade.status == "success",
+            CopyTrade.status.in_(["success", "dry_run"]),
             CopyTrade.original_market.is_not(None),
             CopyTrade.original_token_id.is_not(None),
         )
@@ -747,12 +806,9 @@ def redeem_resolved_positions(session: "Session") -> int:
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
 
     for trader_id, condition_id, token_id, trades, net_shares in active:
-        # Skip dry_run traders — they have no real on-chain positions
         trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
-        if trader_obj:
-            from bot.executor import is_trader_dry_run
-            if is_trader_dry_run(trader_obj, session):
-                continue
+        from bot.executor import is_trader_dry_run
+        trader_is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
 
         # For wallet-only positions, try to find condition_id from CLOB API
         if not condition_id:
@@ -805,6 +861,17 @@ def redeem_resolved_positions(session: "Session") -> int:
         label         = (trades[0].market_title if trades else "") or condition_id[:12]
         outcome       = token_data["outcome"]
         outcome_index = token_data["index"]
+
+        # ── Dry-run traders: simulate redemption (no on-chain tx) ──────────
+        if trader_is_dry:
+            logger.info(
+                "Simulated redemption (dry_run): market=%r outcome=%r shares=%.4f",
+                label, outcome, net_shares,
+            )
+            # Record simulated redemption with status="dry_run"
+            _record_simulated_redemption(session, trades, trader_id, token_id, net_shares, label, outcome)
+            redeemed += 1
+            continue
 
         logger.info(
             "Redeeming: market=%r outcome=%r shares=%.4f neg_risk=%s",
@@ -1241,10 +1308,14 @@ def detect_expired_losses(session: "Session") -> int:
             by_trader.setdefault(ct.trader_id, []).append(ct)
 
         for trader_id, trader_buys in by_trader.items():
-            net = _get_net_holdings(session, trader_id, token_id)
+            trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
+            from bot.executor import is_trader_dry_run
+            is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
+            sf = ["dry_run"] if is_dry else ["success"]
+            net = _get_net_holdings(session, trader_id, token_id, status_filter=sf)
             if net < 0.1:
                 continue  # skip rounding residuals
-            _record_expired_loss(session, trader_id, trader_buys, net)
+            _record_expired_loss(session, trader_id, trader_buys, net, is_dry_run=is_dry)
             created += 1
 
     return created
