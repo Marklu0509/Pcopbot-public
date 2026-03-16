@@ -1,5 +1,6 @@
 """Streamlit entry point — multi-page app."""
 
+import hmac
 import importlib
 import sys
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ if _pw:
         st.title("🔒 Login")
         entered = st.text_input("Password", type="password")
         if st.button("Login"):
-            if entered == _pw:
+            if hmac.compare_digest(entered, _pw):
                 st.session_state.authenticated = True
                 st.rerun()
             else:
