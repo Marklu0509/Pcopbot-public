@@ -54,7 +54,7 @@ def render_wallet_metrics(funder_address: str) -> None:
     total, err = _fetch_portfolio_value(funder_address)
 
     if total is None:
-        st.caption(f"💰 資產：無法取得 ({err})" if err else "💰 資產：無法取得")
+        st.caption(f"Unable to fetch assets ({err})" if err else "Unable to fetch assets")
         return
 
-    st.metric("💼 總資產 (USDC)", f"${total:,.2f}")
+    st.metric("Total Assets (USDC)", f"${total:,.2f}")

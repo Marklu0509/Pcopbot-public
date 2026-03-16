@@ -33,7 +33,7 @@ if _pw:
                 st.session_state.authenticated = True
                 st.rerun()
             else:
-                st.error("密碼錯誤")
+                st.error("Incorrect password")
         st.stop()
 
 # ── Live clock in sidebar (UTC, matching trading system) ──

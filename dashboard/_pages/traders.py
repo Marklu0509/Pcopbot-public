@@ -223,13 +223,13 @@ def _load_trader_positions(trader_id: int) -> pd.DataFrame:
 
 
 _PNL_RANGE_OPTIONS: dict[str, timedelta | None] = {
-    "今日":   timedelta(days=1),
-    "近3天":  timedelta(days=3),
-    "近7天":  timedelta(days=7),
-    "近30天": timedelta(days=30),
-    "近半年": timedelta(days=183),
-    "近一年": timedelta(days=365),
-    "全部":   None,
+    "Today":    timedelta(days=1),
+    "3 Days":   timedelta(days=3),
+    "7 Days":   timedelta(days=7),
+    "30 Days":  timedelta(days=30),
+    "6 Months": timedelta(days=183),
+    "1 Year":   timedelta(days=365),
+    "All":      None,
 }
 
 
@@ -535,9 +535,9 @@ def _render_trader_detail(t) -> None:
     col_pnl_hdr, col_pnl_range = st.columns([3, 1])
     col_pnl_hdr.subheader("💰 Realized PnL")
     selected_range = col_pnl_range.selectbox(
-        "時間範圍",
+        "Time Range",
         list(_PNL_RANGE_OPTIONS.keys()),
-        index=len(_PNL_RANGE_OPTIONS) - 1,  # default: 全部
+        index=len(_PNL_RANGE_OPTIONS) - 1,  # default: All
         key=f"pnl_range_{t.id}",
         label_visibility="collapsed",
     )
