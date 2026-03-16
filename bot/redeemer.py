@@ -1191,18 +1191,40 @@ def detect_expired_losses(session: "Session") -> int:
             except (ValueError, TypeError):
                 pass
 
+    # Fetch wallet positions to detect losses when Gamma has no data
+    from bot.tracker import fetch_positions as _fetch_pos
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    wallet_token_ids: set[str] = set()
+    if funder:
+        try:
+            for p in _fetch_pos(funder):
+                tid = p.get("asset_id", "")
+                if tid and p.get("size", 0) > 0:
+                    wallet_token_ids.add(tid)
+        except Exception:
+            pass
+
+    from bot.executor import _get_net_holdings
     created = 0
     for token_id, buys in token_buys.items():
         info = token_info.get(token_id)
-        # Require: market confirmed closed AND Gamma price == 0
-        if info is None or not info["closed"] or info["price"] >= 0.02:
+
+        is_loss = False
+        if info is not None and info["closed"] and info["price"] < 0.02:
+            # Gamma confirms: closed market, losing token
+            is_loss = True
+        elif info is None and token_id not in wallet_token_ids:
+            # Gamma returned no data (422) AND wallet doesn't hold it.
+            # Position is gone — treat as expired loss.
+            is_loss = True
+
+        if not is_loss:
             continue
 
         by_trader: dict[int, list] = {}
         for ct in buys:
             by_trader.setdefault(ct.trader_id, []).append(ct)
 
-        from bot.executor import _get_net_holdings
         for trader_id, trader_buys in by_trader.items():
             net = _get_net_holdings(session, trader_id, token_id)
             if net <= 0:
