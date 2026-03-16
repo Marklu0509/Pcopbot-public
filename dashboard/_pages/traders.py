@@ -238,35 +238,47 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
     # Fetch current prices from our own wallet's open positions (most accurate source)
     price_map = _fetch_position_prices()
 
-    # Fallback 1: Gamma API via clob_token_ids
+    # Primary fallback: CLOB API (Polymarket's own exchange — most stable)
+    # Uses /price endpoint per token. best_bid = what you'd actually get selling.
     all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
     missing_tids = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
-    if missing_tids:
-        from bot.tracker import fetch_prices_by_token_ids
+    for tid in missing_tids:
         try:
-            price_map.update(fetch_prices_by_token_ids(missing_tids))
-        except Exception as exc:
-            _logger.warning("Gamma price fetch failed: %s", exc)
-
-    # Fallback 2: CLOB orderbook best_bid for any still-missing tokens (max 20)
-    # Use best_bid (not mid-price) — it's the actual price you'd get if you sold.
-    # Wide spreads like bid=0.001/ask=0.999 would give misleading mid=0.5.
-    still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
-    for tid in still_missing[:20]:
+            resp = _req.get(
+                "https://clob.polymarket.com/price",
+                params={"token_id": tid, "side": "sell"},
+                timeout=5,
+            )
+            if resp.ok:
+                price_val = float(resp.json().get("price", 0) or 0)
+                if price_val > 0:
+                    price_map[tid] = price_val
+                    continue
+        except Exception:
+            pass
+        # If /price fails, try orderbook best_bid
         try:
             resp = _req.get(
                 "https://clob.polymarket.com/book",
                 params={"token_id": tid},
                 timeout=5,
             )
-            if not resp.ok:
-                continue
-            book = resp.json()
-            best_bid = float(book.get("bids", [{}])[0].get("price", 0) or 0) if book.get("bids") else 0.0
-            if best_bid > 0:
-                price_map[tid] = best_bid
+            if resp.ok:
+                book = resp.json()
+                best_bid = float(book.get("bids", [{}])[0].get("price", 0) or 0) if book.get("bids") else 0.0
+                if best_bid > 0:
+                    price_map[tid] = best_bid
         except Exception as exc:
-            _logger.warning("CLOB book price fetch failed for %s: %s", tid[:12], exc)
+            _logger.warning("CLOB price fetch failed for %s: %s", tid[:12], exc)
+
+    # Last resort fallback: Gamma API for anything still missing
+    still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
+    if still_missing:
+        from bot.tracker import fetch_prices_by_token_ids
+        try:
+            price_map.update(fetch_prices_by_token_ids(still_missing))
+        except Exception as exc:
+            _logger.warning("Gamma price fetch failed: %s", exc)
 
     holdings: list[dict] = []
     for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
