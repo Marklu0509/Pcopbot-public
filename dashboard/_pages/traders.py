@@ -238,7 +238,7 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
     # Fetch current prices from our own wallet's open positions (most accurate source)
     price_map = _fetch_position_prices()
 
-    # Fallback: Gamma API via clob_token_ids for any token not in our positions
+    # Fallback 1: Gamma API via clob_token_ids
     all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
     missing_tids = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
     if missing_tids:
@@ -247,6 +247,29 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
             price_map.update(fetch_prices_by_token_ids(missing_tids))
         except Exception as exc:
             _logger.warning("Gamma price fetch failed: %s", exc)
+
+    # Fallback 2: CLOB orderbook mid-price for any still-missing tokens (max 10)
+    still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
+    for tid in still_missing[:10]:
+        try:
+            resp = _req.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": tid},
+                timeout=5,
+            )
+            if not resp.ok:
+                continue
+            book = resp.json()
+            best_bid = float(book.get("bids", [{}])[0].get("price", 0) or 0) if book.get("bids") else 0.0
+            best_ask = float(book.get("asks", [{}])[0].get("price", 0) or 0) if book.get("asks") else 0.0
+            if best_bid > 0 and best_ask > 0:
+                price_map[tid] = round((best_bid + best_ask) / 2, 4)
+            elif best_bid > 0:
+                price_map[tid] = best_bid
+            elif best_ask > 0:
+                price_map[tid] = best_ask
+        except Exception as exc:
+            _logger.warning("CLOB book price fetch failed for %s: %s", tid[:12], exc)
 
     holdings: list[dict] = []
     for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
