@@ -1195,13 +1195,13 @@ def detect_expired_losses(session: "Session") -> int:
     # Fetch wallet positions to detect losses when Gamma has no data
     from bot.tracker import fetch_positions as _fetch_pos
     funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
-    wallet_token_ids: set[str] = set()
+    wallet_tokens: dict[str, float] = {}  # token_id -> cur_price
     if funder:
         try:
             for p in _fetch_pos(funder):
                 tid = p.get("asset_id", "")
                 if tid and p.get("size", 0) > 0:
-                    wallet_token_ids.add(tid)
+                    wallet_tokens[tid] = float(p.get("cur_price", 0) or 0)
         except Exception:
             pass
 
@@ -1214,9 +1214,13 @@ def detect_expired_losses(session: "Session") -> int:
         if info is not None and info["closed"] and info["price"] < 0.02:
             # Gamma confirms: closed market, losing token
             is_loss = True
-        elif info is None and token_id not in wallet_token_ids:
+        elif info is None and token_id not in wallet_tokens:
             # Gamma returned no data (422) AND wallet doesn't hold it.
             # Position is gone — treat as expired loss.
+            is_loss = True
+        elif info is None and wallet_tokens.get(token_id, 1.0) < 0.02:
+            # Gamma returned no data AND wallet holds it at price ~0.
+            # Token lost but shares still in wallet.
             is_loss = True
 
         if not is_loss:
