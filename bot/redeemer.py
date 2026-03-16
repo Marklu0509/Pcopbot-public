@@ -1228,8 +1228,8 @@ def detect_expired_losses(session: "Session") -> int:
 
         for trader_id, trader_buys in by_trader.items():
             net = _get_net_holdings(session, trader_id, token_id)
-            if net <= 0:
-                continue
+            if net < 0.1:
+                continue  # skip rounding residuals
             _record_expired_loss(session, trader_id, trader_buys, net)
             created += 1
 
