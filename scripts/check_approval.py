@@ -20,6 +20,8 @@ ctf = w3.eth.contract(
     address=Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
     abi=abi,
 )
-f = "REDACTED_ADDRESS"
+f = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "").strip()
+if not f:
+    raise SystemExit("Set POLYMARKET_FUNDER_ADDRESS env var")
 print("Regular:", ctf.functions.isApprovedForAll(f, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E").call())
 print("NegRisk:", ctf.functions.isApprovedForAll(f, "0xC5d563A36AE78145C45a50134d48A1215220f80a").call())
