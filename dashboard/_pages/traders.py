@@ -272,6 +272,7 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
             "Outcome": outcome,
             "Position": round(net_size, 4),
             "Avg Price": round(avg_price, 4),
+            "Cost": round(cost_basis, 2),
             "Cur Price": round(cur_price, 4),
             "Value": round(current_value, 2),
             "Unrealized": round(unrealized, 2),
@@ -581,7 +582,7 @@ def _render_trader_detail(t) -> None:
         else:
             total_value = holdings_df["Value"].sum()
             total_unrealized = holdings_df["Unrealized"].sum()
-            total_cost = (holdings_df["Avg Price"] * holdings_df["Position"]).sum()
+            total_cost = holdings_df["Cost"].sum()
             pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
             mc1, mc2, mc3, mc4 = st.columns(4)
             mc1.metric("Markets", len(holdings_df))
@@ -594,6 +595,7 @@ def _render_trader_detail(t) -> None:
                 hide_index=True,
                 column_config={
                     "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Cost": st.column_config.NumberColumn(format="$%.2f"),
                     "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
                     "Value": st.column_config.NumberColumn(format="$%.2f"),
                     "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
@@ -608,7 +610,7 @@ def _render_trader_detail(t) -> None:
         else:
             total_value = holdings_df["Value"].sum()
             total_unrealized = holdings_df["Unrealized"].sum()
-            total_cost = (holdings_df["Avg Price"] * holdings_df["Position"]).sum()
+            total_cost = holdings_df["Cost"].sum()
             pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
             mc1, mc2, mc3, mc4 = st.columns(4)
             mc1.metric("Markets", len(holdings_df))
@@ -621,6 +623,7 @@ def _render_trader_detail(t) -> None:
                 hide_index=True,
                 column_config={
                     "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+                    "Cost": st.column_config.NumberColumn(format="$%.2f"),
                     "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
                     "Value": st.column_config.NumberColumn(format="$%.2f"),
                     "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
