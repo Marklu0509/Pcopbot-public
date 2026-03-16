@@ -6,6 +6,7 @@ import streamlit as st
 from dashboard.components.charts import pnl_line_chart
 from db.database import get_session_factory, init_db
 from db.models import CopyTrade, Trader
+from config import settings
 
 init_db()
 _SessionLocal = get_session_factory()
@@ -63,10 +64,25 @@ def render() -> None:
     # Separate realized (SELL) and unrealized (BUY) PnL
     buys = executed[executed["side"] == "BUY"]
     sells = executed[executed["side"] == "SELL"]
-    unrealized_pnl = buys["pnl"].sum()
     realized_pnl = sells["pnl"].sum()
     total_invested = buys["cost"].sum()
     total_revenue = sells["cost"].sum()
+
+    # Unrealized PnL from wallet positions (live data)
+    unrealized_pnl = 0.0
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if funder:
+        try:
+            from bot.tracker import fetch_positions
+            wallet_positions = fetch_positions(funder)
+            for pos in wallet_positions:
+                unrealized_pnl += pos.get("pnl", 0.0)
+        except Exception:
+            # Fallback to DB-based calculation if wallet fetch fails
+            unrealized_pnl = buys["pnl"].sum()
+    else:
+        unrealized_pnl = buys["pnl"].sum()
+
     net_pnl = realized_pnl + unrealized_pnl
     roi = (net_pnl / total_invested * 100) if total_invested > 0 else 0
 
