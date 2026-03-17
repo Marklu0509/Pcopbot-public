@@ -875,6 +875,9 @@ def execute_copy_trade(
         except Exception as exc:
             logger.warning("Could not query orderbook: %s", exc)
 
+    # For BUY cap calculations, use order_price (post-slippage) so actual
+    # cost stays within limits. expected_price (trader's fill price) can be
+    # lower than what we'll actually pay.
     copy_size, rejection = risk.cap_and_check(
         session=session,
         trader=trader,
@@ -887,6 +890,7 @@ def execute_copy_trade(
         original_price=trade["price"],
         side=trade["side"],
         status_filter=mode_status,
+        order_price=order_price if trade["side"] == "BUY" else None,
     )
 
     status = rejection or ("dry_run" if dry_run else "pending")

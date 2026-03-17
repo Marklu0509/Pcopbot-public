@@ -258,15 +258,21 @@ def cap_and_check(
     original_price: float,
     side: str,
     status_filter: list[str] | None = None,
+    order_price: float | None = None,
 ) -> tuple[float, Optional[str]]:
     """Run all risk checks: cap copy_size to limits, then reject if below minimum.
 
     Returns (capped_copy_size, rejection_status).
     rejection_status is None if the trade should proceed.
     status_filter controls which trade statuses to count for limit checks.
+    order_price: the actual price we'll pay (post-slippage). Used for cap
+    calculations so actual cost stays within limits. Falls back to expected_price.
     """
     if status_filter is None:
         status_filter = ["success", "dry_run"]
+
+    # Price used for cap calculations — order_price accounts for slippage
+    cap_price = order_price if order_price is not None else expected_price
 
     # ── Filters that apply to ALL trades (BUY and SELL) ──
     rejection = check_ignore_trades_under(original_size, original_price, trader)
@@ -279,15 +285,15 @@ def cap_and_check(
 
     # ── Buy-side: cap to limits instead of rejecting ──
     if side == "BUY":
-        copy_size = cap_per_trade_limit(copy_size, expected_price, trader)
-        copy_size = cap_total_spend_limit(session, trader, copy_size, expected_price, status_filter=status_filter)
-        copy_size = cap_max_per_market(session, trader, market, copy_size, expected_price, status_filter=status_filter)
-        copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, expected_price, status_filter=status_filter)
-        copy_size = cap_position_limit(session, trader, token_id, copy_size, expected_price, status_filter=status_filter)
+        copy_size = cap_per_trade_limit(copy_size, cap_price, trader)
+        copy_size = cap_total_spend_limit(session, trader, copy_size, cap_price, status_filter=status_filter)
+        copy_size = cap_max_per_market(session, trader, market, copy_size, cap_price, status_filter=status_filter)
+        copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, cap_price, status_filter=status_filter)
+        copy_size = cap_position_limit(session, trader, token_id, copy_size, cap_price, status_filter=status_filter)
 
     # ── Check min_per_trade (reject if below, after capping) ──
     if side == "BUY":
-        trade_value = copy_size * expected_price
+        trade_value = copy_size * cap_price
         if trader.min_per_trade > 0 and trade_value < trader.min_per_trade:
             logger.info(
                 "Trade value $%.2f below min_per_trade $%.2f for trader %s (after capping)",
@@ -296,7 +302,7 @@ def cap_and_check(
             return copy_size, STATUS_BELOW_THRESHOLD
 
     # ── Minimum order value $1 USD hard floor ──
-    order_value = copy_size * expected_price
+    order_value = copy_size * cap_price
     if order_value < MINIMUM_ORDER_VALUE_USD:
         logger.info(
             "Order value $%.2f below $%.2f minimum for trader %s",
