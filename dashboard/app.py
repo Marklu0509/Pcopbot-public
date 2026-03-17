@@ -53,6 +53,9 @@ if _funder:
     st.sidebar.divider()
 
 st.sidebar.title("Pcopbot 🤖")
+if st.sidebar.button("Refresh", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
 page = st.sidebar.radio(
     "Navigate",
     ["Traders", "Add Trader", "History", "PnL", "Logs", "Settings"],

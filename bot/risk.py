@@ -274,17 +274,6 @@ def cap_and_check(
     # Price used for cap calculations — order_price accounts for slippage
     cap_price = order_price if order_price is not None else expected_price
 
-    # Log trader settings for debugging
-    logger.info(
-        "risk_check START: trader=%s side=%s copy_size=%.4f expected=%.4f cap_price=%.4f | "
-        "ignore_under=%.2f min_price=%.4f max_price=%.4f min_per_trade=%.2f "
-        "max_per_trade=%.2f max_per_market=%.2f max_per_yes_no=%.2f buy_at_min=%s",
-        trader.wallet_address[:12], side, copy_size, expected_price, cap_price,
-        trader.ignore_trades_under, trader.min_price, trader.max_price,
-        trader.min_per_trade, trader.max_per_trade, trader.max_per_market,
-        trader.max_per_yes_no, getattr(trader, "buy_at_min", False),
-    )
-
     # ── Filters that apply to ALL trades (BUY and SELL) ──
     rejection = check_ignore_trades_under(original_size, original_price, trader)
     if rejection:
