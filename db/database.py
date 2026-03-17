@@ -51,6 +51,10 @@ def init_db() -> None:
             "ALTER TABLE traders ADD COLUMN limit_fallback_market BOOLEAN DEFAULT 1",
             "ALTER TABLE traders ADD COLUMN sell_only BOOLEAN DEFAULT 0",
             "ALTER TABLE traders ADD COLUMN dry_run BOOLEAN DEFAULT 1",
+            "ALTER TABLE traders ADD COLUMN buy_price_offset_pct FLOAT DEFAULT 1.0",
+            "ALTER TABLE traders ADD COLUMN sell_price_offset_pct FLOAT DEFAULT 1.0",
+            "ALTER TABLE traders ADD COLUMN buy_limit_fallback BOOLEAN DEFAULT 1",
+            "ALTER TABLE traders ADD COLUMN sell_limit_fallback BOOLEAN DEFAULT 1",
         ]:
             try:
                 conn.execute(text(stmt))

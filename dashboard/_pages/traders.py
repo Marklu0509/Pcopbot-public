@@ -465,7 +465,11 @@ def _render_trader_detail(t) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Copy %/$", f"{t.proportional_pct:.0f}%" if t.sizing_mode == "proportional" else f"${t.fixed_amount:.2f}")
     _buy_ot = getattr(t, 'buy_order_type', 'market') or 'market'
-    c2.metric("Buy Order", f"{_buy_ot.upper()} ({t.buy_slippage:.0f}%)")
+    if _buy_ot == "limit":
+        _buy_off = getattr(t, 'buy_price_offset_pct', 1.0) or 1.0
+        c2.metric("Buy Order", f"LIMIT (+{_buy_off:.1f}%)")
+    else:
+        c2.metric("Buy Order", f"FOK ({t.buy_slippage:.0f}%)")
     c3.metric("TP", f"{t.tp_pct:.1f}%" if t.tp_pct else "—")
     c4.metric("SL", f"{t.sl_pct:.1f}%" if t.sl_pct else "—")
 
@@ -474,7 +478,11 @@ def _render_trader_detail(t) -> None:
     c6.metric("Max / Trade", f"${t.max_per_trade:.2f}" if t.max_per_trade else "—")
     c7.metric("Max / Market", f"${t.max_per_market:.2f}" if t.max_per_market else "—")
     _sell_ot = t.sell_order_type or 'market'
-    c8.metric("Sell Order", f"{_sell_ot.upper()} ({t.sell_slippage:.0f}%)")
+    if _sell_ot == "limit":
+        _sell_off = getattr(t, 'sell_price_offset_pct', 1.0) or 1.0
+        c8.metric("Sell Order", f"LIMIT (-{_sell_off:.1f}%)")
+    else:
+        c8.metric("Sell Order", f"FOK ({t.sell_slippage:.0f}%)")
 
     # ── Toggles ──
     tc1, tc2, tc3 = st.columns(3)
@@ -524,9 +532,21 @@ def _render_trader_detail(t) -> None:
                 ["market", "limit"],
                 index=0 if (getattr(t, 'buy_order_type', 'market') or 'market') == "market" else 1,
                 key=f"bot_{t.id}",
-                help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at target's price ± slippage and wait.",
+                help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at trader's price + offset and wait.",
             )
-            buy_slippage = st.number_input("Buy Slippage (%)", value=t.buy_slippage, min_value=0.0, max_value=100.0, key=f"bs_{t.id}")
+            buy_slippage = st.number_input(
+                "Buy Slippage (%)",
+                value=t.buy_slippage, min_value=0.0, max_value=100.0, key=f"bs_{t.id}",
+                help="Used for Market (FOK) orders and as the FOK fallback price ceiling.",
+            )
+            _cur_buy_offset = getattr(t, 'buy_price_offset_pct', 1.0) or 1.0
+            buy_price_offset_pct = st.number_input(
+                "Buy Limit Price Offset (%)",
+                value=_cur_buy_offset, min_value=0.0, max_value=50.0, step=0.5,
+                key=f"bpop_{t.id}",
+                help="For Limit (GTC) BUY: your limit = trader's price × (1 + offset%). "
+                     "CLOB fills at best available up to this limit — you won't overpay in stable markets.",
+            )
             buy_at_min = st.checkbox("Below Min Limit, Buy at Min", value=t.buy_at_min, key=f"bam_{t.id}")
 
             st.markdown("##### Take-Profit / Stop-Loss")
@@ -554,9 +574,21 @@ def _render_trader_detail(t) -> None:
                 ["market", "limit"],
                 index=0 if _cur_sell_ot == "market" else 1,
                 key=f"sot_{t.id}",
-                help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at target's price ± slippage and wait.",
+                help="Market (FOK): fill at current market price or cancel. Limit (GTC): place order at trader's price - offset and wait.",
             )
-            sell_slippage = st.number_input("Sell Slippage (%)", value=t.sell_slippage, min_value=0.0, max_value=100.0, key=f"ss_{t.id}")
+            sell_slippage = st.number_input(
+                "Sell Slippage (%)",
+                value=t.sell_slippage, min_value=0.0, max_value=100.0, key=f"ss_{t.id}",
+                help="Used for Market (FOK) orders and as the FOK fallback price floor.",
+            )
+            _cur_sell_offset = getattr(t, 'sell_price_offset_pct', 1.0) or 1.0
+            sell_price_offset_pct = st.number_input(
+                "Sell Limit Price Offset (%)",
+                value=_cur_sell_offset, min_value=0.0, max_value=50.0, step=0.5,
+                key=f"spop_{t.id}",
+                help="For Limit (GTC) SELL: your limit = trader's price × (1 - offset%). "
+                     "CLOB fills at best available down to this limit.",
+            )
 
             st.markdown("##### Limit Order Settings")
             _cur_timeout = getattr(t, 'limit_timeout_seconds', 30) or 30
@@ -567,14 +599,27 @@ def _render_trader_detail(t) -> None:
                 key=f"lto_{t.id}",
                 help="How long to wait for a limit (GTC) order to fill before cancelling.",
             )
-            _cur_fallback = getattr(t, 'limit_fallback_market', True)
-            if _cur_fallback is None:
-                _cur_fallback = True
-            limit_fallback_market = st.checkbox(
-                "Fallback to Market if Limit times out",
-                value=_cur_fallback,
-                key=f"lfm_{t.id}",
-                help="If a limit order doesn't fill within the timeout, automatically retry with a market (FOK) order.",
+            _cur_buy_fb = getattr(t, 'buy_limit_fallback', None)
+            if _cur_buy_fb is None:
+                _cur_buy_fb = getattr(t, 'limit_fallback_market', True)
+            if _cur_buy_fb is None:
+                _cur_buy_fb = True
+            buy_limit_fallback = st.checkbox(
+                "BUY: Fallback to Market if Limit times out",
+                value=_cur_buy_fb,
+                key=f"blfb_{t.id}",
+                help="If a BUY limit order doesn't fill, retry with a market (FOK) order using the slippage price.",
+            )
+            _cur_sell_fb = getattr(t, 'sell_limit_fallback', None)
+            if _cur_sell_fb is None:
+                _cur_sell_fb = getattr(t, 'limit_fallback_market', True)
+            if _cur_sell_fb is None:
+                _cur_sell_fb = True
+            sell_limit_fallback = st.checkbox(
+                "SELL: Fallback to Market if Limit times out",
+                value=_cur_sell_fb,
+                key=f"slfb_{t.id}",
+                help="If a SELL limit order doesn't fill, retry with a market (FOK) order using the slippage price.",
             )
 
             if st.form_submit_button("💾 Save"):
@@ -602,8 +647,12 @@ def _render_trader_detail(t) -> None:
                         "buy_order_type": buy_order_type,
                         "sell_order_type": sell_order_type,
                         "sell_slippage": sell_slippage,
+                        "buy_price_offset_pct": buy_price_offset_pct,
+                        "sell_price_offset_pct": sell_price_offset_pct,
                         "limit_timeout_seconds": limit_timeout_seconds,
-                        "limit_fallback_market": limit_fallback_market,
+                        "buy_limit_fallback": buy_limit_fallback,
+                        "sell_limit_fallback": sell_limit_fallback,
+                        "limit_fallback_market": buy_limit_fallback,
                         "max_slippage": buy_slippage,
                         "min_trade_threshold": min_per_trade,
                     },

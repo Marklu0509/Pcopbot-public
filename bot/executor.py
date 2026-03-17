@@ -306,6 +306,18 @@ def _apply_slippage(price: float, side: str, slippage_pct: float) -> float:
     return max(price * (1 - slippage_pct / 100.0), 0.01)
 
 
+def _compute_limit_price(trader_price: float, side: str, offset_pct: float) -> float:
+    """Compute limit order price based on trader's fill price + offset.
+
+    BUY:  trader_price * (1 + offset_pct / 100) — ceiling, CLOB fills at best ask
+    SELL: trader_price * (1 - offset_pct / 100) — floor, CLOB fills at best bid
+    Result is clamped to [0.01, 0.99] (Polymarket price bounds).
+    """
+    if side == "BUY":
+        return min(max(trader_price * (1 + offset_pct / 100.0), 0.01), 0.99)
+    return max(min(trader_price * (1 - offset_pct / 100.0), 0.99), 0.01)
+
+
 def _extract_price(entry) -> float:
     """Extract the price from an orderbook entry (dict or object)."""
     if isinstance(entry, dict):
@@ -860,8 +872,16 @@ def execute_copy_trade(
         order_type_str = trader.sell_order_type or "market"
         slippage_pct = trader.sell_slippage
 
-    # Apply slippage to get the actual order price
-    order_price = _apply_slippage(expected_price, trade["side"], slippage_pct)
+    # Compute order price: limit orders use tight offset, market orders use slippage
+    offset_pct = (
+        getattr(trader, "buy_price_offset_pct", 1.0)
+        if trade["side"] == "BUY"
+        else getattr(trader, "sell_price_offset_pct", 1.0)
+    ) or 1.0
+    if order_type_str == "limit":
+        order_price = _compute_limit_price(expected_price, trade["side"], offset_pct)
+    else:
+        order_price = _apply_slippage(expected_price, trade["side"], slippage_pct)
 
     # In live mode, query orderbook for real best price (for slippage risk check)
     best_price = expected_price
@@ -916,7 +936,14 @@ def execute_copy_trade(
             if ot == OrderType.GTC and order_id:
                 # Poll for GTC fill, cancel + fallback if timeout
                 timeout = getattr(trader, "limit_timeout_seconds", 30) or 30
-                fallback = getattr(trader, "limit_fallback_market", True)
+                # Per-side fallback toggle (fall back to legacy shared setting)
+                if trade["side"] == "BUY":
+                    fallback = getattr(trader, "buy_limit_fallback", None)
+                else:
+                    fallback = getattr(trader, "sell_limit_fallback", None)
+                if fallback is None:
+                    fallback = getattr(trader, "limit_fallback_market", True)
+
                 filled = _wait_for_fill(client, order_id, timeout)
                 if filled:
                     status = "success"
@@ -929,11 +956,13 @@ def execute_copy_trade(
                         logger.warning("Failed to cancel GTC order %s: %s", order_id, cancel_exc)
 
                     if fallback:
+                        # FOK fallback uses wider slippage price for better fill chance
+                        fallback_price = _apply_slippage(expected_price, trade["side"], slippage_pct)
                         logger.info("Falling back to FOK market order for trader %s", trader.wallet_address)
                         try:
                             fok_args = OrderArgs(
                                 token_id=trade["token_id"],
-                                price=round(order_price, 4),
+                                price=round(fallback_price, 4),
                                 size=round(copy_size, 4),
                                 side=side,
                             )
@@ -952,16 +981,19 @@ def execute_copy_trade(
             else:
                 status = "success"
 
+            _price_label = "offset" if order_type_str == "limit" else "slippage"
+            _price_pct = offset_pct if order_type_str == "limit" else slippage_pct
             logger.info(
                 "Copy trade executed for trader %s: market=%s side=%s size=%.4f "
-                "price=%.4f (orig=%.4f, slippage=%.1f%%) order_type=%s order_id=%s",
+                "price=%.4f (orig=%.4f, %s=%.1f%%) order_type=%s order_id=%s",
                 trader.wallet_address,
                 trade["market"],
                 trade["side"],
                 copy_size,
                 order_price,
                 expected_price,
-                slippage_pct,
+                _price_label,
+                _price_pct,
                 order_type_str.upper(),
                 order_id,
             )

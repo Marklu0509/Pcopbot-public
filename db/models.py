@@ -71,7 +71,16 @@ class Trader(Base):
 
     # Limit order management
     limit_timeout_seconds = Column(Integer, default=30)    # seconds to wait for GTC fill
-    limit_fallback_market = Column(Boolean, default=True)  # fallback to FOK if GTC times out
+    limit_fallback_market = Column(Boolean, default=True)  # fallback to FOK if GTC times out (legacy, see buy/sell specific)
+
+    # Per-side price offset for limit (GTC) orders
+    # Limit price = trader_price * (1 ± offset/100). CLOB fills at best available up to limit.
+    buy_price_offset_pct = Column(Float, default=1.0)
+    sell_price_offset_pct = Column(Float, default=1.0)
+
+    # Per-side fallback toggle: retry with FOK market order if GTC times out
+    buy_limit_fallback = Column(Boolean, default=True)
+    sell_limit_fallback = Column(Boolean, default=True)
 
     # Legacy / convenience aliases
     max_position_limit = Column(Float, default=500.0)
