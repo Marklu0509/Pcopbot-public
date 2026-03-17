@@ -25,19 +25,24 @@ def is_trader_dry_run(trader: Trader, session: Session) -> bool:
     try:
         row = session.query(BotSetting).filter(BotSetting.key == "dry_run").first()
         if row and row.value.lower() in ("true", "1", "yes"):
+            logger.debug("dry_run resolved via global DB override for trader %s", trader.wallet_address)
             return True
     except Exception:
         pass
 
     # 2. Check env override
     if settings.DRY_RUN:
+        logger.debug("dry_run resolved via env DRY_RUN=True for trader %s", trader.wallet_address)
         return True
 
     # 3. Per-trader setting (default True if column is None)
     trader_dry_run = getattr(trader, "dry_run", None)
-    if trader_dry_run is None:
-        return True
-    return bool(trader_dry_run)
+    result = True if trader_dry_run is None else bool(trader_dry_run)
+    logger.info(
+        "dry_run check: trader=%s raw_value=%r type=%s resolved=%s",
+        trader.wallet_address[:12], trader_dry_run, type(trader_dry_run).__name__, result,
+    )
+    return result
 
 # If a SELL would leave less than this USD value, close out the full position.
 SELL_DUST_CLOSEOUT_USD = 1.0
