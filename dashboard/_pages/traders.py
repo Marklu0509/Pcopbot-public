@@ -248,7 +248,7 @@ def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame
 
 
 def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> pd.DataFrame:
-    """Aggregate current holdings per token for a trader, with current price."""
+    """Load holdings from DB (fast, no API calls). Returns base data + token IDs."""
     statuses = statuses or ["success"]
     with _SessionLocal() as session:
         rows = (
@@ -274,18 +274,53 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
 
     df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
 
-    # Fetch current prices from our own wallet's open positions (most accurate source)
-    price_map = dict(_fetch_position_prices())  # copy so we don't mutate cache
+    holdings: list[dict] = []
+    for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
+        buy_size = group.loc[group["Side"] == "BUY", "Size"].sum()
+        sell_size = group.loc[group["Side"] == "SELL", "Size"].sum()
+        net_size = buy_size - sell_size
+        if net_size <= 0:
+            continue
+        buy_rows = group[group["Side"] == "BUY"]
+        avg_price = (
+            (buy_rows["Price"] * buy_rows["Size"]).sum() / buy_rows["Size"].sum()
+            if buy_rows["Size"].sum() > 0 else 0
+        )
+        token_id = buy_rows["TokenId"].iloc[0] if not buy_rows.empty else ""
+        cost_basis = avg_price * net_size
+        holdings.append({
+            "Market": market,
+            "Outcome": outcome,
+            "Position": round(net_size, 4),
+            "Avg Price": round(avg_price, 4),
+            "Cost": round(cost_basis, 2),
+            "Cur Price": 0.0,
+            "Value": 0.0,
+            "Unrealized": 0.0,
+            "Change %": 0.0,
+            "Trades": len(group),
+            "_token_id": token_id,  # internal, hidden in display
+        })
 
-    # Primary fallback: CLOB API (cached 30s, won't re-fetch on every toggle)
-    all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
-    missing_tids = tuple(t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0)
+    return pd.DataFrame(holdings)
+
+
+def _enrich_holdings_with_prices(holdings_df: pd.DataFrame) -> pd.DataFrame:
+    """Add live prices to holdings DataFrame. May be slow on first call (API)."""
+    if holdings_df.empty or "_token_id" not in holdings_df.columns:
+        return holdings_df
+
+    # 1. Funder wallet (cached)
+    price_map = dict(_fetch_position_prices())
+
+    # 2. CLOB API for missing (cached 30s)
+    all_tids = holdings_df["_token_id"].dropna().unique().tolist()
+    missing_tids = tuple(t for t in all_tids if t and price_map.get(t, 0.0) == 0.0)
     if missing_tids:
-        clob_prices = _fetch_clob_prices(missing_tids)
-        price_map.update(clob_prices)
+        price_map.update(_fetch_clob_prices(missing_tids))
 
-    # Last resort fallback: Gamma API for anything still missing
-    still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
+    # 3. Gamma fallback for still missing
+    still_missing = [t for t in all_tids if t and price_map.get(t, 0.0) == 0.0]
     if still_missing:
         from bot.tracker import fetch_prices_by_token_ids
         try:
@@ -293,39 +328,22 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
         except Exception as exc:
             _logger.warning("Gamma price fetch failed: %s", exc)
 
-    holdings: list[dict] = []
-    for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
-        buy_size = group.loc[group["Side"] == "BUY", "Size"].sum()
-        sell_size = group.loc[group["Side"] == "SELL", "Size"].sum()
-        net_size = buy_size - sell_size
-        if net_size <= 0:
-            continue  # fully sold or redeemed — skip
-        buy_rows = group[group["Side"] == "BUY"]
-        avg_price = (
-            (buy_rows["Price"] * buy_rows["Size"]).sum() / buy_rows["Size"].sum()
-            if buy_rows["Size"].sum() > 0 else 0
-        )
-        # Use token_id from BUY rows to look up live price from Gamma API
-        token_id = buy_rows["TokenId"].iloc[0] if not buy_rows.empty else ""
-        cur_price = price_map.get(token_id, 0.0)
-        cost_basis = avg_price * net_size
+    # Update price columns
+    enriched = holdings_df.copy()
+    for idx, row in enriched.iterrows():
+        cur_price = price_map.get(row["_token_id"], 0.0)
+        avg_price = row["Avg Price"]
+        net_size = row["Position"]
         current_value = cur_price * net_size
+        cost_basis = row["Cost"]
         unrealized = current_value - cost_basis if cur_price > 0 else 0.0
         change_pct = ((cur_price - avg_price) / avg_price * 100) if avg_price > 0 and cur_price > 0 else 0.0
-        holdings.append({
-            "Market": market,
-            "Outcome": outcome,
-            "Position": round(net_size, 4),
-            "Avg Price": round(avg_price, 4),
-            "Cost": round(cost_basis, 2),
-            "Cur Price": round(cur_price, 4),
-            "Value": round(current_value, 2),
-            "Unrealized": round(unrealized, 2),
-            "Change %": round(change_pct, 1),
-            "Trades": len(group),
-        })
+        enriched.at[idx, "Cur Price"] = round(cur_price, 4)
+        enriched.at[idx, "Value"] = round(current_value, 2)
+        enriched.at[idx, "Unrealized"] = round(unrealized, 2)
+        enriched.at[idx, "Change %"] = round(change_pct, 1)
 
-    return pd.DataFrame(holdings)
+    return enriched
 
 
 def _load_trader_positions(trader_id: int) -> pd.DataFrame:
@@ -620,60 +638,65 @@ def _render_trader_detail(t) -> None:
     st.subheader("📊 Copy-Trade Holdings")
     htab_live, htab_dry = st.tabs(["Live (success)", "Dry Run (simulated)"])
 
-    with htab_live:
-        holdings_df = _load_trader_holdings(t.id, statuses=["success"])
-        if holdings_df.empty:
-            st.info("No live copy-trade holdings yet.")
-        else:
-            total_value = holdings_df["Value"].sum()
-            total_unrealized = holdings_df["Unrealized"].sum()
-            total_cost = holdings_df["Cost"].sum()
-            pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Markets", len(holdings_df))
-            mc2.metric("Total Value", f"${total_value:,.2f}")
-            mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
-            mc4.metric("Change %", f"{pct:+.1f}%")
-            st.dataframe(
-                holdings_df,
+    _holdings_col_config = {
+        "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
+        "Cost": st.column_config.NumberColumn(format="$%.2f"),
+        "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
+        "Value": st.column_config.NumberColumn(format="$%.2f"),
+        "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
+        "Change %": st.column_config.NumberColumn(format="%.1f%%"),
+    }
+    _hidden_cols = ["_token_id"]
+
+    for htab, statuses, empty_msg in [
+        (htab_live, ["success"], "No live copy-trade holdings yet."),
+        (htab_dry, ["dry_run"], "No dry-run holdings yet."),
+    ]:
+        with htab:
+            holdings_df = _load_trader_holdings(t.id, statuses=statuses)
+            if holdings_df.empty:
+                st.info(empty_msg)
+                continue
+
+            # Show table immediately with DB data (no prices yet)
+            display_cols = [c for c in holdings_df.columns if c not in _hidden_cols]
+            metrics_area = st.container()
+            table_area = st.empty()
+
+            with metrics_area:
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Markets", len(holdings_df))
+                mc2.metric("Total Value", "loading...")
+                mc3.metric("Unrealized PnL", "loading...")
+                mc4.metric("Change %", "loading...")
+
+            table_area.dataframe(
+                holdings_df[display_cols],
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
-                    "Cost": st.column_config.NumberColumn(format="$%.2f"),
-                    "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
-                    "Value": st.column_config.NumberColumn(format="$%.2f"),
-                    "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
-                    "Change %": st.column_config.NumberColumn(format="%.1f%%"),
-                },
+                column_config=_holdings_col_config,
             )
 
-    with htab_dry:
-        holdings_df = _load_trader_holdings(t.id, statuses=["dry_run"])
-        if holdings_df.empty:
-            st.info("No dry-run holdings yet.")
-        else:
+            # Now fetch prices (may take time on first load, cached after)
+            holdings_df = _enrich_holdings_with_prices(holdings_df)
             total_value = holdings_df["Value"].sum()
             total_unrealized = holdings_df["Unrealized"].sum()
             total_cost = holdings_df["Cost"].sum()
             pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Markets", len(holdings_df))
-            mc2.metric("Total Value", f"${total_value:,.2f}")
-            mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
-            mc4.metric("Change %", f"{pct:+.1f}%")
-            st.dataframe(
-                holdings_df,
+
+            # Update table + metrics with live prices
+            with metrics_area:
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Markets", len(holdings_df))
+                mc2.metric("Total Value", f"${total_value:,.2f}")
+                mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
+                mc4.metric("Change %", f"{pct:+.1f}%")
+
+            table_area.dataframe(
+                holdings_df[display_cols],
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "Avg Price": st.column_config.NumberColumn(format="$%.4f"),
-                    "Cost": st.column_config.NumberColumn(format="$%.2f"),
-                    "Cur Price": st.column_config.NumberColumn(format="$%.4f"),
-                    "Value": st.column_config.NumberColumn(format="$%.2f"),
-                    "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
-                    "Change %": st.column_config.NumberColumn(format="%.1f%%"),
-                },
+                column_config=_holdings_col_config,
             )
 
     st.divider()
