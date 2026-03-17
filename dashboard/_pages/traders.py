@@ -43,6 +43,45 @@ def _fetch_position_prices() -> dict[str, float]:
         _logger.warning("Failed to fetch position prices: %s", exc)
         return {}
 
+
+@st.cache_data(ttl=30, show_spinner="Fetching prices...")
+def _fetch_clob_prices(token_ids: tuple[str, ...]) -> dict[str, float]:
+    """Fetch prices from CLOB API for tokens not in wallet (cached 30s).
+
+    Uses /price endpoint (fast) with /book best_bid fallback.
+    """
+    price_map: dict[str, float] = {}
+    for tid in token_ids:
+        # Try /price first (fastest)
+        try:
+            resp = _req.get(
+                "https://clob.polymarket.com/price",
+                params={"token_id": tid, "side": "sell"},
+                timeout=3,
+            )
+            if resp.ok:
+                price_val = float(resp.json().get("price", 0) or 0)
+                if price_val > 0:
+                    price_map[tid] = price_val
+                    continue
+        except Exception:
+            pass
+        # Fallback: orderbook best_bid
+        try:
+            resp = _req.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": tid},
+                timeout=3,
+            )
+            if resp.ok:
+                book = resp.json()
+                best_bid = float(book.get("bids", [{}])[0].get("price", 0) or 0) if book.get("bids") else 0.0
+                if best_bid > 0:
+                    price_map[tid] = best_bid
+        except Exception:
+            pass
+    return price_map
+
 STATUS_ICONS = {
     "success": "🟢",
     "dry_run": "🔵",
@@ -236,40 +275,14 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
     df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
 
     # Fetch current prices from our own wallet's open positions (most accurate source)
-    price_map = _fetch_position_prices()
+    price_map = dict(_fetch_position_prices())  # copy so we don't mutate cache
 
-    # Primary fallback: CLOB API (Polymarket's own exchange — most stable)
-    # Uses /price endpoint per token. best_bid = what you'd actually get selling.
+    # Primary fallback: CLOB API (cached 30s, won't re-fetch on every toggle)
     all_buy_token_ids = df[df["Side"] == "BUY"]["TokenId"].dropna().unique().tolist()
-    missing_tids = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
-    for tid in missing_tids:
-        try:
-            resp = _req.get(
-                "https://clob.polymarket.com/price",
-                params={"token_id": tid, "side": "sell"},
-                timeout=5,
-            )
-            if resp.ok:
-                price_val = float(resp.json().get("price", 0) or 0)
-                if price_val > 0:
-                    price_map[tid] = price_val
-                    continue
-        except Exception:
-            pass
-        # If /price fails, try orderbook best_bid
-        try:
-            resp = _req.get(
-                "https://clob.polymarket.com/book",
-                params={"token_id": tid},
-                timeout=5,
-            )
-            if resp.ok:
-                book = resp.json()
-                best_bid = float(book.get("bids", [{}])[0].get("price", 0) or 0) if book.get("bids") else 0.0
-                if best_bid > 0:
-                    price_map[tid] = best_bid
-        except Exception as exc:
-            _logger.warning("CLOB price fetch failed for %s: %s", tid[:12], exc)
+    missing_tids = tuple(t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0)
+    if missing_tids:
+        clob_prices = _fetch_clob_prices(missing_tids)
+        price_map.update(clob_prices)
 
     # Last resort fallback: Gamma API for anything still missing
     still_missing = [t for t in all_buy_token_ids if t and price_map.get(t, 0.0) == 0.0]
