@@ -291,24 +291,41 @@ def cap_and_check(
         copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, cap_price, status_filter=status_filter)
         copy_size = cap_position_limit(session, trader, token_id, copy_size, cap_price, status_filter=status_filter)
 
-    # ── Check min_per_trade (reject if below, after capping) ──
+    # ── Check min_per_trade (reject or bump if below, after capping) ──
+    buy_at_min = getattr(trader, "buy_at_min", False)
     if side == "BUY":
         trade_value = copy_size * cap_price
         if trader.min_per_trade > 0 and trade_value < trader.min_per_trade:
-            logger.info(
-                "Trade value $%.2f below min_per_trade $%.2f for trader %s (after capping)",
-                trade_value, trader.min_per_trade, trader.wallet_address,
-            )
-            return copy_size, STATUS_BELOW_THRESHOLD
+            if buy_at_min and cap_price > 0:
+                min_shares = trader.min_per_trade / cap_price
+                logger.info(
+                    "Bumping trade from %.4f to %.4f shares (min_per_trade $%.2f) for trader %s",
+                    copy_size, min_shares, trader.min_per_trade, trader.wallet_address,
+                )
+                copy_size = min_shares
+            else:
+                logger.info(
+                    "Trade value $%.2f below min_per_trade $%.2f for trader %s (after capping)",
+                    trade_value, trader.min_per_trade, trader.wallet_address,
+                )
+                return copy_size, STATUS_BELOW_THRESHOLD
 
     # ── Minimum order value $1 USD hard floor ──
     order_value = copy_size * cap_price
     if order_value < MINIMUM_ORDER_VALUE_USD:
-        logger.info(
-            "Order value $%.2f below $%.2f minimum for trader %s",
-            order_value, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
-        )
-        return copy_size, STATUS_BELOW_MINIMUM_ORDER
+        if side == "BUY" and buy_at_min and cap_price > 0:
+            min_shares = MINIMUM_ORDER_VALUE_USD / cap_price
+            logger.info(
+                "Bumping trade from %.4f to %.4f shares ($%.2f hard floor) for trader %s",
+                copy_size, min_shares, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
+            )
+            copy_size = min_shares
+        else:
+            logger.info(
+                "Order value $%.2f below $%.2f minimum for trader %s",
+                order_value, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
+            )
+            return copy_size, STATUS_BELOW_MINIMUM_ORDER
 
     # ── Slippage (applies to all) ──
     rejection = check_slippage(best_price, expected_price, trader)
