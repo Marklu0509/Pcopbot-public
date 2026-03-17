@@ -658,41 +658,22 @@ def _render_trader_detail(t) -> None:
                 st.info(empty_msg)
                 continue
 
-            # Show table immediately with DB data (no prices yet)
-            display_cols = [c for c in holdings_df.columns if c not in _hidden_cols]
-            metrics_area = st.container()
-            table_area = st.empty()
-
-            with metrics_area:
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Markets", len(holdings_df))
-                mc2.metric("Total Value", "loading...")
-                mc3.metric("Unrealized PnL", "loading...")
-                mc4.metric("Change %", "loading...")
-
-            table_area.dataframe(
-                holdings_df[display_cols],
-                use_container_width=True,
-                hide_index=True,
-                column_config=_holdings_col_config,
-            )
-
-            # Now fetch prices (may take time on first load, cached after)
+            # Enrich with prices (cached for 30s, fast on subsequent loads)
             holdings_df = _enrich_holdings_with_prices(holdings_df)
+            display_cols = [c for c in holdings_df.columns if c not in _hidden_cols]
+
             total_value = holdings_df["Value"].sum()
             total_unrealized = holdings_df["Unrealized"].sum()
             total_cost = holdings_df["Cost"].sum()
             pct = (total_unrealized / total_cost * 100) if total_cost > 0 else 0
 
-            # Update table + metrics with live prices
-            with metrics_area:
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Markets", len(holdings_df))
-                mc2.metric("Total Value", f"${total_value:,.2f}")
-                mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
-                mc4.metric("Change %", f"{pct:+.1f}%")
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Markets", len(holdings_df))
+            mc2.metric("Total Value", f"${total_value:,.2f}")
+            mc3.metric("Unrealized PnL", f"${total_unrealized:,.2f}")
+            mc4.metric("Change %", f"{pct:+.1f}%")
 
-            table_area.dataframe(
+            st.dataframe(
                 holdings_df[display_cols],
                 use_container_width=True,
                 hide_index=True,
