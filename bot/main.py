@@ -335,6 +335,26 @@ def _poll_once(session) -> None:
             # Sell-only mode: skip BUY trades for this trader
             if getattr(t, "sell_only", False) and trade["side"] == "BUY":
                 logger.info("[%s] Sell-only mode: skipping BUY trade.", label)
+                from datetime import datetime, timezone
+                skip_record = CopyTrade(
+                    trader_id=t.id,
+                    original_trade_id=trade["trade_id"],
+                    original_market=trade["market"],
+                    original_token_id=trade["token_id"],
+                    market_title=trade.get("market_title", ""),
+                    outcome=trade.get("outcome", ""),
+                    original_side=trade["side"],
+                    original_size=trade["size"],
+                    original_price=trade["price"],
+                    original_timestamp=trade["timestamp"].replace(tzinfo=None),
+                    copy_size=0.0,
+                    copy_price=trade["price"],
+                    status="skipped_sell_only",
+                    error_message="Sell-only mode: BUY skipped",
+                    executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                session.add(skip_record)
+                session.commit()
                 watermark.advance_watermark(session, t, trade["timestamp"])
                 continue
 

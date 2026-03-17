@@ -955,7 +955,24 @@ def execute_copy_trade(
                     except Exception as cancel_exc:
                         logger.warning("Failed to cancel GTC order %s: %s", order_id, cancel_exc)
 
-                    if fallback:
+                    # Re-check: order may have filled between last poll and cancel
+                    try:
+                        final_order = client.get_order(order_id)
+                        final_status = ""
+                        if isinstance(final_order, dict):
+                            final_status = final_order.get("status", "").upper()
+                        else:
+                            final_status = getattr(final_order, "status", "").upper()
+                        if final_status in ("FILLED", "MATCHED"):
+                            logger.info("GTC order %s filled during cancel race window", order_id)
+                            filled = True
+                            status = "success"
+                    except Exception as recheck_exc:
+                        logger.warning("Failed to re-check order %s: %s", order_id, recheck_exc)
+
+                    if filled:
+                        pass  # already set status = "success" above
+                    elif fallback:
                         # FOK fallback uses wider slippage price for better fill chance
                         fallback_price = _apply_slippage(expected_price, trade["side"], slippage_pct)
                         logger.info("Falling back to FOK market order for trader %s", trader.wallet_address)

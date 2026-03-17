@@ -18,6 +18,7 @@ STATUS_COLORS = {
     "slippage_exceeded": "🟡",
     "below_threshold": "⚪",
     "position_limit": "🟠",
+    "skipped_sell_only": "⏭️",
 }
 
 PAGE_SIZE = 50
