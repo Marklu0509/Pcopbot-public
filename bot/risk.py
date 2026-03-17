@@ -284,12 +284,16 @@ def cap_and_check(
         return copy_size, rejection
 
     # ── Buy-side: cap to limits instead of rejecting ──
+    pre_cap_size = copy_size
     if side == "BUY":
         copy_size = cap_per_trade_limit(copy_size, cap_price, trader)
         copy_size = cap_total_spend_limit(session, trader, copy_size, cap_price, status_filter=status_filter)
         copy_size = cap_max_per_market(session, trader, market, copy_size, cap_price, status_filter=status_filter)
         copy_size = cap_max_per_yes_no(session, trader, token_id, copy_size, cap_price, status_filter=status_filter)
         copy_size = cap_position_limit(session, trader, token_id, copy_size, cap_price, status_filter=status_filter)
+    # The post-cap size is the hard ceiling — bumps must not exceed this.
+    cap_ceiling = copy_size
+    was_capped = copy_size < pre_cap_size
 
     # ── Check min_per_trade (reject or bump if below, after capping) ──
     buy_at_min = getattr(trader, "buy_at_min", False)
@@ -298,6 +302,13 @@ def cap_and_check(
         if trader.min_per_trade > 0 and trade_value < trader.min_per_trade:
             if buy_at_min and cap_price > 0:
                 min_shares = trader.min_per_trade / cap_price
+                if was_capped and min_shares > cap_ceiling:
+                    # Bump would exceed spending limits — reject instead
+                    logger.info(
+                        "buy_at_min: min_per_trade needs %.4f shares but cap ceiling is %.4f ($%.2f) — rejecting for trader %s",
+                        min_shares, cap_ceiling, cap_ceiling * cap_price, trader.wallet_address,
+                    )
+                    return copy_size, STATUS_BELOW_THRESHOLD
                 logger.info(
                     "Bumping trade from %.4f to %.4f shares (min_per_trade $%.2f) for trader %s",
                     copy_size, min_shares, trader.min_per_trade, trader.wallet_address,
@@ -315,6 +326,13 @@ def cap_and_check(
     if order_value < MINIMUM_ORDER_VALUE_USD:
         if side == "BUY" and buy_at_min and cap_price > 0:
             min_shares = MINIMUM_ORDER_VALUE_USD / cap_price
+            if was_capped and min_shares > cap_ceiling:
+                # Bump would exceed spending limits — reject instead
+                logger.info(
+                    "buy_at_min: $1 floor needs %.4f shares but cap ceiling is %.4f ($%.2f) — rejecting for trader %s",
+                    min_shares, cap_ceiling, cap_ceiling * cap_price, trader.wallet_address,
+                )
+                return copy_size, STATUS_BELOW_MINIMUM_ORDER
             logger.info(
                 "Bumping trade from %.4f to %.4f shares ($%.2f hard floor) for trader %s",
                 copy_size, min_shares, MINIMUM_ORDER_VALUE_USD, trader.wallet_address,
