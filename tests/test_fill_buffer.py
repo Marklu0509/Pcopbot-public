@@ -31,7 +31,7 @@ def test_single_fill_above_threshold_returns_immediate():
     result = buf.add_fill(1, "tok_abc", trade, threshold=100, window_seconds=30)
     assert result.action == "immediate"
     assert result.aggregated_trade is None
-    assert len(buf._slots) == 0  # nothing buffered
+    assert not buf._slots  # nothing buffered
 
 
 def test_single_fill_below_threshold_buffered():
@@ -41,7 +41,7 @@ def test_single_fill_below_threshold_buffered():
     assert result.action == "buffered"
     assert result.total_value == 25.0
     assert result.buffered_count == 1
-    assert len(buf._slots) == 1
+    assert len(buf._slots) == 1  # one slot
 
 
 def test_accumulated_fills_trigger_execute():
@@ -90,7 +90,7 @@ def test_flush_expired_removes_old_entries():
         mock_dt.now.return_value = t0
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         buf.add_fill(1, "tok_abc", _make_trade(10, 0.50), threshold=100, window_seconds=30)
-    assert len(buf._slots) == 1
+    assert len(buf._slots) == 1  # one slot
 
     # Flush at t0 + 60s (well past window)
     future = t0 + timedelta(seconds=60)
@@ -112,7 +112,7 @@ def test_flush_expired_keeps_active_entries():
     now = datetime.now(timezone.utc)
     expired = buf.flush_expired(now, window_seconds_map={1: 30})
     assert len(expired) == 0
-    assert len(buf._slots) == 1
+    assert len(buf._slots) == 1  # one slot
 
 
 def test_buffer_reset_after_execute():
@@ -134,8 +134,8 @@ def test_different_tokens_buffered_separately():
     buf.add_fill(1, "tok_a", _make_trade(50, 0.50, token_id="tok_a"), threshold=100, window_seconds=30)
     buf.add_fill(1, "tok_b", _make_trade(50, 0.50, token_id="tok_b"), threshold=100, window_seconds=30)
     assert len(buf._slots) == 2
-    assert buf._slots[(1, "tok_a")].total_value == 25.0
-    assert buf._slots[(1, "tok_b")].total_value == 25.0
+    assert buf._slots[(1, "tok_a", "BUY")].total_value == 25.0
+    assert buf._slots[(1, "tok_b", "BUY")].total_value == 25.0
 
 
 def test_different_traders_buffered_separately():
@@ -187,6 +187,23 @@ def test_aggregated_trade_dict_structure():
 
 
 # ── Sliding window specific tests ──
+
+def test_buy_and_sell_same_token_buffered_separately():
+    """BUY and SELL fills for the same token must not mix."""
+    buf = FillBuffer()
+    buf.add_fill(1, "tok_abc", _make_trade(50, 0.50, side="BUY", trade_id="b1"), threshold=100, window_seconds=30)
+    buf.add_fill(1, "tok_abc", _make_trade(50, 0.50, side="SELL", trade_id="s1"), threshold=100, window_seconds=30)
+    assert len(buf._slots) == 2
+    assert (1, "tok_abc", "BUY") in buf._slots
+    assert (1, "tok_abc", "SELL") in buf._slots
+    # Adding more SELL should only trigger SELL aggregation (50*0.50=$25 + 160*0.50=$80 = $105)
+    r = buf.add_fill(1, "tok_abc", _make_trade(160, 0.50, side="SELL", trade_id="s2"), threshold=100, window_seconds=30)
+    assert r.action == "execute"
+    assert r.aggregated_trade["side"] == "SELL"
+    # BUY buffer should still be intact
+    assert (1, "tok_abc", "BUY") in buf._slots
+    assert buf._slots[(1, "tok_abc", "BUY")].total_value == 25.0
+
 
 def test_sliding_window_keeps_recent_fills_across_old_boundary():
     """Fill at t=25s and t=35s should combine even though t=0 fill would have expired."""

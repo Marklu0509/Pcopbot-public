@@ -73,7 +73,8 @@ class FillBuffer:
     """
 
     def __init__(self) -> None:
-        self._slots: dict[tuple[int, str], _BufferEntry] = {}
+        # Key: (trader_id, token_id, side) — BUY and SELL are buffered separately
+        self._slots: dict[tuple[int, str, str], _BufferEntry] = {}
 
     def add_fill(
         self,
@@ -101,7 +102,8 @@ class FillBuffer:
         if window_seconds <= 0:
             return AggregationResult(action="immediate")
 
-        key = (trader_id, token_id)
+        side = trade.get("side", "BUY")
+        key = (trader_id, token_id, side)
         now = datetime.now(timezone.utc)
 
         # Get or create buffer slot
@@ -148,7 +150,7 @@ class FillBuffer:
         """
         expired: list[tuple[int, str, _BufferEntry]] = []
         for key, entry in list(self._slots.items()):
-            trader_id, token_id = key
+            trader_id, token_id, _side = key
             window = 30
             if window_seconds_map and trader_id in window_seconds_map:
                 window = window_seconds_map[trader_id]
