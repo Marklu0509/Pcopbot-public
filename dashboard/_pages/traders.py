@@ -198,6 +198,47 @@ def _reset_trade_history(trader_id: int, is_dry_run: bool) -> int:
     return deleted
 
 
+def _mark_as_sold(
+    trader_id: int,
+    token_id: str,
+    condition_id: str,
+    market_title: str,
+    outcome: str,
+    net_shares: float,
+    sell_price: float,
+    avg_buy_price: float,
+    status_mode: str = "success",
+) -> int | None:
+    """Create a SELL CopyTrade record to close out a position.
+
+    Returns the new CopyTrade ID, or None on failure.
+    """
+    pnl = round((sell_price - avg_buy_price) * net_shares, 4)
+    with _SessionLocal() as session:
+        record = CopyTrade(
+            trader_id=trader_id,
+            original_trade_id=f"manual_sell:{token_id[:20]}",
+            original_market=condition_id,
+            original_token_id=token_id,
+            market_title=market_title,
+            outcome=outcome,
+            original_side="SELL",
+            original_size=net_shares,
+            original_price=sell_price,
+            original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+            copy_size=net_shares,
+            copy_price=sell_price,
+            status=status_mode,
+            order_id=f"manual_sell:{token_id[:20]}",
+            error_message=f"Manual mark-as-sold (avg buy ${avg_buy_price:.4f})",
+            pnl=pnl,
+            executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        session.add(record)
+        session.commit()
+        return record.id
+
+
 def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame:
     """Load copy trades for a trader, newest first.
 
@@ -305,6 +346,7 @@ def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> 
             "Change %": 0.0,
             "Trades": len(group),
             "_token_id": token_id,  # internal, hidden in display
+            "_condition_id": cid,   # internal, for mark-as-sold
         })
 
     return pd.DataFrame(holdings)
@@ -719,7 +761,7 @@ def _render_trader_detail(t) -> None:
         "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
         "Change %": st.column_config.NumberColumn(format="%.1f%%"),
     }
-    _hidden_cols = ["_token_id"]
+    _hidden_cols = ["_token_id", "_condition_id"]
 
     for htab, statuses, empty_msg in [
         (htab_live, ["success"], "No live copy-trade holdings yet."),
@@ -752,6 +794,53 @@ def _render_trader_detail(t) -> None:
                 hide_index=True,
                 column_config=_holdings_col_config,
             )
+
+            # ── Mark as Sold ──
+            if not holdings_df.empty:
+                with st.expander("Mark as Sold (manual close)"):
+                    market_options = holdings_df["Market"].tolist()
+                    sel_idx = st.selectbox(
+                        "Select position to close",
+                        range(len(market_options)),
+                        format_func=lambda i: f"{market_options[i]} ({holdings_df.iloc[i]['Outcome']}) — {holdings_df.iloc[i]['Position']} shares",
+                        key=f"mark_sold_select_{t.id}_{statuses[0]}",
+                    )
+                    sel_row = holdings_df.iloc[sel_idx]
+                    cur_price = sel_row.get("Cur Price", 0.0) or 0.0
+                    sell_price = st.number_input(
+                        "Sell Price",
+                        min_value=0.0,
+                        max_value=1.0,
+                        value=float(cur_price) if cur_price > 0 else 0.50,
+                        step=0.01,
+                        key=f"mark_sold_price_{t.id}_{statuses[0]}",
+                    )
+                    pnl_preview = (sell_price - sel_row["Avg Price"]) * sel_row["Position"]
+                    st.caption(
+                        f"Position: {sel_row['Position']:.4f} shares | "
+                        f"Avg Buy: ${sel_row['Avg Price']:.4f} | "
+                        f"Sell: ${sell_price:.4f} | "
+                        f"PnL: ${pnl_preview:+.4f}"
+                    )
+                    if st.button(
+                        f"Confirm Mark as Sold",
+                        key=f"mark_sold_btn_{t.id}_{statuses[0]}",
+                        type="primary",
+                    ):
+                        record_id = _mark_as_sold(
+                            trader_id=t.id,
+                            token_id=sel_row["_token_id"],
+                            condition_id=sel_row.get("_condition_id", ""),
+                            market_title=sel_row["Market"],
+                            outcome=sel_row["Outcome"],
+                            net_shares=sel_row["Position"],
+                            sell_price=sell_price,
+                            avg_buy_price=sel_row["Avg Price"],
+                            status_mode=statuses[0],
+                        )
+                        if record_id:
+                            st.success(f"Marked as sold! Record #{record_id}, PnL: ${pnl_preview:+.4f}")
+                            st.rerun()
 
     st.divider()
 
