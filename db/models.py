@@ -129,6 +129,10 @@ class CopyTrade(Base):
     error_message = Column(String, nullable=True)
     order_id = Column(String, nullable=True)
 
+    # Fill aggregation context (non-null when trade was aggregated from multiple fills)
+    agg_fill_count = Column(Integer, nullable=True)   # number of fills aggregated
+    agg_total_value = Column(Float, nullable=True)     # total USD value of aggregated fills
+
     # PnL (updated externally once market resolves)
     pnl = Column(Float, default=0.0)
 

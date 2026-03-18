@@ -115,27 +115,27 @@ class FillBuffer:
             buffered_count=len(entry.fills),
         )
 
-    def flush_expired(self, now: datetime, window_seconds_map: dict[int, int] | None = None) -> list[tuple[int, str]]:
-        """Remove expired buffer entries. Returns keys of discarded entries.
+    def flush_expired(self, now: datetime, window_seconds_map: dict[int, int] | None = None) -> list[tuple[int, str, _BufferEntry]]:
+        """Remove expired buffer entries. Returns (trader_id, token_id, entry) tuples.
 
         window_seconds_map: optional {trader_id: window_seconds} for per-trader windows.
         Falls back to 30s if not provided.
         """
-        expired_keys: list[tuple[int, str]] = []
+        expired: list[tuple[int, str, _BufferEntry]] = []
         for key, entry in list(self._slots.items()):
-            trader_id, _ = key
+            trader_id, token_id = key
             window = 30
             if window_seconds_map and trader_id in window_seconds_map:
                 window = window_seconds_map[trader_id]
             elapsed = (now - entry.first_seen).total_seconds()
             if elapsed > window:
-                expired_keys.append(key)
+                expired.append((trader_id, token_id, entry))
                 logger.info(
                     "Aggregation expired: trader_id=%d token=%s fills=%d value=$%.2f (window=%ds)",
                     trader_id, key[1][:16], len(entry.fills), entry.total_value, window,
                 )
                 del self._slots[key]
-        return expired_keys
+        return expired
 
     @staticmethod
     def _build_aggregated_trade(entry: _BufferEntry) -> dict:
@@ -154,4 +154,7 @@ class FillBuffer:
             "timestamp": latest.get("timestamp", datetime.now(timezone.utc)),
             "market_title": latest.get("market_title", ""),
             "outcome": latest.get("outcome", ""),
+            # Aggregation metadata for CopyTrade record
+            "_agg_fill_count": len(entry.fills),
+            "_agg_total_value": round(entry.total_value, 4),
         }

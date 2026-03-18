@@ -90,7 +90,11 @@ def test_flush_expired_removes_old_entries():
     future = datetime.now(timezone.utc) + timedelta(seconds=60)
     expired = buf.flush_expired(future, window_seconds_map={1: 30})
     assert len(expired) == 1
-    assert expired[0] == (1, "tok_abc")
+    trader_id, token_id, entry = expired[0]
+    assert trader_id == 1
+    assert token_id == "tok_abc"
+    assert entry.total_value == 5.0
+    assert len(entry.fills) == 1
     assert len(buf._slots) == 0
 
 

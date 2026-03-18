@@ -1076,6 +1076,8 @@ def execute_copy_trade(
         error_message=error_msg,
         order_id=order_id,
         pnl=realized_pnl,
+        agg_fill_count=trade.get("_agg_fill_count"),
+        agg_total_value=trade.get("_agg_total_value"),
         executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     session.add(copy_trade)

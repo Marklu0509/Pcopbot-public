@@ -416,15 +416,35 @@ def _poll_once(session, fill_buffer: FillBuffer) -> None:
                 )
             watermark.advance_watermark(session, t, trade["timestamp"])
 
-    # Flush expired aggregation buffers
+    # Flush expired aggregation buffers — record as below_threshold
     expired = fill_buffer.flush_expired(
         datetime.now(timezone.utc), window_seconds_map=window_map,
     )
-    for trader_id, token_id in expired:
-        logger.info(
-            "Discarded expired aggregation buffer: trader_id=%d token=%s",
-            trader_id, token_id[:16],
-        )
+    for trader_id, token_id, entry in expired:
+        # Record expired aggregation so it appears in trade history
+        latest = entry.latest_fill or (entry.fills[-1] if entry.fills else None)
+        if latest:
+            expired_record = CopyTrade(
+                trader_id=trader_id,
+                original_trade_id=f"agg_expired_{latest.get('trade_id', '')}_{len(entry.fills)}",
+                original_market=latest.get("market", ""),
+                original_token_id=token_id,
+                market_title=latest.get("market_title", ""),
+                outcome=latest.get("outcome", ""),
+                original_side=latest.get("side", "BUY"),
+                original_size=round(entry.total_size, 6),
+                original_price=round(entry.weighted_price_sum / entry.total_size, 6) if entry.total_size > 0 else 0,
+                original_timestamp=latest.get("timestamp", datetime.now(timezone.utc)).replace(tzinfo=None),
+                copy_size=0.0,
+                copy_price=0.0,
+                status="below_threshold",
+                error_message=f"Aggregation expired: {len(entry.fills)} fills totaling ${entry.total_value:.2f} (threshold not reached)",
+                agg_fill_count=len(entry.fills),
+                agg_total_value=round(entry.total_value, 4),
+                executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(expired_record)
+            session.commit()
 
 
 def run() -> None:

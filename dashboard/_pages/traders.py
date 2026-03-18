@@ -219,6 +219,8 @@ def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame
                 CopyTrade.pnl,
                 CopyTrade.error_message,
                 CopyTrade.order_id,
+                CopyTrade.agg_fill_count,
+                CopyTrade.agg_total_value,
             )
             .filter(CopyTrade.trader_id == trader_id)
             .order_by(CopyTrade.executed_at.desc())
@@ -234,6 +236,7 @@ def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame
             "ID", "Time", "Market", "Outcome", "Side",
             "Orig Position", "Orig Price", "Copy Position", "Copy Price",
             "Status", "PnL", "Error", "Order ID",
+            "Agg Fills", "Agg Value",
         ],
     )
     df["Orig Value"] = (df["Orig Position"] * df["Orig Price"]).round(2)
@@ -243,7 +246,8 @@ def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame
     df = df[["ID", "Time", "Market", "Outcome", "Side",
              "Orig Position", "Orig Price", "Orig Value",
              "Copy Position", "Copy Price", "Copy Value",
-             "Status", "PnL", "Error", "Order ID"]]
+             "Status", "PnL", "Agg Fills", "Agg Value",
+             "Error", "Order ID"]]
     return df
 
 
