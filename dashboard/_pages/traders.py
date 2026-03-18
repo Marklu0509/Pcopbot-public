@@ -889,7 +889,7 @@ def _render_trader_detail(t) -> None:
                         f"({trade_count} total records). Open positions (BUY records "
                         f"with remaining holdings) will be preserved."
                     )
-                rc1, rc2 = st.columns(2)
+                rc1, rc2, rc3 = st.columns(3)
                 with rc1:
                     if st.button("Confirm Reset", key=f"reset_confirm_{t.id}", type="primary"):
                         deleted = _reset_trade_history(t.id, is_dry_run=_dry)
@@ -898,6 +898,13 @@ def _render_trader_detail(t) -> None:
                         st.cache_data.clear()
                         st.rerun()
                 with rc2:
+                    if not _dry and st.button("Force Reset (delete ALL)", key=f"reset_force_{t.id}"):
+                        deleted = _reset_trade_history(t.id, is_dry_run=True)
+                        st.session_state[reset_key] = False
+                        st.success(f"Force deleted {deleted} trade records (including open positions).")
+                        st.cache_data.clear()
+                        st.rerun()
+                with rc3:
                     if st.button("Cancel", key=f"reset_cancel_{t.id}"):
                         st.session_state[reset_key] = False
                         st.rerun()
