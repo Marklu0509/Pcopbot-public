@@ -1,8 +1,9 @@
-"""Unit tests for bot.fill_buffer.FillBuffer."""
+"""Unit tests for bot.fill_buffer.FillBuffer (sliding window)."""
 
 import sys
 import os
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 # Ensure project root is on sys.path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -82,12 +83,17 @@ def test_vwap_calculation():
 
 def test_flush_expired_removes_old_entries():
     buf = FillBuffer()
-    # Add a fill
-    buf.add_fill(1, "tok_abc", _make_trade(10, 0.50), threshold=100, window_seconds=30)
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Add a fill at t0
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t0
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        buf.add_fill(1, "tok_abc", _make_trade(10, 0.50), threshold=100, window_seconds=30)
     assert len(buf._slots) == 1
 
-    # Flush with a time far in the future
-    future = datetime.now(timezone.utc) + timedelta(seconds=60)
+    # Flush at t0 + 60s (well past window)
+    future = t0 + timedelta(seconds=60)
     expired = buf.flush_expired(future, window_seconds_map={1: 30})
     assert len(expired) == 1
     trader_id, token_id, entry = expired[0]
@@ -178,6 +184,86 @@ def test_aggregated_trade_dict_structure():
     assert t["trade_id"].startswith("agg_t1_")
     assert t["market"] == "market_1"
     assert t["token_id"] == "tok_abc"
+
+
+# ── Sliding window specific tests ──
+
+def test_sliding_window_keeps_recent_fills_across_old_boundary():
+    """Fill at t=25s and t=35s should combine even though t=0 fill would have expired."""
+    buf = FillBuffer()
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Fill 1 at t=0: $30
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t0
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        r1 = buf.add_fill(1, "tok_abc", _make_trade(60, 0.50, trade_id="t1"), threshold=100, window_seconds=30)
+    assert r1.action == "buffered"
+
+    # Fill 2 at t=25s: $40
+    t25 = t0 + timedelta(seconds=25)
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t25
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        r2 = buf.add_fill(1, "tok_abc", _make_trade(80, 0.50, trade_id="t2"), threshold=100, window_seconds=30)
+    assert r2.action == "buffered"
+    assert r2.total_value == 70.0  # both fills still in window
+
+    # Fill 3 at t=35s: $60 — fill at t=0 should be pruned (35-0=35 > 30)
+    # Remaining: t=25 ($40) + t=35 ($60) = $100 ≥ threshold → execute!
+    t35 = t0 + timedelta(seconds=35)
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t35
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        r3 = buf.add_fill(1, "tok_abc", _make_trade(120, 0.50, trade_id="t3"), threshold=100, window_seconds=30)
+    assert r3.action == "execute"
+    assert r3.buffered_count == 2  # only t=25 and t=35 fills
+    assert r3.total_value == 100.0  # 40 + 60
+    assert r3.aggregated_trade["size"] == 200.0  # 80 + 120
+
+
+def test_sliding_window_prunes_old_fills():
+    """Old fills outside the window should be pruned, reducing total value."""
+    buf = FillBuffer()
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Fill at t=0: $30
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t0
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        buf.add_fill(1, "tok_abc", _make_trade(60, 0.50, trade_id="t1"), threshold=100, window_seconds=30)
+
+    # Fill at t=40s: $20 — t=0 fill should be pruned
+    t40 = t0 + timedelta(seconds=40)
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t40
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        r = buf.add_fill(1, "tok_abc", _make_trade(40, 0.50, trade_id="t2"), threshold=100, window_seconds=30)
+    assert r.action == "buffered"
+    assert r.total_value == 20.0  # only t=40 fill ($20), t=0 fill pruned
+    assert r.buffered_count == 1
+
+
+def test_sliding_window_all_fills_in_window_kept():
+    """When all fills are within the window, none should be pruned."""
+    buf = FillBuffer()
+    t0 = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Fill at t=0: $25
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t0
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        buf.add_fill(1, "tok_abc", _make_trade(50, 0.50, trade_id="t1"), threshold=100, window_seconds=30)
+
+    # Fill at t=10s: $25
+    t10 = t0 + timedelta(seconds=10)
+    with patch("bot.fill_buffer.datetime") as mock_dt:
+        mock_dt.now.return_value = t10
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        r = buf.add_fill(1, "tok_abc", _make_trade(50, 0.50, trade_id="t2"), threshold=100, window_seconds=30)
+    assert r.action == "buffered"
+    assert r.total_value == 50.0  # both fills kept
+    assert r.buffered_count == 2
 
 
 if __name__ == "__main__":

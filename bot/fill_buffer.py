@@ -1,15 +1,16 @@
 """Aggregation buffer for fragmented order fills.
 
 Large limit orders on Polymarket often get split into many small fills.
-This buffer accumulates fills per (trader_id, token_id) and triggers
-execution once the combined value crosses the ignore_trades_under threshold.
+This buffer accumulates fills per (trader_id, token_id) using a sliding
+window and triggers execution once the combined value crosses the
+ignore_trades_under threshold.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +33,37 @@ class _BufferEntry:
     total_size: float = 0.0
     weighted_price_sum: float = 0.0  # sum(size * price) for VWAP
     total_value: float = 0.0  # sum(size * price) — same as weighted_price_sum
-    first_seen: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     latest_fill: dict | None = None
+
+    def _recalculate(self) -> None:
+        """Recalculate totals from current fills list."""
+        self.total_size = sum(f["size"] for f in self.fills)
+        self.weighted_price_sum = sum(f["size"] * f["price"] for f in self.fills)
+        self.total_value = self.weighted_price_sum
+        self.latest_fill = self.fills[-1] if self.fills else None
+
+    def prune_before(self, cutoff: datetime) -> list[dict]:
+        """Remove fills older than cutoff. Returns pruned fills."""
+        kept: list[dict] = []
+        pruned: list[dict] = []
+        for f in self.fills:
+            ts = f.get("_buffer_ts")
+            if ts is not None and ts < cutoff:
+                pruned.append(f)
+            else:
+                kept.append(f)
+        if pruned:
+            self.fills = kept
+            self._recalculate()
+        return pruned
 
 
 class FillBuffer:
     """In-memory aggregation buffer for sub-threshold fills.
+
+    Uses a **sliding window**: each new fill prunes entries older than
+    window_seconds from the current time, so fills near the boundary
+    of a fixed window are never lost.
 
     Keyed by (trader_id, token_id). Each slot accumulates fills until
     the combined value crosses the threshold, then returns an aggregated
@@ -81,16 +107,15 @@ class FillBuffer:
         # Get or create buffer slot
         entry = self._slots.get(key)
         if entry is None:
-            entry = _BufferEntry(first_seen=now)
+            entry = _BufferEntry()
             self._slots[key] = entry
 
-        # Check if existing entry has expired — if so, discard and start fresh
-        elapsed = (now - entry.first_seen).total_seconds()
-        if elapsed > window_seconds:
-            entry = _BufferEntry(first_seen=now)
-            self._slots[key] = entry
+        # Sliding window: prune fills older than window_seconds from now
+        cutoff = now - timedelta(seconds=window_seconds)
+        entry.prune_before(cutoff)
 
-        # Add fill to buffer
+        # Stamp the fill with buffer arrival time and add it
+        trade["_buffer_ts"] = now
         entry.fills.append(trade)
         entry.total_size += trade["size"]
         entry.weighted_price_sum += trade["size"] * trade["price"]
@@ -100,7 +125,6 @@ class FillBuffer:
         # Check if accumulated value crosses threshold
         if entry.total_value >= threshold:
             aggregated = self._build_aggregated_trade(entry)
-            # Reset buffer slot
             del self._slots[key]
             return AggregationResult(
                 action="execute",
@@ -116,8 +140,9 @@ class FillBuffer:
         )
 
     def flush_expired(self, now: datetime, window_seconds_map: dict[int, int] | None = None) -> list[tuple[int, str, _BufferEntry]]:
-        """Remove expired buffer entries. Returns (trader_id, token_id, entry) tuples.
+        """Remove buffer entries with no recent fills. Returns (trader_id, token_id, entry) tuples.
 
+        A slot is expired if the latest fill is older than the window.
         window_seconds_map: optional {trader_id: window_seconds} for per-trader windows.
         Falls back to 30s if not provided.
         """
@@ -127,12 +152,23 @@ class FillBuffer:
             window = 30
             if window_seconds_map and trader_id in window_seconds_map:
                 window = window_seconds_map[trader_id]
-            elapsed = (now - entry.first_seen).total_seconds()
+
+            # Check latest fill time — if no fills remain or latest is too old, expire
+            if not entry.fills:
+                expired.append((trader_id, token_id, entry))
+                del self._slots[key]
+                continue
+
+            latest_ts = entry.latest_fill.get("_buffer_ts") if entry.latest_fill else None
+            if latest_ts is None:
+                latest_ts = entry.fills[-1].get("_buffer_ts", now)
+
+            elapsed = (now - latest_ts).total_seconds()
             if elapsed > window:
                 expired.append((trader_id, token_id, entry))
                 logger.info(
                     "Aggregation expired: trader_id=%d token=%s fills=%d value=$%.2f (window=%ds)",
-                    trader_id, key[1][:16], len(entry.fills), entry.total_value, window,
+                    trader_id, token_id[:16], len(entry.fills), entry.total_value, window,
                 )
                 del self._slots[key]
         return expired
