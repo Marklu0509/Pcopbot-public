@@ -8,6 +8,7 @@ from db.database import get_session_factory, init_db
 from db.models import BotLog, BotSetting, CopyTrade, Position, Trader
 from bot import tracker, watermark
 from bot.executor import execute_copy_trade
+from bot.fill_buffer import FillBuffer
 from config import settings
 
 
@@ -306,12 +307,22 @@ def _recalculate_sell_pnl(session) -> None:
         logger.info("Recalculated realized PnL on %d SELL trade(s).", sell_updated)
 
 
-def _poll_once(session) -> None:
+def _poll_once(session, fill_buffer: FillBuffer) -> None:
     """One iteration: poll all active traders and copy new trades."""
+    from datetime import datetime, timezone
+
     traders = session.query(Trader).filter(Trader.is_active == True).all()
     if not traders:
         logger.info("No active traders configured — nothing to poll.")
         return
+
+    # Build per-trader window map for buffer expiry
+    window_map: dict[int, int] = {}
+    for t in traders:
+        # Use the larger of buy/sell windows for expiry
+        buy_w = getattr(t, "buy_agg_window_seconds", 30) or 0
+        sell_w = getattr(t, "sell_agg_window_seconds", 0) or 0
+        window_map[t.id] = max(buy_w, sell_w, 30)
 
     for t in traders:
         label = t.label or t.wallet_address[:12]
@@ -335,7 +346,6 @@ def _poll_once(session) -> None:
             # Sell-only mode: skip BUY trades for this trader
             if getattr(t, "sell_only", False) and trade["side"] == "BUY":
                 logger.info("[%s] Sell-only mode: skipping BUY trade.", label)
-                from datetime import datetime, timezone
                 skip_record = CopyTrade(
                     trader_id=t.id,
                     original_trade_id=trade["trade_id"],
@@ -358,6 +368,44 @@ def _poll_once(session) -> None:
                 watermark.advance_watermark(session, t, trade["timestamp"])
                 continue
 
+            # ── Fill aggregation: buffer small fills, execute when threshold crossed ──
+            threshold = t.ignore_trades_under or 0.0
+            side = trade["side"]
+            agg_window = (
+                getattr(t, "buy_agg_window_seconds", 30) or 0
+                if side == "BUY"
+                else getattr(t, "sell_agg_window_seconds", 0) or 0
+            )
+
+            if threshold > 0 and agg_window > 0:
+                fill_value = trade["size"] * trade["price"]
+                if fill_value < threshold:
+                    # Sub-threshold fill: try aggregation buffer
+                    result = fill_buffer.add_fill(
+                        t.id, trade["token_id"], trade, threshold, agg_window,
+                    )
+                    # Always advance watermark so fill is not re-polled
+                    watermark.advance_watermark(session, t, trade["timestamp"])
+
+                    if result.action == "execute":
+                        logger.info(
+                            "[%s] Aggregated %d fills ($%.2f) for %s — executing",
+                            label, result.buffered_count, result.total_value, side,
+                        )
+                        try:
+                            execute_copy_trade(session, t, result.aggregated_trade)
+                        except Exception as exc:
+                            logger.error("[%s] Error executing aggregated trade: %s", label, exc)
+                    elif result.action == "buffered":
+                        logger.info(
+                            "[%s] Buffered %s fill $%.2f (total $%.2f / $%.2f, %d fills)",
+                            label, side, fill_value, result.total_value,
+                            threshold, result.buffered_count,
+                        )
+                    # action == "immediate" shouldn't happen here (fill_value < threshold)
+                    continue
+
+            # Single fill >= threshold, no aggregation, or aggregation disabled: execute immediately
             try:
                 execute_copy_trade(session, t, trade)
             except Exception as exc:
@@ -366,8 +414,17 @@ def _poll_once(session) -> None:
                     label,
                     exc,
                 )
-            # Advance watermark regardless of execution outcome
             watermark.advance_watermark(session, t, trade["timestamp"])
+
+    # Flush expired aggregation buffers
+    expired = fill_buffer.flush_expired(
+        datetime.now(timezone.utc), window_seconds_map=window_map,
+    )
+    for trader_id, token_id in expired:
+        logger.info(
+            "Discarded expired aggregation buffer: trader_id=%d token=%s",
+            trader_id, token_id[:16],
+        )
 
 
 def run() -> None:
@@ -391,13 +448,14 @@ def run() -> None:
         _sync_positions(session)
 
     _poll_count = 0
+    fill_buffer = FillBuffer()
 
     while _running:
         poll_interval = _get_poll_interval(SessionLocal)
         logger.debug("Poll interval: %ss", poll_interval)
         with SessionLocal() as session:
             try:
-                _poll_once(session)
+                _poll_once(session, fill_buffer)
             except Exception as exc:
                 logger.error("Unhandled error in poll loop: %s", exc)
 

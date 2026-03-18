@@ -555,6 +555,23 @@ def _render_trader_detail(t) -> None:
 
             st.markdown("##### Filters")
             ignore_trades_under = st.number_input("Ignore Target Wallet Trades Under ($)", value=t.ignore_trades_under, min_value=0.0, key=f"itu_{t.id}")
+            _cur_buy_agg = getattr(t, "buy_agg_window_seconds", 30) or 0
+            buy_agg_window_seconds = st.number_input(
+                "BUY Fill Aggregation Window (seconds, 0 = disabled)",
+                value=_cur_buy_agg, min_value=0, max_value=300, step=5,
+                key=f"baw_{t.id}",
+                help="Accumulate small BUY fills within this window. When total value exceeds "
+                     "'Ignore Trades Under' threshold, execute a single copy trade with the "
+                     "combined size and weighted average price (VWAP).",
+            )
+            _cur_sell_agg = getattr(t, "sell_agg_window_seconds", 0) or 0
+            sell_agg_window_seconds = st.number_input(
+                "SELL Fill Aggregation Window (seconds, 0 = disabled)",
+                value=_cur_sell_agg, min_value=0, max_value=300, step=5,
+                key=f"saw_{t.id}",
+                help="Same as BUY aggregation but for SELL fills. "
+                     "Set to 0 to always execute SELL fills immediately.",
+            )
             min_price = st.number_input("Min Price ($, 0 = no limit)", value=t.min_price, min_value=0.0, key=f"mnp_{t.id}")
             max_price = st.number_input("Max Price ($, 0 = no limit)", value=t.max_price, min_value=0.0, key=f"mxp_{t.id}")
 
@@ -635,6 +652,8 @@ def _render_trader_detail(t) -> None:
                         "tp_pct": tp_pct,
                         "sl_pct": sl_pct,
                         "ignore_trades_under": ignore_trades_under,
+                        "buy_agg_window_seconds": buy_agg_window_seconds,
+                        "sell_agg_window_seconds": sell_agg_window_seconds,
                         "min_price": min_price,
                         "max_price": max_price,
                         "total_spend_limit": total_spend_limit,

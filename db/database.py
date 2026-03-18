@@ -55,6 +55,8 @@ def init_db() -> None:
             "ALTER TABLE traders ADD COLUMN sell_price_offset_pct FLOAT DEFAULT 1.0",
             "ALTER TABLE traders ADD COLUMN buy_limit_fallback BOOLEAN DEFAULT 1",
             "ALTER TABLE traders ADD COLUMN sell_limit_fallback BOOLEAN DEFAULT 1",
+            "ALTER TABLE traders ADD COLUMN buy_agg_window_seconds INTEGER DEFAULT 30",
+            "ALTER TABLE traders ADD COLUMN sell_agg_window_seconds INTEGER DEFAULT 0",
         ]:
             try:
                 conn.execute(text(stmt))

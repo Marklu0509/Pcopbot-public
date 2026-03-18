@@ -98,6 +98,16 @@ def render() -> None:
 
         st.markdown("##### Filters")
         ignore_trades_under = st.number_input("Ignore Target Wallet Trades Under ($)", value=0.0, min_value=0.0)
+        buy_agg_window_seconds = st.number_input(
+            "BUY Fill Aggregation Window (seconds, 0 = disabled)",
+            value=30, min_value=0, max_value=300, step=5,
+            help="Accumulate small BUY fills and trigger when total exceeds threshold.",
+        )
+        sell_agg_window_seconds = st.number_input(
+            "SELL Fill Aggregation Window (seconds, 0 = disabled)",
+            value=0, min_value=0, max_value=300, step=5,
+            help="Same for SELL fills. Set to 0 to always execute immediately.",
+        )
         min_price = st.number_input("Min Price ($, 0 = no limit)", value=0.0, min_value=0.0)
         max_price = st.number_input("Max Price ($, 0 = no limit)", value=0.0, min_value=0.0)
 
@@ -144,6 +154,8 @@ def render() -> None:
                         "tp_pct": tp_pct,
                         "sl_pct": sl_pct,
                         "ignore_trades_under": ignore_trades_under,
+                        "buy_agg_window_seconds": buy_agg_window_seconds,
+                        "sell_agg_window_seconds": sell_agg_window_seconds,
                         "min_price": min_price,
                         "max_price": max_price,
                         "total_spend_limit": total_spend_limit,

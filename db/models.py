@@ -51,6 +51,10 @@ class Trader(Base):
     # Ignore target wallet trades under this USD value
     ignore_trades_under = Column(Float, default=0.0)
 
+    # Fill aggregation: accumulate small fills and trigger when total exceeds threshold
+    buy_agg_window_seconds = Column(Integer, default=30)   # 0 = disabled for BUY
+    sell_agg_window_seconds = Column(Integer, default=0)   # 0 = disabled for SELL
+
     # Price filters (0 = no limit)
     min_price = Column(Float, default=0.0)
     max_price = Column(Float, default=0.0)
