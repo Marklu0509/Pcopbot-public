@@ -387,20 +387,82 @@ def _poll_once(session, fill_buffer: FillBuffer) -> None:
                     # Always advance watermark so fill is not re-polled
                     watermark.advance_watermark(session, t, trade["timestamp"])
 
+                    # Update pruned records (sliding window eviction)
+                    if result.pruned_record_ids:
+                        session.query(CopyTrade).filter(
+                            CopyTrade.id.in_(result.pruned_record_ids)
+                        ).update(
+                            {CopyTrade.status: "below_threshold",
+                             CopyTrade.error_message: "Sliding window eviction (fill too old)"},
+                            synchronize_session="fetch",
+                        )
+                        session.commit()
+
                     if result.action == "execute":
                         logger.info(
                             "[%s] Aggregated %d fills ($%.2f) for %s — executing",
                             label, result.buffered_count, result.total_value, side,
                         )
                         try:
-                            execute_copy_trade(session, t, result.aggregated_trade)
+                            copy_trade = execute_copy_trade(session, t, result.aggregated_trade)
+                            # Override orig data with triggering fill's individual data
+                            copy_trade.original_trade_id = trade["trade_id"]
+                            copy_trade.original_size = trade["size"]
+                            copy_trade.original_price = trade["price"]
+                            copy_trade.original_timestamp = trade["timestamp"].replace(tzinfo=None)
+                            session.commit()
+
+                            # Build group annotation
+                            prev_ids = list(result.buffered_record_ids)
+                            all_ids = prev_ids + [copy_trade.id]
+                            vwap = result.aggregated_trade["price"]
+                            note = (
+                                f"Agg group [{', '.join(f'#{i}' for i in all_ids)}]: "
+                                f"{result.buffered_count} fills, VWAP ${vwap:.4f}, "
+                                f"total ${result.total_value:.2f}"
+                            )
+                            copy_trade.error_message = note
+                            # Update all previous buffered records
+                            if prev_ids:
+                                session.query(CopyTrade).filter(
+                                    CopyTrade.id.in_(prev_ids)
+                                ).update(
+                                    {CopyTrade.status: copy_trade.status,
+                                     CopyTrade.error_message: note},
+                                    synchronize_session="fetch",
+                                )
+                            session.commit()
                         except Exception as exc:
                             logger.error("[%s] Error executing aggregated trade: %s", label, exc)
                     elif result.action == "buffered":
+                        # Record individual fill immediately
+                        buffered_record = CopyTrade(
+                            trader_id=t.id,
+                            original_trade_id=trade["trade_id"],
+                            original_market=trade["market"],
+                            original_token_id=trade["token_id"],
+                            market_title=trade.get("market_title", ""),
+                            outcome=trade.get("outcome", ""),
+                            original_side=trade["side"],
+                            original_size=trade["size"],
+                            original_price=trade["price"],
+                            original_timestamp=trade["timestamp"].replace(tzinfo=None),
+                            copy_size=0.0,
+                            copy_price=0.0,
+                            status="buffered",
+                            error_message=f"Buffering: {result.buffered_count} fills, ${result.total_value:.2f} / ${threshold:.2f}",
+                            agg_fill_count=result.buffered_count,
+                            agg_total_value=round(result.total_value, 4),
+                            executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                        )
+                        session.add(buffered_record)
+                        session.commit()
+                        # Store record ID on the trade dict so buffer can retrieve it later
+                        trade["_record_id"] = buffered_record.id
                         logger.info(
-                            "[%s] Buffered %s fill $%.2f (total $%.2f / $%.2f, %d fills)",
+                            "[%s] Buffered %s fill $%.2f (total $%.2f / $%.2f, %d fills) → record #%d",
                             label, side, fill_value, result.total_value,
-                            threshold, result.buffered_count,
+                            threshold, result.buffered_count, buffered_record.id,
                         )
                     # action == "immediate" shouldn't happen here (fill_value < threshold)
                     continue
@@ -416,34 +478,24 @@ def _poll_once(session, fill_buffer: FillBuffer) -> None:
                 )
             watermark.advance_watermark(session, t, trade["timestamp"])
 
-    # Flush expired aggregation buffers — record as below_threshold
+    # Flush expired aggregation buffers — update existing records to below_threshold
     expired = fill_buffer.flush_expired(
         datetime.now(timezone.utc), window_seconds_map=window_map,
     )
     for trader_id, token_id, entry in expired:
-        # Record expired aggregation so it appears in trade history
-        latest = entry.latest_fill or (entry.fills[-1] if entry.fills else None)
-        if latest:
-            expired_record = CopyTrade(
-                trader_id=trader_id,
-                original_trade_id=f"agg_expired_{latest.get('trade_id', '')}_{len(entry.fills)}",
-                original_market=latest.get("market", ""),
-                original_token_id=token_id,
-                market_title=latest.get("market_title", ""),
-                outcome=latest.get("outcome", ""),
-                original_side=latest.get("side", "BUY"),
-                original_size=round(entry.total_size, 6),
-                original_price=round(entry.weighted_price_sum / entry.total_size, 6) if entry.total_size > 0 else 0,
-                original_timestamp=latest.get("timestamp", datetime.now(timezone.utc)).replace(tzinfo=None),
-                copy_size=0.0,
-                copy_price=0.0,
-                status="below_threshold",
-                error_message=f"Aggregation expired: {len(entry.fills)} fills totaling ${entry.total_value:.2f} (threshold not reached)",
-                agg_fill_count=len(entry.fills),
-                agg_total_value=round(entry.total_value, 4),
-                executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        record_ids = list(entry.collect_record_ids())
+        note = (
+            f"Aggregation expired: {len(entry.fills)} fills totaling "
+            f"${entry.total_value:.2f} (threshold not reached)"
+        )
+        if record_ids:
+            session.query(CopyTrade).filter(
+                CopyTrade.id.in_(record_ids)
+            ).update(
+                {CopyTrade.status: "below_threshold",
+                 CopyTrade.error_message: note},
+                synchronize_session="fetch",
             )
-            session.add(expired_record)
             session.commit()
 
 

@@ -88,6 +88,7 @@ STATUS_ICONS = {
     "failed": "🔴",
     "slippage_exceeded": "🟡",
     "below_threshold": "⚪",
+    "buffered": "🟠",
     "position_limit": "🟠",
 }
 

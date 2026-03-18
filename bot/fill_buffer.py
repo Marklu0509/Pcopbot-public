@@ -1,9 +1,13 @@
 """Aggregation buffer for fragmented order fills.
 
 Large limit orders on Polymarket often get split into many small fills.
-This buffer accumulates fills per (trader_id, token_id) using a sliding
-window and triggers execution once the combined value crosses the
-ignore_trades_under threshold.
+This buffer accumulates fills per (trader_id, token_id, side) using a
+sliding window and triggers execution once the combined value crosses
+the ignore_trades_under threshold.
+
+Each buffered fill is recorded individually in CopyTrade. The record ID
+is stored on the fill dict as ``_record_id`` so it can be retrieved when
+the group triggers or expires.
 """
 
 from __future__ import annotations
@@ -23,11 +27,15 @@ class AggregationResult:
     aggregated_trade: dict | None = None
     total_value: float = 0.0
     buffered_count: int = 0
+    # CopyTrade IDs of previously buffered fills (available on "execute")
+    buffered_record_ids: tuple[int, ...] = ()
+    # CopyTrade IDs of fills pruned by sliding window (available on "buffered" and "execute")
+    pruned_record_ids: tuple[int, ...] = ()
 
 
 @dataclass
 class _BufferEntry:
-    """Internal state for a single (trader_id, token_id) buffer slot."""
+    """Internal state for a single (trader_id, token_id, side) buffer slot."""
 
     fills: list[dict] = field(default_factory=list)
     total_size: float = 0.0
@@ -57,6 +65,13 @@ class _BufferEntry:
             self._recalculate()
         return pruned
 
+    def collect_record_ids(self) -> tuple[int, ...]:
+        """Collect _record_id values from all fills that have one."""
+        return tuple(
+            f["_record_id"] for f in self.fills
+            if f.get("_record_id") is not None
+        )
+
 
 class FillBuffer:
     """In-memory aggregation buffer for sub-threshold fills.
@@ -65,9 +80,9 @@ class FillBuffer:
     window_seconds from the current time, so fills near the boundary
     of a fixed window are never lost.
 
-    Keyed by (trader_id, token_id). Each slot accumulates fills until
-    the combined value crosses the threshold, then returns an aggregated
-    trade dict for immediate execution.
+    Keyed by (trader_id, token_id, side). Each slot accumulates fills
+    until the combined value crosses the threshold, then returns an
+    aggregated trade dict for immediate execution.
 
     Thread-safety: not required — the bot is single-threaded.
     """
@@ -114,7 +129,11 @@ class FillBuffer:
 
         # Sliding window: prune fills older than window_seconds from now
         cutoff = now - timedelta(seconds=window_seconds)
-        entry.prune_before(cutoff)
+        pruned_fills = entry.prune_before(cutoff)
+        pruned_ids = tuple(
+            f["_record_id"] for f in pruned_fills
+            if f.get("_record_id") is not None
+        )
 
         # Stamp the fill with buffer arrival time and add it
         trade["_buffer_ts"] = now
@@ -127,18 +146,23 @@ class FillBuffer:
         # Check if accumulated value crosses threshold
         if entry.total_value >= threshold:
             aggregated = self._build_aggregated_trade(entry)
+            # Collect record IDs from previously buffered fills (not the triggering one)
+            buffered_ids = entry.collect_record_ids()
             del self._slots[key]
             return AggregationResult(
                 action="execute",
                 aggregated_trade=aggregated,
                 total_value=entry.total_value,
                 buffered_count=len(entry.fills),
+                buffered_record_ids=buffered_ids,
+                pruned_record_ids=pruned_ids,
             )
 
         return AggregationResult(
             action="buffered",
             total_value=entry.total_value,
             buffered_count=len(entry.fills),
+            pruned_record_ids=pruned_ids,
         )
 
     def flush_expired(self, now: datetime, window_seconds_map: dict[int, int] | None = None) -> list[tuple[int, str, _BufferEntry]]:
