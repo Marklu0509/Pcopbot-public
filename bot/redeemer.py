@@ -921,7 +921,18 @@ def redeem_resolved_positions(session: "Session") -> int:
             if is_neg_risk:
                 tx_hash = _redeem_neg_risk(w3, account, condition_id, token_id, holder_address)
             else:
-                tx_hash = _redeem_binary(w3, account, condition_id, token_id, outcome_index, holder_address)
+                try:
+                    tx_hash = _redeem_binary(w3, account, condition_id, token_id, outcome_index, holder_address)
+                except ValueError as bin_exc:
+                    if "No CTF balance" in str(bin_exc):
+                        # Token might be in NegRiskAdapter — try neg_risk redemption
+                        logger.info(
+                            "No CTF balance for %r, retrying as neg_risk market…",
+                            label,
+                        )
+                        tx_hash = _redeem_neg_risk(w3, account, condition_id, token_id, holder_address)
+                    else:
+                        raise
 
             seen_conditions.add(condition_id)
             logger.info("Redemption successful: market=%r tx=%s", label, tx_hash[:20])
