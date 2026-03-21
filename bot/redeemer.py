@@ -776,6 +776,8 @@ def redeem_resolved_positions(session: "Session") -> int:
             logger.warning("Failed to fetch funder positions for redeem: %s", exc)
 
     # Keep only groups where we actually hold shares (wallet or DB)
+    # wallet_has_data: True if we successfully fetched wallet positions
+    wallet_has_data = bool(funder_wallet_sizes) or bool(funder_address)
     from bot.executor import _get_net_holdings
     active: list[tuple] = []
     for (trader_id, condition_id, token_id), trades in groups.items():
@@ -785,14 +787,15 @@ def redeem_resolved_positions(session: "Session") -> int:
         db_net = _get_net_holdings(session, trader_id, token_id)
         net = wallet_size if wallet_size > 0 else db_net
         if net > 0:
-            active.append((trader_id, condition_id, token_id, trades, net))
+            # Track wallet_size so we can detect "already redeemed" cases
+            active.append((trader_id, condition_id, token_id, trades, net, wallet_size))
 
     # Also include wallet-only positions not tracked in DB
     if funder_wallet_sizes and open_buys:
         sample_trader_id = open_buys[0].trader_id
         for token_id, wallet_size in funder_wallet_sizes.items():
             if wallet_size > 0:
-                active.append((sample_trader_id, "", token_id, [], wallet_size))
+                active.append((sample_trader_id, "", token_id, [], wallet_size, wallet_size))
 
     if not active:
         return 0
@@ -830,7 +833,7 @@ def redeem_resolved_positions(session: "Session") -> int:
     redeemed       = 0
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
 
-    for trader_id, condition_id, token_id, trades, net_shares in active:
+    for trader_id, condition_id, token_id, trades, net_shares, wallet_size in active:
         trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
         from bot.executor import is_trader_dry_run
         trader_is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
@@ -895,6 +898,16 @@ def redeem_resolved_positions(session: "Session") -> int:
             )
             # Record simulated redemption with status="dry_run"
             _record_simulated_redemption(session, trades, trader_id, token_id, net_shares, label, outcome)
+            redeemed += 1
+            continue
+
+        # ── Wallet empty but DB shows holdings → already redeemed elsewhere ──
+        if wallet_has_data and wallet_size <= 0 and not trader_is_dry:
+            logger.info(
+                "Already redeemed (wallet empty): market=%r shares=%.4f — recording synthetic SELL",
+                label, net_shares,
+            )
+            _record_redemption(session, trades, net_shares, f"already_redeemed:{condition_id[:24]}")
             redeemed += 1
             continue
 
