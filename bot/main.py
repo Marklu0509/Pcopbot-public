@@ -412,23 +412,29 @@ def _poll_once(session, fill_buffer: FillBuffer) -> None:
                             copy_trade.original_timestamp = trade["timestamp"].replace(tzinfo=None)
                             session.commit()
 
-                            # Build group annotation
+                            # Build group annotation, preserving original error
                             prev_ids = list(result.buffered_record_ids)
                             all_ids = prev_ids + [copy_trade.id]
                             vwap = result.aggregated_trade["price"]
-                            note = (
+                            agg_note = (
                                 f"Agg group [{', '.join(f'#{i}' for i in all_ids)}]: "
                                 f"{result.buffered_count} fills, VWAP ${vwap:.4f}, "
                                 f"total ${result.total_value:.2f}"
                             )
-                            copy_trade.error_message = note
-                            # Update all previous buffered records
+                            # Preserve the original error from execute_copy_trade
+                            orig_error = copy_trade.error_message or ""
+                            if orig_error:
+                                copy_trade.error_message = f"{orig_error} | {agg_note}"
+                            else:
+                                copy_trade.error_message = agg_note
+                            # Update all previous buffered records with status + note
+                            prev_note = f"{orig_error} | {agg_note}" if orig_error else agg_note
                             if prev_ids:
                                 session.query(CopyTrade).filter(
                                     CopyTrade.id.in_(prev_ids)
                                 ).update(
                                     {CopyTrade.status: copy_trade.status,
-                                     CopyTrade.error_message: note},
+                                     CopyTrade.error_message: prev_note},
                                     synchronize_session="fetch",
                                 )
                             session.commit()
