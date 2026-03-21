@@ -29,7 +29,6 @@ def _load_history(
     trader_id: int | None = None,
     status_filter: str | None = None,
     page: int = 1,
-    market_search: str = "",
 ) -> tuple[pd.DataFrame, int]:
     with _SessionLocal() as session:
         q = (
@@ -56,8 +55,6 @@ def _load_history(
             q = q.filter(CopyTrade.trader_id == trader_id)
         if status_filter and status_filter != "All":
             q = q.filter(CopyTrade.status == status_filter)
-        if market_search:
-            q = q.filter(CopyTrade.market_title.ilike(f"%{market_search}%"))
         total = q.count()
         rows = (
             q.order_by(CopyTrade.executed_at.desc())
@@ -112,18 +109,16 @@ def render() -> None:
     trader_options = {"All": None} | {f"{t.label or t.wallet_address}": t.id for t in traders}
     status_options = ["All", "success", "dry_run", "failed", "slippage_exceeded", "below_threshold", "position_limit"]
 
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
+    col1, col2, col3 = st.columns(3)
     with col1:
         selected_trader_label = st.selectbox("Trader", list(trader_options.keys()))
         trader_id = trader_options[selected_trader_label]
     with col2:
         status_filter = st.selectbox("Status", status_options)
     with col3:
-        market_search = st.text_input("Search Market", placeholder="e.g. Lakers, Bitcoin...")
-    with col4:
         page = st.number_input("Page", min_value=1, value=1, step=1)
 
-    df, total = _load_history(trader_id=trader_id, status_filter=status_filter, page=int(page), market_search=market_search)
+    df, total = _load_history(trader_id=trader_id, status_filter=status_filter, page=int(page))
     st.caption(f"Total records: {total} | Page size: {PAGE_SIZE}")
 
     if df.empty:
