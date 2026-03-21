@@ -734,6 +734,9 @@ def _render_trader_detail(t) -> None:
     if pos_df.empty:
         st.info("No pre-existing positions found.")
     else:
+        _pos_search = st.text_input("Filter", placeholder="Search market...", key=f"pos_search_{t.id}", label_visibility="collapsed")
+        if _pos_search:
+            pos_df = pos_df[pos_df["Market"].str.contains(_pos_search, case=False, na=False)]
         pm1, pm2, pm3, pm4 = st.columns(4)
         pm1.metric("Markets", len(pos_df))
         pm2.metric("Total Position", f"{pos_df['Position'].sum():,.2f}")
@@ -775,6 +778,11 @@ def _render_trader_detail(t) -> None:
 
             # Enrich with prices (cached for 30s, fast on subsequent loads)
             holdings_df = _enrich_holdings_with_prices(holdings_df)
+
+            _hold_search = st.text_input("Filter", placeholder="Search market...", key=f"hold_search_{t.id}_{statuses[0]}", label_visibility="collapsed")
+            if _hold_search:
+                holdings_df = holdings_df[holdings_df["Market"].str.contains(_hold_search, case=False, na=False)]
+
             display_cols = [c for c in holdings_df.columns if c not in _hidden_cols]
 
             total_value = holdings_df["Value"].sum()
@@ -860,7 +868,7 @@ def _render_trader_detail(t) -> None:
     )
     rtab_live, rtab_dry = st.tabs(["Live (success)", "Dry Run (simulated)"])
 
-    def _render_realized_block(realized_df: pd.DataFrame, empty_msg: str) -> None:
+    def _render_realized_block(realized_df: pd.DataFrame, empty_msg: str, search_key: str = "") -> None:
         if realized_df.empty or len(realized_df) == 0:
             rm1, rm2, rm3, rm4 = st.columns(4)
             rm1.metric("Closed Markets", 0)
@@ -870,6 +878,10 @@ def _render_trader_detail(t) -> None:
             st.info(empty_msg)
             st.dataframe(realized_df, use_container_width=True, hide_index=True)
             return
+
+        _rpnl_search = st.text_input("Filter", placeholder="Search market...", key=search_key, label_visibility="collapsed")
+        if _rpnl_search:
+            realized_df = realized_df[realized_df["Market"].str.contains(_rpnl_search, case=False, na=False)]
 
         total_cost = realized_df["Total Cost"].sum()
         total_realized = realized_df["Realized PnL"].sum()
@@ -907,12 +919,14 @@ def _render_trader_detail(t) -> None:
         _render_realized_block(
             _load_realized_pnl(t.id, statuses=["success"], since=_pnl_since),
             "No live realized PnL yet.",
+            search_key=f"rpnl_search_{t.id}_live",
         )
 
     with rtab_dry:
         _render_realized_block(
             _load_realized_pnl(t.id, statuses=["dry_run"], since=_pnl_since),
             "No dry-run realized PnL yet.",
+            search_key=f"rpnl_search_{t.id}_dry",
         )
 
     st.divider()
@@ -940,10 +954,13 @@ def _render_trader_detail(t) -> None:
     if trades_df.empty:
         st.info("No trades recorded yet.")
     else:
+        _trade_search = st.text_input("Filter", placeholder="Search market...", key=f"trade_search_{t.id}", label_visibility="collapsed")
+        if _trade_search:
+            trades_df = trades_df[trades_df["Market"].str.contains(_trade_search, case=False, na=False)]
         if load_full:
-            st.caption(f"Showing full history: {len(trades_df)} trades")
+            st.caption(f"Showing {len(trades_df)} trades (full history)")
         else:
-            st.caption(f"Showing latest {len(trades_df)} trades")
+            st.caption(f"Showing {len(trades_df)} trades")
         st.dataframe(
             trades_df,
             use_container_width=True,
