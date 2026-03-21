@@ -1,5 +1,4 @@
 """Executes copy trades via py_clob_client (or logs them in dry-run mode)."""
-
 from __future__ import annotations
 
 import logging
@@ -40,7 +39,7 @@ def is_trader_dry_run(trader: Trader, session: Session) -> bool:
     return bool(trader_dry_run)
 
 # If a SELL would leave less than this USD value, close out the full position.
-SELL_DUST_CLOSEOUT_USD = 1.0
+SELL_DUST_CLOSEOUT_USD = 1.5
 
 # Polymarket contract addresses on Polygon (chain_id=137).
 _CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens (ERC-1155)
@@ -759,7 +758,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
 
         # ── Simulate SELL for dry_run traders (no real order) ──────────────
         if dry_traders and effective >= attempt_floor:
-            sim_price = recorded_price if live_sell_ok else sell_price
+            sim_price = recorded_price if live_sell_ok else effective
             for trader_id, db_net in dry_traders:
                 avg_buy = _get_avg_buy_price(session, trader_id, token_id, status_filter=["dry_run"])
                 pnl = round((sim_price - avg_buy) * db_net, 4)

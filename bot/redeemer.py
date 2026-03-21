@@ -305,42 +305,67 @@ def _get_market_info(condition_id: str, token_id: str | None = None) -> dict | N
     if not data:
         # Fallback for resolved markets that return 422 on /markets/{id}
         if token_id:
-            # Try multiple price sources — Gamma batch can return 0.0 for some tokens
-            from bot.tracker import fetch_prices_by_token_ids, fetch_position_prices
-            price_map = fetch_prices_by_token_ids([token_id])
-            price = price_map.get(token_id, 0.0)
+            import json as _json
+            import requests as _req
 
-            # Fallback: funder wallet curPrice (more reliable for resolved markets)
-            if price < 0.99:
-                funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
-                if funder:
-                    try:
-                        funder_prices = fetch_position_prices(funder)
-                        funder_price = funder_prices.get(token_id, 0.0)
-                        if funder_price > price:
-                            price = funder_price
-                    except Exception:
-                        pass
-
-            if price >= 0.99:
-                # Winning token — assume binary (neg_risk=False).
-                logger.warning(
-                    "Market %s returned 422 from Gamma — assuming binary for redemption. "
-                    "If this is a neg_risk market, please redeem manually.",
-                    condition_id[:16],
+            # Try Gamma batch endpoint first — it works for resolved markets
+            # and returns full data including negRisk.
+            try:
+                resp = _req.get(
+                    f"{settings.GAMMA_API_BASE}/markets",
+                    params={"clob_token_ids": _json.dumps([token_id])},
+                    timeout=15,
                 )
-                return {
-                    "neg_risk": False,
-                    "condition_id": condition_id,
-                    "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
-                    "winner": "",
-                }
-            # price < 0.99 — market may not be resolved, or token is losing side.
-            # Do not auto-detect losses from fallback prices.
-        return None
+                if resp.ok:
+                    markets = resp.json()
+                    if not isinstance(markets, list):
+                        markets = [markets]
+                    if markets:
+                        data = markets[0]
+                        logger.info(
+                            "Market %s: Gamma /markets/{id} returned 422, "
+                            "recovered via batch endpoint.",
+                            condition_id[:16],
+                        )
+            except Exception as exc:
+                logger.debug("Gamma batch fallback failed for %s: %s", condition_id[:16], exc)
 
-    resolved = data.get("resolved", False) or data.get("closed", False)
-    if not resolved:
+            # If batch endpoint returned data, process it normally below
+            if data:
+                resolved = data.get("resolved", False) or data.get("closed", False)
+                if not resolved:
+                    return None
+                # Fall through to the normal parsing logic below
+            else:
+                # Last resort: price-only fallback
+                from bot.tracker import fetch_prices_by_token_ids, fetch_position_prices
+                price_map = fetch_prices_by_token_ids([token_id])
+                price = price_map.get(token_id, 0.0)
+
+                if price < 0.99:
+                    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+                    if funder:
+                        try:
+                            funder_prices = fetch_position_prices(funder)
+                            funder_price = funder_prices.get(token_id, 0.0)
+                            if funder_price > price:
+                                price = funder_price
+                        except Exception:
+                            pass
+
+                if price >= 0.99:
+                    logger.warning(
+                        "Market %s: all Gamma endpoints failed — using price-only "
+                        "fallback (assuming binary). If neg_risk, redeem manually.",
+                        condition_id[:16],
+                    )
+                    return {
+                        "neg_risk": False,
+                        "condition_id": condition_id,
+                        "token_info": {token_id: {"outcome": "", "price": price, "index": 0}},
+                        "winner": "",
+                    }
+                return None
         return None
 
     # ── Parse token list ─────────────────────────────────────────────────────
