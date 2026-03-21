@@ -1071,7 +1071,14 @@ def detect_manual_sells(session: "Session") -> int:
         )
 
         for trader_id in trader_ids:
-            net_shares = _get_net_holdings(session, trader_id, token_id)
+            # Determine trader mode (live vs dry_run)
+            trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
+            from bot.executor import is_trader_dry_run
+            is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
+            record_status = "dry_run" if is_dry else "success"
+            status_filter = ["dry_run"] if is_dry else ["success"]
+
+            net_shares = _get_net_holdings(session, trader_id, token_id, status_filter=status_filter)
             if net_shares <= 0:
                 continue
 
@@ -1085,7 +1092,7 @@ def detect_manual_sells(session: "Session") -> int:
                     CopyTrade.trader_id == trader_id,
                     CopyTrade.original_token_id == token_id,
                     CopyTrade.original_side == "BUY",
-                    CopyTrade.status.in_(["success", "dry_run"]),
+                    CopyTrade.status.in_(status_filter),
                 )
                 .first()
             )
@@ -1111,7 +1118,7 @@ def detect_manual_sells(session: "Session") -> int:
                 original_timestamp=sell_time,
                 copy_size=actual_size,
                 copy_price=sell_price,
-                status="success",
+                status=record_status,
                 order_id=order_id_key,
                 pnl=pnl,
                 executed_at=sell_time,
@@ -1126,13 +1133,13 @@ def detect_manual_sells(session: "Session") -> int:
             remaining = net_shares - actual_size
             if remaining <= 0:
                 for bt in buy_trades:
-                    if bt.trader_id == trader_id and bt.original_token_id == token_id:
+                    if bt.trader_id == trader_id and bt.original_token_id == token_id and bt.status in status_filter:
                         bt.pnl = 0.0
 
             created += 1
             logger.info(
-                "Manual sell recorded: market=%s trader=%d size=%.4f price=%.4f pnl=%.4f",
-                market_title or token_id[:12], trader_id, actual_size, sell_price, pnl,
+                "Manual sell recorded: market=%s trader=%d size=%.4f price=%.4f pnl=%.4f status=%s",
+                market_title or token_id[:12], trader_id, actual_size, sell_price, pnl, record_status,
             )
 
     if created:
@@ -1201,6 +1208,13 @@ def detect_manual_redemptions(session: "Session") -> int:
                 by_trader[int(bt.trader_id)].add(bt.original_token_id)
 
         for trader_id, token_ids in by_trader.items():
+            # Determine trader mode (live vs dry_run)
+            trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
+            from bot.executor import is_trader_dry_run
+            is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
+            record_status = "dry_run" if is_dry else "success"
+            status_filter = ["dry_run"] if is_dry else ["success"]
+
             for token_id in token_ids:
                 # Dedup key is scoped per trader+token+tx to avoid skipping
                 # traders on a second run after a mid-run interruption.
@@ -1208,7 +1222,7 @@ def detect_manual_redemptions(session: "Session") -> int:
                 if session.query(CopyTrade).filter(CopyTrade.order_id == order_id_key).first():
                     continue
 
-                net_shares = _get_net_holdings(session, trader_id, token_id)
+                net_shares = _get_net_holdings(session, trader_id, token_id, status_filter=status_filter)
                 if net_shares <= 0:
                     continue
 
@@ -1221,7 +1235,7 @@ def detect_manual_redemptions(session: "Session") -> int:
                         CopyTrade.trader_id == trader_id,
                         CopyTrade.original_token_id == token_id,
                         CopyTrade.original_side == "BUY",
-                        CopyTrade.status.in_(["success", "dry_run"]),
+                        CopyTrade.status.in_(status_filter),
                     )
                     .first()
                 )
@@ -1246,7 +1260,7 @@ def detect_manual_redemptions(session: "Session") -> int:
                     original_timestamp=redeem_time,
                     copy_size=net_shares,
                     copy_price=1.0,
-                    status="success",
+                    status=record_status,
                     order_id=order_id_key,
                     pnl=pnl,
                     executed_at=redeem_time,
@@ -1255,13 +1269,13 @@ def detect_manual_redemptions(session: "Session") -> int:
 
                 # Zero out unrealized PnL on BUY records for this position
                 for bt in buy_trades:
-                    if bt.trader_id == trader_id and bt.original_token_id == token_id:
+                    if bt.trader_id == trader_id and bt.original_token_id == token_id and bt.status in status_filter:
                         bt.pnl = 0.0
 
                 created += 1
                 logger.info(
-                    "Manual redemption recorded: market=%s trader=%d size=%.4f pnl=%.4f",
-                    market_title or condition_id[:12], trader_id, net_shares, pnl,
+                    "Manual redemption recorded: market=%s trader=%d size=%.4f pnl=%.4f status=%s",
+                    market_title or condition_id[:12], trader_id, net_shares, pnl, record_status,
                 )
 
     if created:
