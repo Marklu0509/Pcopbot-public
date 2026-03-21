@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 from config import settings
 from bot.tracker import fetch_market
-from db.models import CopyTrade
+from db.models import CopyTrade, Trader
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
