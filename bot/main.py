@@ -568,27 +568,39 @@ def run() -> None:
 
             # Auto-redeem resolved winning positions every 20 poll cycles
             if _poll_count % 20 == 0:
+                from bot.redeemer import (
+                    redeem_resolved_positions,
+                    detect_manual_redemptions,
+                    detect_manual_sells,
+                    detect_expired_losses,
+                )
                 try:
-                    from bot.redeemer import (
-                        redeem_resolved_positions,
-                        detect_manual_redemptions,
-                        detect_manual_sells,
-                        detect_expired_losses,
-                    )
                     redeemed = redeem_resolved_positions(session)
                     if redeemed:
                         logger.info("Auto-redeemed %d resolved position(s).", redeemed)
+                except Exception as exc:
+                    logger.error("Error during auto-redemption: %s", exc)
+
+                try:
                     manual = detect_manual_redemptions(session)
                     if manual:
                         logger.info("Recorded %d manual redemption(s) from funder wallet.", manual)
+                except Exception as exc:
+                    logger.error("Error detecting manual redemptions: %s", exc)
+
+                try:
                     manual_sells = detect_manual_sells(session)
                     if manual_sells:
                         logger.info("Recorded %d manual sell(s) from funder wallet.", manual_sells)
+                except Exception as exc:
+                    logger.error("Error detecting manual sells: %s", exc)
+
+                try:
                     expired = detect_expired_losses(session)
                     if expired:
                         logger.info("Recorded %d expired losing position(s).", expired)
                 except Exception as exc:
-                    logger.error("Error during auto-redemption: %s", exc)
+                    logger.error("Error detecting expired losses: %s", exc)
 
         logger.debug("Sleeping %s seconds…", poll_interval)
         time.sleep(poll_interval)
