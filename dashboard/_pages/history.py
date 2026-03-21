@@ -24,6 +24,7 @@ STATUS_COLORS = {
 PAGE_SIZE = 50
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _load_history(
     trader_id: int | None = None,
     status_filter: str | None = None,

@@ -239,6 +239,7 @@ def _mark_as_sold(
         return record.id
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame:
     """Load copy trades for a trader, newest first.
 
@@ -293,7 +294,8 @@ def _load_trader_trades(trader_id: int, limit: int | None = 300) -> pd.DataFrame
     return df
 
 
-def _load_trader_holdings(trader_id: int, statuses: list[str] | None = None) -> pd.DataFrame:
+@st.cache_data(ttl=30, show_spinner=False)
+def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = None) -> pd.DataFrame:
     """Load holdings from DB (fast, no API calls). Returns base data + token IDs."""
     statuses = statuses or ["success"]
     with _SessionLocal() as session:
@@ -393,6 +395,7 @@ def _enrich_holdings_with_prices(holdings_df: pd.DataFrame) -> pd.DataFrame:
     return enriched
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _load_trader_positions(trader_id: int) -> pd.DataFrame:
     """Load pre-existing positions (fetched on startup) for a trader."""
     with _SessionLocal() as session:
@@ -430,9 +433,10 @@ _PNL_RANGE_OPTIONS: dict[str, timedelta | None] = {
 }
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def _load_realized_pnl(
     trader_id: int,
-    statuses: list[str] | None = None,
+    statuses: tuple[str, ...] | None = None,
     since: datetime | None = None,
 ) -> pd.DataFrame:
     """Compute realized PnL per market/outcome from SELL copy trades.
@@ -767,8 +771,8 @@ def _render_trader_detail(t) -> None:
     _hidden_cols = ["_token_id", "_condition_id"]
 
     for htab, statuses, empty_msg in [
-        (htab_live, ["success"], "No live copy-trade holdings yet."),
-        (htab_dry, ["dry_run"], "No dry-run holdings yet."),
+        (htab_live, ("success",), "No live copy-trade holdings yet."),
+        (htab_dry, ("dry_run",), "No dry-run holdings yet."),
     ]:
         with htab:
             holdings_df = _load_trader_holdings(t.id, statuses=statuses)
@@ -917,14 +921,14 @@ def _render_trader_detail(t) -> None:
 
     with rtab_live:
         _render_realized_block(
-            _load_realized_pnl(t.id, statuses=["success"], since=_pnl_since),
+            _load_realized_pnl(t.id, statuses=("success",), since=_pnl_since),
             "No live realized PnL yet.",
             search_key=f"rpnl_search_{t.id}_live",
         )
 
     with rtab_dry:
         _render_realized_block(
-            _load_realized_pnl(t.id, statuses=["dry_run"], since=_pnl_since),
+            _load_realized_pnl(t.id, statuses=("dry_run",), since=_pnl_since),
             "No dry-run realized PnL yet.",
             search_key=f"rpnl_search_{t.id}_dry",
         )
