@@ -787,15 +787,15 @@ def redeem_resolved_positions(session: "Session") -> int:
         db_net = _get_net_holdings(session, trader_id, token_id)
         net = wallet_size if wallet_size > 0 else db_net
         if net > 0:
-            # Track wallet_size so we can detect "already redeemed" cases
-            active.append((trader_id, condition_id, token_id, trades, net, wallet_size))
+            # Track wallet_size and db_net for "already redeemed" detection
+            active.append((trader_id, condition_id, token_id, trades, net, wallet_size, db_net))
 
     # Also include wallet-only positions not tracked in DB
     if funder_wallet_sizes and open_buys:
         sample_trader_id = open_buys[0].trader_id
         for token_id, wallet_size in funder_wallet_sizes.items():
             if wallet_size > 0:
-                active.append((sample_trader_id, "", token_id, [], wallet_size, wallet_size))
+                active.append((sample_trader_id, "", token_id, [], wallet_size, wallet_size, 0.0))
 
     if not active:
         return 0
@@ -833,7 +833,7 @@ def redeem_resolved_positions(session: "Session") -> int:
     redeemed       = 0
     seen_conditions: set[str] = set()  # avoid double-redeeming same market in one pass
 
-    for trader_id, condition_id, token_id, trades, net_shares, wallet_size in active:
+    for trader_id, condition_id, token_id, trades, net_shares, wallet_size, db_net in active:
         trader_obj = session.query(Trader).filter(Trader.id == trader_id).first()
         from bot.executor import is_trader_dry_run
         trader_is_dry = is_trader_dry_run(trader_obj, session) if trader_obj else True
@@ -941,10 +941,28 @@ def redeem_resolved_positions(session: "Session") -> int:
             redeemed += 1
 
         except Exception as exc:
-            logger.error(
-                "Redemption failed: market=%r token=%s neg_risk=%s error=%s",
-                label, token_id[:12], is_neg_risk, exc,
-            )
+            err_str = str(exc)
+            # On-chain balance is 0 in both contracts — position already redeemed
+            if "No CTF balance" in err_str or "No on-chain balance" in err_str:
+                if db_net > 0:
+                    # DB still shows open position — record synthetic SELL
+                    logger.info(
+                        "On-chain balance 0 for %r — recording synthetic redemption (db_net=%.4f)",
+                        label, db_net,
+                    )
+                    _record_redemption(session, trades, db_net, f"already_redeemed:{condition_id[:24]}")
+                    redeemed += 1
+                else:
+                    # DB already closed — stale Data API position, skip
+                    logger.info(
+                        "On-chain balance 0 for %r and db_net=0 — skipping (stale wallet data)",
+                        label,
+                    )
+            else:
+                logger.error(
+                    "Redemption failed: market=%r token=%s neg_risk=%s error=%s",
+                    label, token_id[:12], is_neg_risk, exc,
+                )
 
     if redeemed:
         logger.info("Auto-redemption complete: %d position(s) redeemed", redeemed)
