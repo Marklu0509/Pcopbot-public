@@ -231,6 +231,21 @@ def _get_avg_buy_price(
     return 0.0
 
 
+def _snap_size_for_clob(size: float, price: float) -> float:
+    """Round size so that maker_amount (size * price) has at most 2 decimals.
+
+    Polymarket CLOB requires:
+      - maker amount (USDC): max 2 decimal places
+      - taker amount (shares): max 4 decimal places
+    """
+    size = round(size, 4)  # taker amount: max 4 decimals
+    if price > 0:
+        # Ensure size * price rounds cleanly to 2 decimals
+        maker = round(size * price, 2)
+        size = round(maker / price, 4)
+    return size
+
+
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
     """Determine the copy trade size (in shares) based on the trader's sizing mode.
 
@@ -238,11 +253,12 @@ def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> 
     Proportional mode: percentage of the original trade's share count.
     """
     if trader.sizing_mode == "proportional":
-        return original_size * (trader.proportional_pct / 100.0)
-    # Fixed mode: convert dollar amount to shares
-    if price > 0:
-        return trader.fixed_amount / price
-    return trader.fixed_amount
+        raw = original_size * (trader.proportional_pct / 100.0)
+    elif price > 0:
+        raw = trader.fixed_amount / price
+    else:
+        raw = trader.fixed_amount
+    return _snap_size_for_clob(raw, price)
 
 
 def _get_clob_client():
@@ -644,7 +660,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                         order_args = OrderArgs(
                             token_id=token_id,
                             price=attempt_price,
-                            size=round(total_net, 4),
+                            size=_snap_size_for_clob(total_net, attempt_price),
                             side=_SELL,
                         )
                         signed_order = client.create_order(order_args)
@@ -925,7 +941,7 @@ def execute_copy_trade(
             order_args = OrderArgs(
                 token_id=trade["token_id"],
                 price=round(order_price, 4),
-                size=round(copy_size, 4),
+                size=_snap_size_for_clob(copy_size, order_price),
                 side=side,
             )
             signed_order = client.create_order(order_args)
@@ -979,7 +995,7 @@ def execute_copy_trade(
                             fok_args = OrderArgs(
                                 token_id=trade["token_id"],
                                 price=round(fallback_price, 4),
-                                size=round(copy_size, 4),
+                                size=_snap_size_for_clob(copy_size, fallback_price),
                                 side=side,
                             )
                             signed_fok = client.create_order(fok_args)
