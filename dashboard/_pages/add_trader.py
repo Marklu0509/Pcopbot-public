@@ -81,7 +81,7 @@ def render() -> None:
         st.markdown("##### Sizing")
         sizing_mode = st.selectbox("Sizing mode", ["fixed", "proportional"])
         fixed_amount = st.number_input("Fixed amount ($)", value=50.0, min_value=0.0)
-        proportional_pct = st.number_input("Copy Percentage (%)", value=100.0, min_value=0.0, max_value=100.0)
+        proportional_pct = st.number_input("Copy Percentage (%)", value=100.0, min_value=0.0, max_value=100.0, step=0.001, format="%.4f")
 
         st.markdown("##### Buy Settings")
         buy_order_type = st.selectbox(

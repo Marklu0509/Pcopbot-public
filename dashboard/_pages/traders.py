@@ -514,7 +514,7 @@ def _render_trader_detail(t) -> None:
 
     # ── Summary metrics ──
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Copy %/$", f"{t.proportional_pct:.0f}%" if t.sizing_mode == "proportional" else f"${t.fixed_amount:.2f}")
+    c1.metric("Copy %/$", f"{t.proportional_pct:g}%" if t.sizing_mode == "proportional" else f"${t.fixed_amount:.2f}")
     _buy_ot = getattr(t, 'buy_order_type', 'market') or 'market'
     if _buy_ot == "limit":
         _buy_off = getattr(t, 'buy_price_offset_pct', 1.0) or 1.0
@@ -575,7 +575,7 @@ def _render_trader_detail(t) -> None:
                 key=f"sm_{t.id}",
             )
             fixed_amount = st.number_input("Fixed amount ($)", value=t.fixed_amount, min_value=0.0, key=f"fa_{t.id}")
-            proportional_pct = st.number_input("Copy Percentage (%)", value=t.proportional_pct, min_value=0.0, max_value=100.0, key=f"pp_{t.id}")
+            proportional_pct = st.number_input("Copy Percentage (%)", value=t.proportional_pct, min_value=0.0, max_value=100.0, step=0.001, format="%.4f", key=f"pp_{t.id}")
 
             st.markdown("##### Buy Settings")
             buy_order_type = st.selectbox(
