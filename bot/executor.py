@@ -231,10 +231,14 @@ def _get_avg_buy_price(
     return 0.0
 
 
-def _snap_sell_size(size: float) -> float:
-    """Round SELL size to 2 decimal places (matching py_clob_client behavior)."""
+def _snap_size_2dp(size: float) -> float:
+    """Floor size to 2 decimal places (CLOB taker_amount precision for limit orders and sells)."""
     from math import floor
     return floor(size * 100) / 100 if size > 0 else 0.0
+
+
+# Backward-compatible alias
+_snap_sell_size = _snap_size_2dp
 
 
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
@@ -962,8 +966,6 @@ def execute_copy_trade(
             ot = OrderType.FOK if order_type_str == "market" else OrderType.GTC
 
             if trade["side"] == "BUY":
-                # Use MarketOrderArgs: pass USDC amount directly so
-                # py_clob_client handles maker_amount precision cleanly.
                 buy_amount = _calculate_buy_amount(trader, trade["size"], expected_price)
                 logger.info(
                     "copy_calc: BUY order → buy_amount=$%.2f order_price=%.4f order_type=%s",
@@ -972,13 +974,28 @@ def execute_copy_trade(
                 # Update copy_size to reflect actual shares from USDC amount
                 if order_price > 0:
                     copy_size = buy_amount / order_price
-                mkt_args = MarketOrderArgs(
-                    token_id=trade["token_id"],
-                    amount=buy_amount,
-                    price=round(order_price, 4),
-                    side=side,
-                )
-                signed_order = client.create_market_order(mkt_args)
+
+                if order_type_str == "market":
+                    # FOK market order: maker(USDC)≤2dp, taker(shares)≤4dp
+                    # MarketOrderArgs passes USDC directly, library handles precision.
+                    mkt_args = MarketOrderArgs(
+                        token_id=trade["token_id"],
+                        amount=buy_amount,
+                        price=round(order_price, 4),
+                        side=side,
+                    )
+                    signed_order = client.create_market_order(mkt_args)
+                else:
+                    # GTC limit order: maker(USDC)≤4dp, taker(shares)≤2dp
+                    # Must use OrderArgs with size floored to 2dp.
+                    limit_size = _snap_size_2dp(copy_size)
+                    order_args = OrderArgs(
+                        token_id=trade["token_id"],
+                        price=round(order_price, 4),
+                        size=limit_size,
+                        side=side,
+                    )
+                    signed_order = client.create_order(order_args)
             else:
                 order_args = OrderArgs(
                     token_id=trade["token_id"],
