@@ -231,39 +231,10 @@ def _get_avg_buy_price(
     return 0.0
 
 
-def _snap_size_for_clob(size: float, price: float, side: str = "BUY") -> float:
-    """Adjust size for Polymarket CLOB decimal precision requirements.
-
-    py_clob_client internally rounds size to 2 decimal places.
-    For BUY orders, maker_amount = size * price (USDC) must have <= 2 decimals.
-    We find the largest valid size (2dp) where this holds.
-
-    For SELL orders, maker_amount = size (shares), so 2dp rounding suffices.
-    """
-    from math import floor, gcd
-
-    if size <= 0:
-        return 0.0
-
-    # Library always rounds size to 2dp — match that behavior
-    size_2dp = floor(size * 100) / 100
-
-    if side != "BUY" or price <= 0:
-        return size_2dp
-
-    # BUY: need size_2dp * price_4dp to have <= 2 decimal places.
-    # size = n/100, price = m/10000 → maker = n*m / 1_000_000
-    # For maker to have <= 2dp: n*m must be divisible by 10_000.
-    price_int = round(price * 10_000)
-    g = gcd(price_int, 10_000)
-    size_step = 10_000 // g  # n must be a multiple of this
-
-    n = int(size * 100)
-    valid_n = (n // size_step) * size_step
-    if valid_n <= 0:
-        valid_n = size_step  # at least one step
-
-    return valid_n / 100.0
+def _snap_sell_size(size: float) -> float:
+    """Round SELL size to 2 decimal places (matching py_clob_client behavior)."""
+    from math import floor
+    return floor(size * 100) / 100 if size > 0 else 0.0
 
 
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
@@ -278,7 +249,22 @@ def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> 
         raw = trader.fixed_amount / price
     else:
         raw = trader.fixed_amount
-    return _snap_size_for_clob(raw, price, side="BUY")
+    return raw
+
+
+def _calculate_buy_amount(trader: Trader, original_size: float, price: float) -> float:
+    """Calculate USDC amount for a BUY order (used with MarketOrderArgs).
+
+    Fixed mode:  use the dollar budget directly.
+    Proportional mode: match the original trade's dollar value proportionally.
+    """
+    from math import floor
+    if trader.sizing_mode == "proportional":
+        raw = original_size * price * (trader.proportional_pct / 100.0)
+    else:
+        raw = trader.fixed_amount
+    # Floor to 2 decimals — py_clob_client will also round_down to 2dp
+    return floor(raw * 100) / 100
 
 
 def _get_clob_client():
@@ -680,7 +666,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                         order_args = OrderArgs(
                             token_id=token_id,
                             price=attempt_price,
-                            size=_snap_size_for_clob(total_net, attempt_price, side="SELL"),
+                            size=_snap_sell_size(total_net),
                             side=_SELL,
                         )
                         signed_order = client.create_order(order_args)
@@ -837,7 +823,7 @@ def execute_copy_trade(
 
     Returns the persisted CopyTrade record.
     """
-    from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+    from py_clob_client.clob_types import OrderArgs, MarketOrderArgs, OrderType  # type: ignore
     from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
 
     expected_price = trade["price"]
@@ -958,13 +944,29 @@ def execute_copy_trade(
                 client = _get_clob_client()
             side = BUY if trade["side"] == "BUY" else SELL
             ot = OrderType.FOK if order_type_str == "market" else OrderType.GTC
-            order_args = OrderArgs(
-                token_id=trade["token_id"],
-                price=round(order_price, 4),
-                size=_snap_size_for_clob(copy_size, order_price, side=trade["side"]),
-                side=side,
-            )
-            signed_order = client.create_order(order_args)
+
+            if trade["side"] == "BUY":
+                # Use MarketOrderArgs: pass USDC amount directly so
+                # py_clob_client handles maker_amount precision cleanly.
+                buy_amount = _calculate_buy_amount(trader, trade["size"], expected_price)
+                # Update copy_size to reflect actual shares from USDC amount
+                if order_price > 0:
+                    copy_size = buy_amount / order_price
+                mkt_args = MarketOrderArgs(
+                    token_id=trade["token_id"],
+                    amount=buy_amount,
+                    price=round(order_price, 4),
+                    side=side,
+                )
+                signed_order = client.create_market_order(mkt_args)
+            else:
+                order_args = OrderArgs(
+                    token_id=trade["token_id"],
+                    price=round(order_price, 4),
+                    size=_snap_sell_size(copy_size),
+                    side=side,
+                )
+                signed_order = client.create_order(order_args)
             resp = client.post_order(signed_order, ot)
             order_id = str(resp.get("orderID") or resp.get("order_id") or "")
 
@@ -1012,13 +1014,23 @@ def execute_copy_trade(
                         fallback_price = _apply_slippage(expected_price, trade["side"], slippage_pct)
                         logger.info("Falling back to FOK market order for trader %s", trader.wallet_address)
                         try:
-                            fok_args = OrderArgs(
-                                token_id=trade["token_id"],
-                                price=round(fallback_price, 4),
-                                size=_snap_size_for_clob(copy_size, fallback_price, side=trade["side"]),
-                                side=side,
-                            )
-                            signed_fok = client.create_order(fok_args)
+                            if trade["side"] == "BUY":
+                                fok_buy_amt = _calculate_buy_amount(trader, trade["size"], expected_price)
+                                fok_mkt = MarketOrderArgs(
+                                    token_id=trade["token_id"],
+                                    amount=fok_buy_amt,
+                                    price=round(fallback_price, 4),
+                                    side=side,
+                                )
+                                signed_fok = client.create_market_order(fok_mkt)
+                            else:
+                                fok_args = OrderArgs(
+                                    token_id=trade["token_id"],
+                                    price=round(fallback_price, 4),
+                                    size=_snap_sell_size(copy_size),
+                                    side=side,
+                                )
+                                signed_fok = client.create_order(fok_args)
                             fok_resp = client.post_order(signed_fok, OrderType.FOK)
                             order_id = str(fok_resp.get("orderID") or fok_resp.get("order_id") or "")
                             status = "success"
@@ -1058,6 +1070,11 @@ def execute_copy_trade(
                 exc,
             )
     elif rejection is None and dry_run:
+        if trade["side"] == "BUY" and expected_price > 0:
+            buy_amount = _calculate_buy_amount(trader, trade["size"], expected_price)
+            copy_size = buy_amount / expected_price
+        elif trade["side"] == "SELL":
+            copy_size = _snap_sell_size(copy_size)
         logger.info(
             "[DRY RUN] Would copy trade for trader %s: market=%s side=%s size=%.4f "
             "price=%.4f (limit=%.4f, slippage=%.1f%%) order_type=%s",
