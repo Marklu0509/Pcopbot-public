@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from math import floor as _floor
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -233,8 +234,7 @@ def _get_avg_buy_price(
 
 def _snap_size_2dp(size: float) -> float:
     """Floor size to 2 decimal places (CLOB taker_amount precision for limit orders and sells)."""
-    from math import floor
-    return floor(size * 100) / 100 if size > 0 else 0.0
+    return _floor(size * 100) / 100 if size > 0 else 0.0
 
 
 # Backward-compatible alias
@@ -262,13 +262,12 @@ def _calculate_buy_amount(trader: Trader, original_size: float, price: float) ->
     Fixed mode:  use the dollar budget directly.
     Proportional mode: match the original trade's dollar value proportionally.
     """
-    from math import floor
     if trader.sizing_mode == "proportional":
         raw = original_size * price * (trader.proportional_pct / 100.0)
     else:
         raw = trader.fixed_amount
     # Floor to 2 decimals — py_clob_client will also round_down to 2dp
-    return floor(raw * 100) / 100
+    return _floor(raw * 100) / 100
 
 
 def _get_clob_client():
@@ -966,14 +965,13 @@ def execute_copy_trade(
             ot = OrderType.FOK if order_type_str == "market" else OrderType.GTC
 
             if trade["side"] == "BUY":
-                buy_amount = _calculate_buy_amount(trader, trade["size"], expected_price)
+                # Derive buy_amount from risk-adjusted copy_size (not from scratch)
+                # so that buy_at_min bumps and cap adjustments are honored.
+                buy_amount = _floor(copy_size * order_price * 100) / 100
                 logger.info(
                     "copy_calc: BUY order → buy_amount=$%.2f order_price=%.4f order_type=%s",
                     buy_amount, order_price, order_type_str,
                 )
-                # Update copy_size to reflect actual shares from USDC amount
-                if order_price > 0:
-                    copy_size = buy_amount / order_price
 
                 if order_type_str == "market":
                     # FOK market order: maker(USDC)≤2dp, taker(shares)≤4dp
@@ -1052,7 +1050,8 @@ def execute_copy_trade(
                         logger.info("Falling back to FOK market order for trader %s", trader.wallet_address)
                         try:
                             if trade["side"] == "BUY":
-                                fok_buy_amt = _calculate_buy_amount(trader, trade["size"], expected_price)
+                                # Derive from risk-adjusted copy_size, not recalculated
+                                fok_buy_amt = _floor(copy_size * fallback_price * 100) / 100
                                 fok_mkt = MarketOrderArgs(
                                     token_id=trade["token_id"],
                                     amount=fok_buy_amt,
@@ -1107,9 +1106,9 @@ def execute_copy_trade(
                 exc,
             )
     elif rejection is None and dry_run:
-        if trade["side"] == "BUY" and expected_price > 0:
-            buy_amount = _calculate_buy_amount(trader, trade["size"], expected_price)
-            copy_size = buy_amount / expected_price
+        if trade["side"] == "BUY":
+            # copy_size already adjusted by cap_and_check; just snap for display
+            pass
         elif trade["side"] == "SELL":
             copy_size = _snap_sell_size(copy_size)
         logger.info(
