@@ -827,7 +827,17 @@ def execute_copy_trade(
     from py_clob_client.order_builder.constants import BUY, SELL  # type: ignore
 
     expected_price = trade["price"]
+    orig_value = trade["size"] * expected_price
     copy_size = _calculate_copy_size(trader, trade["size"], expected_price)
+
+    logger.info(
+        "copy_calc: trader=%s side=%s orig_shares=%.4f orig_price=%.4f orig_value=$%.2f "
+        "mode=%s pct=%.4f%% fixed=$%.2f → copy_shares=%.4f",
+        trader.wallet_address[:12], trade["side"],
+        trade["size"], expected_price, orig_value,
+        trader.sizing_mode, trader.proportional_pct, trader.fixed_amount,
+        copy_size,
+    )
 
     # Resolve per-trader dry_run mode
     dry_run = is_trader_dry_run(trader, session)
@@ -934,6 +944,12 @@ def execute_copy_trade(
         order_price=order_price if trade["side"] == "BUY" else None,
     )
 
+    if copy_size != _calculate_copy_size(trader, trade["size"], expected_price):
+        logger.info(
+            "copy_calc: risk cap adjusted copy_shares=%.4f (was %.4f) rejection=%s",
+            copy_size, _calculate_copy_size(trader, trade["size"], expected_price), rejection,
+        )
+
     status = rejection or ("dry_run" if dry_run else "pending")
     order_id: str | None = None
     error_msg: str | None = None
@@ -949,6 +965,10 @@ def execute_copy_trade(
                 # Use MarketOrderArgs: pass USDC amount directly so
                 # py_clob_client handles maker_amount precision cleanly.
                 buy_amount = _calculate_buy_amount(trader, trade["size"], expected_price)
+                logger.info(
+                    "copy_calc: BUY order → buy_amount=$%.2f order_price=%.4f order_type=%s",
+                    buy_amount, order_price, order_type_str,
+                )
                 # Update copy_size to reflect actual shares from USDC amount
                 if order_price > 0:
                     copy_size = buy_amount / order_price
@@ -1110,6 +1130,15 @@ def execute_copy_trade(
     if trade["side"] == "SELL" and status in ("success", "dry_run") and copy_size > 0:
         avg_buy = _get_avg_buy_price(session, trader.id, trade["token_id"], status_filter=mode_status)
         realized_pnl = round((recorded_price - avg_buy) * copy_size, 4)
+
+    copy_value = copy_size * recorded_price
+    logger.info(
+        "copy_result: side=%s status=%s copy_shares=%.4f copy_price=%.4f "
+        "copy_value=$%.2f orig_value=$%.2f ratio=%.4f%%",
+        trade["side"], status, copy_size, recorded_price,
+        copy_value, orig_value,
+        (copy_value / orig_value * 100) if orig_value > 0 else 0,
+    )
 
     copy_trade = CopyTrade(
         trader_id=trader.id,
