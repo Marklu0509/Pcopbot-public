@@ -231,19 +231,39 @@ def _get_avg_buy_price(
     return 0.0
 
 
-def _snap_size_for_clob(size: float, price: float) -> float:
-    """Round size so that maker_amount (size * price) has at most 2 decimals.
+def _snap_size_for_clob(size: float, price: float, side: str = "BUY") -> float:
+    """Adjust size for Polymarket CLOB decimal precision requirements.
 
-    Polymarket CLOB requires:
-      - maker amount (USDC): max 2 decimal places
-      - taker amount (shares): max 4 decimal places
+    py_clob_client internally rounds size to 2 decimal places.
+    For BUY orders, maker_amount = size * price (USDC) must have <= 2 decimals.
+    We find the largest valid size (2dp) where this holds.
+
+    For SELL orders, maker_amount = size (shares), so 2dp rounding suffices.
     """
-    size = round(size, 4)  # taker amount: max 4 decimals
-    if price > 0:
-        # Ensure size * price rounds cleanly to 2 decimals
-        maker = round(size * price, 2)
-        size = round(maker / price, 4)
-    return size
+    from math import floor, gcd
+
+    if size <= 0:
+        return 0.0
+
+    # Library always rounds size to 2dp — match that behavior
+    size_2dp = floor(size * 100) / 100
+
+    if side != "BUY" or price <= 0:
+        return size_2dp
+
+    # BUY: need size_2dp * price_4dp to have <= 2 decimal places.
+    # size = n/100, price = m/10000 → maker = n*m / 1_000_000
+    # For maker to have <= 2dp: n*m must be divisible by 10_000.
+    price_int = round(price * 10_000)
+    g = gcd(price_int, 10_000)
+    size_step = 10_000 // g  # n must be a multiple of this
+
+    n = int(size * 100)
+    valid_n = (n // size_step) * size_step
+    if valid_n <= 0:
+        valid_n = size_step  # at least one step
+
+    return valid_n / 100.0
 
 
 def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> float:
@@ -258,7 +278,7 @@ def _calculate_copy_size(trader: Trader, original_size: float, price: float) -> 
         raw = trader.fixed_amount / price
     else:
         raw = trader.fixed_amount
-    return _snap_size_for_clob(raw, price)
+    return _snap_size_for_clob(raw, price, side="BUY")
 
 
 def _get_clob_client():
@@ -660,7 +680,7 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                         order_args = OrderArgs(
                             token_id=token_id,
                             price=attempt_price,
-                            size=_snap_size_for_clob(total_net, attempt_price),
+                            size=_snap_size_for_clob(total_net, attempt_price, side="SELL"),
                             side=_SELL,
                         )
                         signed_order = client.create_order(order_args)
@@ -941,7 +961,7 @@ def execute_copy_trade(
             order_args = OrderArgs(
                 token_id=trade["token_id"],
                 price=round(order_price, 4),
-                size=_snap_size_for_clob(copy_size, order_price),
+                size=_snap_size_for_clob(copy_size, order_price, side=trade["side"]),
                 side=side,
             )
             signed_order = client.create_order(order_args)
@@ -995,7 +1015,7 @@ def execute_copy_trade(
                             fok_args = OrderArgs(
                                 token_id=trade["token_id"],
                                 price=round(fallback_price, 4),
-                                size=_snap_size_for_clob(copy_size, fallback_price),
+                                size=_snap_size_for_clob(copy_size, fallback_price, side=trade["side"]),
                                 side=side,
                             )
                             signed_fok = client.create_order(fok_args)
