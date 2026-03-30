@@ -310,6 +310,7 @@ def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = Non
                 CopyTrade.copy_size,
                 CopyTrade.copy_price,
                 CopyTrade.pnl,
+                CopyTrade.executed_at,
             )
             .filter(
                 CopyTrade.trader_id == trader_id,
@@ -321,7 +322,7 @@ def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = Non
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL"])
+    df = pd.DataFrame(rows, columns=["Market", "Outcome", "ConditionId", "TokenId", "Side", "Size", "Price", "PnL", "ExecutedAt"])
 
     holdings: list[dict] = []
     for (market, outcome, cid), group in df.groupby(["Market", "Outcome", "ConditionId"]):
@@ -337,6 +338,7 @@ def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = Non
         )
         token_id = buy_rows["TokenId"].iloc[0] if not buy_rows.empty else ""
         cost_basis = avg_price * net_size
+        last_trade = group["ExecutedAt"].dropna().max()
         holdings.append({
             "Market": market,
             "Outcome": outcome,
@@ -347,6 +349,7 @@ def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = Non
             "Value": 0.0,
             "Unrealized": 0.0,
             "Change %": 0.0,
+            "Last Trade": last_trade,
             "Trades": len(group),
             "_token_id": token_id,  # internal, hidden in display
             "_condition_id": cid,   # internal, for mark-as-sold
@@ -464,7 +467,7 @@ def _load_realized_pnl(
             .all()
         )
     empty_cols = ["Market", "Outcome", "Sold Position", "Avg Buy Price", "Avg Sell Price",
-                  "Total Cost", "Revenue", "Realized PnL", "ROI %"]
+                  "Total Cost", "Revenue", "Realized PnL", "ROI %", "Last Sell"]
     if not rows:
         return pd.DataFrame(columns=empty_cols)
 
@@ -487,6 +490,7 @@ def _load_realized_pnl(
         total_cost = avg_buy * sell_size
         realized_pnl = sell_value - total_cost
         roi = (realized_pnl / total_cost * 100) if total_cost > 0 else 0
+        last_sell = sells["ExecutedAt"].dropna().max()
         realized.append({
             "Market": market,
             "Outcome": outcome,
@@ -497,6 +501,7 @@ def _load_realized_pnl(
             "Revenue": round(sell_value, 2),
             "Realized PnL": round(realized_pnl, 2),
             "ROI %": round(roi, 1),
+            "Last Sell": last_sell,
         })
     if not realized:
         return pd.DataFrame(columns=empty_cols)
@@ -819,6 +824,7 @@ def _render_trader_detail(t) -> None:
         "Value": st.column_config.NumberColumn(format="$%.2f"),
         "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
         "Change %": st.column_config.NumberColumn(format="%.1f%%"),
+        "Last Trade": st.column_config.DatetimeColumn(format="MM/DD HH:mm"),
     }
     _hidden_cols = ["_token_id", "_condition_id"]
 
@@ -960,6 +966,7 @@ def _render_trader_detail(t) -> None:
                 "Avg Buy Price": st.column_config.NumberColumn(format="$%.4f"),
                 "Avg Sell Price": st.column_config.NumberColumn(format="$%.4f"),
                 "ROI %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Last Sell": st.column_config.DatetimeColumn(format="MM/DD HH:mm"),
             },
         )
 
