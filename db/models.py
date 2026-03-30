@@ -45,6 +45,11 @@ class Trader(Base):
     tp_pct = Column(Float, default=0.0)
     sl_pct = Column(Float, default=0.0)
 
+    # Tiered take-profit rules (JSON string, e.g.
+    # [{"max_entry": 0.30, "target": 0.80}, {"max_entry": 1.00, "target": 0.90}])
+    # Empty string or null = disabled (falls back to tp_pct if set).
+    tp_rules = Column(String, default="")
+
     # "Below Min Limit, Buy at Min" toggle
     buy_at_min = Column(Boolean, default=True)
 

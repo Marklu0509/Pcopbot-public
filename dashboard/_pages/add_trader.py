@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import re
 
@@ -96,6 +97,40 @@ def render() -> None:
         tp_pct = st.number_input("TP % (0 = disabled)", value=0.0, min_value=0.0)
         sl_pct = st.number_input("SL % (0 = disabled)", value=0.0, min_value=0.0)
 
+        st.markdown("##### Tiered Take-Profit Rules")
+        st.caption(
+            "Set price-based TP targets by entry price tier. "
+            "When market price hits the target, the bot sells automatically. "
+            "Overrides TP% above when configured."
+        )
+        _tp_entries: list[tuple[float, float]] = []
+        for i in range(3):
+            _rc1, _rc2 = st.columns(2)
+            with _rc1:
+                _me = st.number_input(
+                    f"Max Entry Price (row {i+1})",
+                    value=0.0, min_value=0.0, max_value=1.0,
+                    step=0.01, format="%.2f",
+                    key=f"new_tpr_me_{i}",
+                )
+            with _rc2:
+                _tgt = st.number_input(
+                    f"Sell Target (row {i+1})",
+                    value=0.0, min_value=0.0, max_value=1.0,
+                    step=0.01, format="%.2f",
+                    key=f"new_tpr_tg_{i}",
+                )
+            _tp_entries.append((_me, _tgt))
+        _partial = [(me, tgt) for me, tgt in _tp_entries if (me > 0) != (tgt > 0)]
+        if _partial:
+            st.warning(f"{len(_partial)} row(s) ignored: set both Max Entry Price and Sell Target.")
+        _tp_rules_list = [
+            {"max_entry": me, "target": tgt}
+            for me, tgt in _tp_entries
+            if me > 0 and tgt > 0
+        ]
+        tp_rules = _json.dumps(_tp_rules_list) if _tp_rules_list else ""
+
         st.markdown("##### Filters")
         ignore_trades_under = st.number_input("Ignore Target Wallet Trades Under ($)", value=0.0, min_value=0.0)
         buy_agg_window_seconds = st.number_input(
@@ -153,6 +188,7 @@ def render() -> None:
                         "buy_at_min": buy_at_min,
                         "tp_pct": tp_pct,
                         "sl_pct": sl_pct,
+                        "tp_rules": tp_rules,
                         "ignore_trades_under": ignore_trades_under,
                         "buy_agg_window_seconds": buy_agg_window_seconds,
                         "sell_agg_window_seconds": sell_agg_window_seconds,

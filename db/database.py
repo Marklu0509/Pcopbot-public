@@ -59,6 +59,7 @@ def init_db() -> None:
             "ALTER TABLE traders ADD COLUMN sell_agg_window_seconds INTEGER DEFAULT 0",
             "ALTER TABLE copy_trades ADD COLUMN agg_fill_count INTEGER",
             "ALTER TABLE copy_trades ADD COLUMN agg_total_value FLOAT",
+            "ALTER TABLE traders ADD COLUMN tp_rules VARCHAR DEFAULT ''",
         ]:
             try:
                 conn.execute(text(stmt))

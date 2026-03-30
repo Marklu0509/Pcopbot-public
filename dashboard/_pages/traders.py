@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -521,7 +522,11 @@ def _render_trader_detail(t) -> None:
         c2.metric("Buy Order", f"LIMIT (+{_buy_off:.1f}%)")
     else:
         c2.metric("Buy Order", f"FOK ({t.buy_slippage:.0f}%)")
-    c3.metric("TP", f"{t.tp_pct:.1f}%" if t.tp_pct else "—")
+    _tp_rules_raw = getattr(t, "tp_rules", "") or ""
+    if _tp_rules_raw.strip():
+        c3.metric("TP", "Rules")
+    else:
+        c3.metric("TP", f"{t.tp_pct:.1f}%" if t.tp_pct else "—")
     c4.metric("SL", f"{t.sl_pct:.1f}%" if t.sl_pct else "—")
 
     c5, c6, c7, c8 = st.columns(4)
@@ -603,6 +608,55 @@ def _render_trader_detail(t) -> None:
             st.markdown("##### Take-Profit / Stop-Loss")
             tp_pct = st.number_input("TP % (0 = disabled)", value=t.tp_pct, min_value=0.0, key=f"tp_{t.id}")
             sl_pct = st.number_input("SL % (0 = disabled)", value=t.sl_pct, min_value=0.0, key=f"sl_{t.id}")
+
+            st.markdown("##### Tiered Take-Profit Rules")
+            st.caption(
+                "Set price-based TP targets by entry price tier. "
+                "When market price hits the target, the bot sells automatically. "
+                "Overrides TP% above when configured."
+            )
+            _cur_tp_rules = getattr(t, "tp_rules", "") or ""
+            # Parse existing rules for the UI
+            _existing_rules: list[dict] = []
+            if _cur_tp_rules.strip():
+                try:
+                    _existing_rules = _json.loads(_cur_tp_rules)
+                except Exception:
+                    _existing_rules = []
+
+            # Default 3 rows, cap at 10 to prevent UI bloat
+            _num_rows = max(min(len(_existing_rules), 10), 3)
+            _tp_entries: list[tuple[float, float]] = []
+            for i in range(_num_rows):
+                _rc1, _rc2 = st.columns(2)
+                _def_entry = _existing_rules[i]["max_entry"] if i < len(_existing_rules) else 0.0
+                _def_target = _existing_rules[i]["target"] if i < len(_existing_rules) else 0.0
+                with _rc1:
+                    _me = st.number_input(
+                        f"Max Entry Price (row {i+1})",
+                        value=_def_entry, min_value=0.0, max_value=1.0,
+                        step=0.01, format="%.2f",
+                        key=f"tpr_me_{t.id}_{i}",
+                    )
+                with _rc2:
+                    _tgt = st.number_input(
+                        f"Sell Target (row {i+1})",
+                        value=_def_target, min_value=0.0, max_value=1.0,
+                        step=0.01, format="%.2f",
+                        key=f"tpr_tg_{t.id}_{i}",
+                    )
+                _tp_entries.append((_me, _tgt))
+            # Warn about partial rows (only one field set)
+            _partial = [(me, tgt) for me, tgt in _tp_entries if (me > 0) != (tgt > 0)]
+            if _partial:
+                st.warning(f"{len(_partial)} row(s) ignored: set both Max Entry Price and Sell Target.")
+            # Build JSON from non-zero rows
+            _tp_rules_list = [
+                {"max_entry": me, "target": tgt}
+                for me, tgt in _tp_entries
+                if me > 0 and tgt > 0
+            ]
+            tp_rules = _json.dumps(_tp_rules_list) if _tp_rules_list else ""
 
             st.markdown("##### Filters")
             ignore_trades_under = st.number_input("Ignore Target Wallet Trades Under ($)", value=t.ignore_trades_under, min_value=0.0, key=f"itu_{t.id}")
@@ -702,6 +756,7 @@ def _render_trader_detail(t) -> None:
                         "buy_at_min": buy_at_min,
                         "tp_pct": tp_pct,
                         "sl_pct": sl_pct,
+                        "tp_rules": tp_rules,
                         "ignore_trades_under": ignore_trades_under,
                         "buy_agg_window_seconds": buy_agg_window_seconds,
                         "sell_agg_window_seconds": sell_agg_window_seconds,

@@ -206,20 +206,35 @@ def _refresh_copy_trade_fill_prices(session) -> None:
             tid = raw.get("asset") or raw.get("asset_id") or ""
             price = float(raw.get("price", 0) or 0)
             ts = float(raw.get("timestamp", 0) or 0)
+            size = float(raw.get("size", 0) or raw.get("shares", 0) or 0)
             if tid and price > 0 and ts > 0:
-                m[tid].append((ts, price))
+                m[tid].append((ts, price, size))
         return m
 
     def _match(act_map: dict, ct) -> float | None:
+        """Match a CopyTrade to a Data API activity entry.
+
+        Uses token_id + timestamp (within 120s) + size (within 20%) to
+        avoid matching manual trades that happen to be on the same token.
+        """
         candidates = act_map.get(ct.original_token_id, [])
         ct_ts = ct.executed_at.timestamp() if ct.executed_at else 0.0
+        ct_size = ct.copy_size or 0.0
         best_price, best_diff = None, float("inf")
-        for ts, price in candidates:
+        for ts, price, size in candidates:
             diff = abs(ts - ct_ts)
+            if diff >= 120:
+                continue
+            # Size filter: skip if sizes differ by more than 20%
+            # (catches manual buys at different sizes)
+            if ct_size > 0 and size > 0:
+                size_ratio = abs(size - ct_size) / ct_size
+                if size_ratio > 0.20:
+                    continue
             if diff < best_diff:
                 best_diff = diff
                 best_price = price
-        return best_price if best_price is not None and best_diff < 600 else None
+        return best_price
 
     buy_map = _build_map("BUY")
     sell_map = _build_map("SELL")
@@ -565,6 +580,16 @@ def run() -> None:
                         logger.info("Auto-sold %d winning position(s) at threshold.", sold)
                 except Exception as exc:
                     logger.error("Error during auto-sell: %s", exc)
+
+            # Tiered take-profit: check every 5 poll cycles to reduce API load
+            if _poll_count % 5 == 0:
+                try:
+                    from bot.executor import take_profit_monitor
+                    tp_sold = take_profit_monitor(session)
+                    if tp_sold:
+                        logger.info("Take-profit sold %d position(s).", tp_sold)
+                except Exception as exc:
+                    logger.error("Error during take-profit monitor: %s", exc)
 
             # Auto-redeem resolved winning positions every 20 poll cycles
             if _poll_count % 20 == 0:

@@ -1,6 +1,7 @@
 """Executes copy trades via py_clob_client (or logs them in dry-run mode)."""
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -408,39 +409,103 @@ def _to_float_or_none(value) -> float | None:
         return None
 
 
-def _get_filled_price(client, order_id: str, fallback_price: float) -> float:
+def _get_filled_price(
+    client,
+    order_id: str,
+    fallback_price: float,
+    *,
+    token_id: str = "",
+    side: str = "",
+) -> float:
     """Fetch actual filled/average price from order details.
 
-    Returns fallback_price when order details are unavailable or don't contain
-    a usable fill/average price.
+    Lookup chain:
+    1. CLOB ``get_order`` (works for GTC, usually gone for FOK)
+    2. Data API ``/activity`` on the funder wallet (matches by token_id +
+       side within a 60-second window of *now*)
+    3. *fallback_price* (caller should pass ``expected_price``, NOT the
+       slippage-adjusted order price)
     """
-    if not order_id:
-        return fallback_price
-    try:
-        order = client.get_order(order_id)
-        if isinstance(order, dict):
-            candidates = [
-                order.get("avgPrice"),
-                order.get("averagePrice"),
-                order.get("filledAvgPrice"),
-                order.get("price"),
-            ]
-        else:
-            candidates = [
-                getattr(order, "avgPrice", None),
-                getattr(order, "averagePrice", None),
-                getattr(order, "filledAvgPrice", None),
-                getattr(order, "price", None),
-            ]
+    # --- 1. CLOB get_order ---
+    if order_id:
+        try:
+            order = client.get_order(order_id)
+            if isinstance(order, dict):
+                candidates = [
+                    order.get("avgPrice"),
+                    order.get("averagePrice"),
+                    order.get("filledAvgPrice"),
+                    order.get("price"),
+                ]
+            else:
+                candidates = [
+                    getattr(order, "avgPrice", None),
+                    getattr(order, "averagePrice", None),
+                    getattr(order, "filledAvgPrice", None),
+                    getattr(order, "price", None),
+                ]
 
-        for raw in candidates:
-            parsed = _to_float_or_none(raw)
-            if parsed is not None:
-                return parsed
-    except Exception as exc:
-        logger.warning("Could not fetch filled price for order %s: %s", order_id, exc)
+            for raw in candidates:
+                parsed = _to_float_or_none(raw)
+                if parsed is not None:
+                    return parsed
+        except Exception as exc:
+            logger.warning("Could not fetch filled price for order %s: %s", order_id, exc)
+
+    # --- 2. Data API activity fallback ---
+    if token_id and side:
+        filled = _query_activity_fill_price(token_id, side)
+        if filled is not None:
+            return filled
 
     return fallback_price
+
+
+def _query_activity_fill_price(
+    token_id: str, side: str, window_seconds: int = 60
+) -> float | None:
+    """Query funder wallet activity for a recent fill matching *token_id* + *side*.
+
+    Returns the price of the closest matching trade within *window_seconds*
+    of now, or ``None`` if no match is found.
+    """
+    from bot import tracker
+
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if not funder:
+        return None
+
+    try:
+        activity = tracker.fetch_trades(funder, limit=50)
+    except Exception as exc:
+        logger.warning("Activity fill-price query failed: %s", exc)
+        return None
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    best_price: float | None = None
+    best_diff = float("inf")
+
+    for raw in activity:
+        if (raw.get("side") or "").upper() != side.upper():
+            continue
+        tid = raw.get("asset") or raw.get("asset_id") or ""
+        if tid != token_id:
+            continue
+        price = float(raw.get("price", 0) or 0)
+        ts = float(raw.get("timestamp", 0) or 0)
+        if price <= 0 or ts <= 0:
+            continue
+        diff = abs(now_ts - ts)
+        if diff < best_diff and diff <= window_seconds:
+            best_diff = diff
+            best_price = price
+
+    if best_price is not None:
+        logger.info(
+            "Resolved fill price from Data API activity: token=%s side=%s price=%.4f",
+            token_id[:16], side, best_price,
+        )
+    return best_price
 
 
 def auto_sell_winning_positions(session: Session, threshold: float | None = None) -> int:
@@ -697,7 +762,10 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                             last_exc = Exception("FOK not filled")
                             continue
 
-                        recorded_price = _get_filled_price(client, order_id, attempt_price)
+                        recorded_price = _get_filled_price(
+                            client, order_id, attempt_price,
+                            token_id=token_id, side="SELL",
+                        )
                         live_sell_ok = True
                         logger.info(
                             "auto_sell SUCCESS: token=%s size=%.4f price=%.4f filled=%.4f order_id=%s",
@@ -813,6 +881,322 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
                 )
             session.commit()
             sold += 1
+
+    return sold
+
+
+# ── Tiered Take-Profit ────────────────────────────────────────────────
+_TP_COOLDOWN = 30  # seconds between TP attempts per token
+_tp_last_attempt: dict[str, float] = {}
+
+
+def _parse_tp_rules(raw: str | None) -> list[dict[str, float]]:
+    """Parse tp_rules JSON string into sorted list of {max_entry, target}."""
+    if not raw or not raw.strip():
+        return []
+    try:
+        rules = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(rules, list):
+        return []
+    parsed = []
+    for r in rules:
+        if isinstance(r, dict) and "max_entry" in r and "target" in r:
+            try:
+                parsed.append({
+                    "max_entry": float(r["max_entry"]),
+                    "target": float(r["target"]),
+                })
+            except (ValueError, TypeError):
+                continue
+    return sorted(parsed, key=lambda x: x["max_entry"])
+
+
+def _get_tp_target(avg_buy: float, rules: list[dict[str, float]]) -> float | None:
+    """Match avg_buy price against tiered rules, return target price or None."""
+    for rule in rules:
+        if avg_buy <= rule["max_entry"]:
+            return rule["target"]
+    return None
+
+
+def take_profit_monitor(session: Session) -> int:
+    """Check open positions against per-trader tiered TP rules and sell when target hit.
+
+    Returns count of positions successfully sold.
+    """
+    from datetime import datetime, timezone
+
+    # Find traders with tp_rules configured
+    traders = (
+        session.query(Trader)
+        .filter(Trader.is_active == True)
+        .all()
+    )
+    traders_with_rules = []
+    for t in traders:
+        rules = _parse_tp_rules(getattr(t, "tp_rules", None))
+        if rules:
+            traders_with_rules.append((t, rules))
+
+    if not traders_with_rules:
+        return 0
+
+    # Collect all open BUY trades for these traders
+    trader_ids = [t.id for t, _ in traders_with_rules]
+    open_buys = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.trader_id.in_(trader_ids),
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .all()
+    )
+    if not open_buys:
+        return 0
+
+    # Group by (trader_id, token_id)
+    token_trader_map: dict[tuple[int, str], list[CopyTrade]] = {}
+    for ct in open_buys:
+        if ct.original_token_id:
+            key = (ct.trader_id, ct.original_token_id)
+            token_trader_map.setdefault(key, []).append(ct)
+
+    # Build lookup: trader_id → (Trader, rules)
+    trader_lookup: dict[int, tuple[Trader, list[dict[str, float]]]] = {
+        t.id: (t, rules) for t, rules in traders_with_rules
+    }
+
+    try:
+        client = _get_clob_client()
+    except Exception as exc:
+        logger.error("take_profit: failed to get CLOB client: %s", exc)
+        return 0
+
+    # Batch-fetch prices
+    unique_token_ids = list({tid for (_, tid) in token_trader_map})
+
+    try:
+        from bot.tracker import fetch_prices_by_token_ids
+        gamma_prices = fetch_prices_by_token_ids(unique_token_ids)
+    except Exception as exc:
+        logger.warning("take_profit: Gamma price fetch failed: %s", exc)
+        gamma_prices = {}
+
+    # Funder wallet prices and sizes
+    funder_prices: dict[str, float] = {}
+    funder_sizes: dict[str, float] = {}
+    funder = (settings.POLYMARKET_FUNDER_ADDRESS or "").strip()
+    if funder:
+        try:
+            from bot.tracker import fetch_positions
+            wallet_positions = fetch_positions(funder)
+            for p in wallet_positions:
+                tid = p.get("asset_id", "")
+                if tid:
+                    funder_prices[tid] = p.get("cur_price", 0.0)
+                    funder_sizes[tid] = p.get("size", 0.0)
+        except Exception as exc:
+            logger.warning("take_profit: funder position fetch failed: %s", exc)
+
+    # Complement token map for accurate sell pricing
+    unique_condition_ids = list({
+        ct.original_market for cts in token_trader_map.values()
+        for ct in cts if ct.original_market
+    })
+    complement_map: dict[str, str] = {}
+    try:
+        from bot.tracker import fetch_complement_token_ids
+        complement_map = fetch_complement_token_ids(unique_token_ids, unique_condition_ids)
+    except Exception as exc:
+        logger.warning("take_profit: complement token fetch failed: %s", exc)
+
+    sold = 0
+    for (trader_id, token_id), buys in token_trader_map.items():
+        if trader_id not in trader_lookup:
+            continue
+        trader_obj, rules = trader_lookup[trader_id]
+        is_dry = is_trader_dry_run(trader_obj, session)
+        status_f = ["dry_run"] if is_dry else ["success"]
+
+        net = _get_net_holdings(session, trader_id, token_id, status_filter=status_f)
+        if net <= 0:
+            continue
+
+        avg_buy = _get_avg_buy_price(session, trader_id, token_id, status_filter=status_f)
+        if avg_buy <= 0:
+            continue
+
+        target = _get_tp_target(avg_buy, rules)
+        if target is None:
+            continue
+
+        # Get current market price (same multi-source logic as auto_sell)
+        best_bid = _get_best_price(client, token_id, "SELL")
+        gamma_price = gamma_prices.get(token_id, 0.0)
+        funder_price = funder_prices.get(token_id, 0.0)
+
+        complement_price = 0.0
+        comp_token = complement_map.get(token_id)
+        if comp_token:
+            comp_best_ask = _get_best_price(client, comp_token, "BUY")
+            if comp_best_ask is not None and comp_best_ask > 0:
+                complement_price = round(1.0 - comp_best_ask, 4)
+
+        effective = max(gamma_price, funder_price, complement_price, best_bid or 0.0)
+
+        logger.debug(
+            "take_profit check: trader=%d token=%s avg_buy=%.4f target=%.4f "
+            "effective=%.4f (bid=%s comp=%.4f gamma=%.4f funder=%.4f)",
+            trader_id, token_id[:16], avg_buy, target, effective,
+            f"{best_bid:.4f}" if best_bid is not None else "None",
+            complement_price, gamma_price, funder_price,
+        )
+
+        if effective < target:
+            continue
+
+        # Cooldown check
+        cooldown_key = f"tp:{trader_id}:{token_id}"
+        now_ts = time.monotonic()
+        last = _tp_last_attempt.get(cooldown_key, 0.0)
+        if now_ts - last < _TP_COOLDOWN:
+            continue
+
+        logger.info(
+            "take_profit TRIGGERED: trader=%d token=%s avg_buy=%.4f "
+            "target=%.4f effective=%.4f net=%.4f",
+            trader_id, token_id[:16], avg_buy, target, effective, net,
+        )
+
+        # CLOB enforces price <= 0.999 for SELL orders
+        sell_price = min(round(target, 4), 0.999)
+        tp_note = f"TP rule: avg_buy={avg_buy:.4f} target={target:.2f}"
+        sample_buy = buys[0] if buys else None
+
+        if is_dry:
+            # Dry-run: simulate sell at effective price
+            sim_price = effective
+            pnl = round((sim_price - avg_buy) * net, 4)
+            sell_record = CopyTrade(
+                trader_id=trader_id,
+                original_trade_id=f"tp_sell_sim:{token_id[:24]}",
+                original_market=sample_buy.original_market if sample_buy else "",
+                original_token_id=token_id,
+                market_title=sample_buy.market_title if sample_buy else "",
+                outcome=sample_buy.outcome if sample_buy else "",
+                original_side="SELL",
+                original_size=net,
+                original_price=sim_price,
+                original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+                copy_size=net,
+                copy_price=sim_price,
+                status="dry_run",
+                order_id=None,
+                pnl=pnl,
+                error_message=tp_note,
+                executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            session.add(sell_record)
+            session.commit()
+            _tp_last_attempt[cooldown_key] = now_ts
+            logger.info(
+                "take_profit DRY_RUN: trader=%d token=%s shares=%.4f "
+                "sim_price=%.4f pnl=%.4f",
+                trader_id, token_id[:16], net, sim_price, pnl,
+            )
+            sold += 1
+        else:
+            # Live sell: FOK at target price
+            # Use tracked wallet size (decremented after each successful sell)
+            wallet_size = funder_sizes.get(token_id, 0.0)
+            sell_size = min(net, wallet_size) if wallet_size > 0 else net
+            if sell_size <= 0:
+                continue
+            try:
+                _ensure_sell_approval(client, token_id)
+            except Exception as exc:
+                logger.warning("take_profit: approval failed for token=%s: %s", token_id[:16], exc)
+
+            try:
+                from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
+                from py_clob_client.order_builder.constants import SELL as _SELL  # type: ignore
+
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=sell_price,
+                    size=_snap_sell_size(sell_size),
+                    side=_SELL,
+                )
+                signed_order = client.create_order(order_args)
+                resp = client.post_order(signed_order, OrderType.FOK)
+                order_id = str(resp.get("orderID") or resp.get("order_id") or "")
+
+                filled = False
+                if order_id:
+                    try:
+                        order_info = client.get_order(order_id)
+                        raw_status = ""
+                        if isinstance(order_info, dict):
+                            raw_status = (order_info.get("status") or "").upper()
+                        else:
+                            raw_status = (getattr(order_info, "status", "") or "").upper()
+                        filled = raw_status in ("FILLED", "MATCHED")
+                    except Exception:
+                        filled = False
+
+                if not filled:
+                    _tp_last_attempt[cooldown_key] = now_ts
+                    logger.info(
+                        "take_profit FOK not filled: trader=%d token=%s price=%.4f "
+                        "(will retry next cycle)",
+                        trader_id, token_id[:16], sell_price,
+                    )
+                    continue
+
+                recorded_price = _get_filled_price(
+                    client, order_id, sell_price,
+                    token_id=token_id, side="SELL",
+                )
+                pnl = round((recorded_price - avg_buy) * sell_size, 4)
+
+                sell_record = CopyTrade(
+                    trader_id=trader_id,
+                    original_trade_id=f"tp_sell:{token_id[:24]}",
+                    original_market=sample_buy.original_market if sample_buy else "",
+                    original_token_id=token_id,
+                    market_title=sample_buy.market_title if sample_buy else "",
+                    outcome=sample_buy.outcome if sample_buy else "",
+                    original_side="SELL",
+                    original_size=sell_size,
+                    original_price=sell_price,
+                    original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+                    copy_size=sell_size,
+                    copy_price=recorded_price,
+                    status="success",
+                    order_id=order_id,
+                    pnl=pnl,
+                    executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                session.add(sell_record)
+                session.commit()
+                _tp_last_attempt[cooldown_key] = now_ts
+                # Decrement local wallet size to prevent over-sell on same token
+                funder_sizes[token_id] = max(wallet_size - sell_size, 0.0)
+                logger.info(
+                    "take_profit SUCCESS: trader=%d token=%s shares=%.4f "
+                    "price=%.4f pnl=%.4f order=%s",
+                    trader_id, token_id[:16], sell_size, recorded_price, pnl, order_id,
+                )
+                sold += 1
+            except Exception as exc:
+                _tp_last_attempt[cooldown_key] = now_ts
+                logger.error(
+                    "take_profit FOK error: trader=%d token=%s: %s",
+                    trader_id, token_id[:16], exc,
+                )
 
     return sold
 
@@ -1133,11 +1517,14 @@ def execute_copy_trade(
     # copy_price policy:
     # - dry run: expected_price (simulated fill)
     # - live success: actual filled/average price from order details
-    # - fallback: order_price when actual fill price is unavailable
+    # - fallback: expected_price (market price, NOT slippage-adjusted order_price)
     if dry_run:
         recorded_price = expected_price
     elif status == "success":
-        recorded_price = _get_filled_price(client, order_id or "", order_price)
+        recorded_price = _get_filled_price(
+            client, order_id or "", expected_price,
+            token_id=trade["token_id"], side=trade["side"],
+        )
     else:
         recorded_price = expected_price
 
