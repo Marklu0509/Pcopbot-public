@@ -350,11 +350,19 @@ def _extract_price(entry) -> float:
     return float(getattr(entry, "price", 0))
 
 
+# Cache token_ids whose orderbook returned 404 (market delisted/resolved).
+# Cleared on bot restart. Avoids hammering the API for dead markets.
+_orderbook_404_cache: set[str] = set()
+
+
 def _get_best_price(client, token_id: str, side: str) -> float | None:
     """Query the CLOB orderbook for the current best available price.
 
     Returns the best ask (for BUY) or best bid (for SELL), or None on failure.
+    Caches 404 responses to avoid repeated queries for delisted markets.
     """
+    if token_id in _orderbook_404_cache:
+        return None
     try:
         book = client.get_order_book(token_id)
         if side == "BUY":
@@ -369,7 +377,11 @@ def _get_best_price(client, token_id: str, side: str) -> float | None:
             prices = [_extract_price(e) for e in entries]
             return min(prices) if side == "BUY" else max(prices)
     except Exception as exc:
-        logger.warning("Failed to query orderbook for %s: %s", token_id, exc)
+        if "404" in str(exc) or "No orderbook" in str(exc):
+            _orderbook_404_cache.add(token_id)
+            logger.debug("Orderbook 404 cached for %s (delisted market)", token_id[:16])
+        else:
+            logger.warning("Failed to query orderbook for %s: %s", token_id, exc)
     return None
 
 
