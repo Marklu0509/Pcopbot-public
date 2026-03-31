@@ -40,3 +40,6 @@ htmlcov/
 CLAUDE.md
 .claudecode/
 .everything-claude-code/
+
+# Local-only scripts
+scripts/analyze_trader.py

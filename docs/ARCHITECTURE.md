@@ -1,5 +1,7 @@
 # Architecture & Technical Deep-Dive
 
+<!-- AUTO-GENERATED sections marked inline — Last updated 2026-03-30 -->
+
 This document covers the full system architecture, algorithms, and design decisions in Pcopbot. Intended as a technical reference for interviews and onboarding.
 
 ---
@@ -10,18 +12,20 @@ This document covers the full system architecture, algorithms, and design decisi
 2. [Bot Daemon — Main Event Loop](#2-bot-daemon--main-event-loop)
 3. [Trade Execution Pipeline](#3-trade-execution-pipeline)
 4. [Risk Management Engine](#4-risk-management-engine)
-5. [Trade Tracking & API Integration](#5-trade-tracking--api-integration)
-6. [Auto-Sell Strategy](#6-auto-sell-strategy)
-7. [On-Chain Redemption](#7-on-chain-redemption)
-8. [PnL Calculation](#8-pnl-calculation)
-9. [Watermark & De-duplication](#9-watermark--de-duplication)
-10. [Database Schema](#10-database-schema)
-11. [Dashboard Architecture](#11-dashboard-architecture)
-12. [Infrastructure & Security](#12-infrastructure--security)
-13. [Data Flow Diagram](#13-data-flow-diagram)
-14. [Key Design Decisions](#14-key-design-decisions)
-15. [Edge Cases & Solutions](#15-edge-cases--solutions)
-16. [Performance Characteristics](#16-performance-characteristics)
+5. [Fill Aggregation](#5-fill-aggregation)
+6. [Trade Tracking & API Integration](#6-trade-tracking--api-integration)
+7. [Auto-Sell Strategy](#7-auto-sell-strategy)
+8. [Tiered Take-Profit](#8-tiered-take-profit)
+9. [On-Chain Redemption](#9-on-chain-redemption)
+10. [PnL Calculation](#10-pnl-calculation)
+11. [Watermark & De-duplication](#11-watermark--de-duplication)
+12. [Database Schema](#12-database-schema)
+13. [Dashboard Architecture](#13-dashboard-architecture)
+14. [Infrastructure & Security](#14-infrastructure--security)
+15. [Data Flow Diagram](#15-data-flow-diagram)
+16. [Key Design Decisions](#16-key-design-decisions)
+17. [Edge Cases & Solutions](#17-edge-cases--solutions)
+18. [Performance Characteristics](#18-performance-characteristics)
 
 ---
 
@@ -94,16 +98,28 @@ The bot runs as a persistent daemon with a configurable poll interval (default 1
 
 ### Poll Loop (every N seconds)
 
+<!-- AUTO-GENERATED: derived from bot/main.py run() -->
+
 ```
 Each cycle:
 ├── For each active trader:
 │   ├── Fetch new trades since watermark (Data API)
 │   ├── Skip BUY trades if trader has sell_only=True
 │   ├── For each trade:
+│   │   ├── Fill aggregation (FillBuffer): buffer sub-threshold fills
+│   │   │   ├── "buffered": record fill, wait for more
+│   │   │   ├── "execute": combined value crossed threshold → run copy trade
+│   │   │   └── "immediate": single fill ≥ threshold → run copy trade directly
 │   │   ├── Risk checks (cap_and_check)
 │   │   ├── Execute copy trade (or dry run)
 │   │   └── Advance watermark
-│   └── Auto-sell winning positions (if enabled)
+│   └── Flush expired aggregation buffer slots
+│
+├── Every 5 cycles:
+│   └── Tiered take-profit monitor (take_profit_monitor)
+│
+├── Every cycle:
+│   └── Auto-sell winning positions (if enabled, auto_sell_winning_positions)
 │
 ├── Every 10 cycles:
 │   ├── Backfill fill prices from wallet activity
@@ -131,6 +147,8 @@ Each cycle:
 
 ### Step-by-Step Flow
 
+<!-- AUTO-GENERATED: derived from bot/executor.py execute_copy_trade() -->
+
 ```
 1. Calculate Copy Size
    ├── Fixed mode:  copy_size = fixed_amount / price
@@ -138,32 +156,35 @@ Each cycle:
 
 2. SELL-Specific Logic
    ├── Cap to actual holdings (can't sell more than owned)
-   └── Dust closeout: if remaining < $1 after sell, sell everything
+   └── Dust closeout: if remaining value < $1.50 after sell, sell everything
 
 3. Risk Checks (risk.cap_and_check)
    ├── Hard rejects: price filter, ignore_trades_under
    ├── Soft caps: per_trade, per_market, per_outcome, position_limit
-   ├── Minimum check: reject if capped result too small
+   ├── Minimum check: reject or bump (buy_at_min) if capped result below min_per_trade
    └── Slippage check: reject if price diverged too much
 
 4. Order Placement (live mode)
    ├── Get CLOB client with Level 2 auth
    ├── Query orderbook for best available price
-   ├── Choose order type:
-   │   ├── FOK (Fill-or-Kill): immediate execution or cancel
-   │   └── GTC (Good-Till-Cancelled): limit order with timeout
+   ├── Choose order type and compute order price:
+   │   ├── FOK BUY: MarketOrderArgs(amount=USDC, price=slippage-adjusted)
+   │   │             buy_amount = floor(copy_size * order_price * 100) / 100
+   │   ├── GTC BUY: OrderArgs(size=floor_2dp(copy_size), price=offset-adjusted)
+   │   ├── FOK SELL: OrderArgs(size=floor_2dp(copy_size), price=slippage-adjusted)
+   │   └── GTC SELL: OrderArgs(size=floor_2dp(copy_size), price=offset-adjusted)
    └── Post order to CLOB
 
 5. GTC Timeout Logic
    ├── Poll order status every 1-3 seconds
    ├── If filled → record success
-   ├── If timeout (default 30s) → cancel order
-   └── If limit_fallback_market=True → retry as FOK
+   ├── If timeout (default 30s) → cancel order, re-check for race-window fill
+   └── If buy_limit_fallback / sell_limit_fallback → retry as FOK MarketOrderArgs/OrderArgs
 
 6. Fill Price Recovery
-   ├── Fetch actual fill price from order details
-   ├── Fallback: use order_price if details unavailable
-   └── Periodic backfill from wallet activity (every 10 cycles)
+   ├── Fetch actual fill price from order details (CLOB get_order)
+   ├── Fallback: query funder wallet activity (Data API, 60s window)
+   └── Periodic backfill from wallet activity (every 10 cycles, 120s window)
 
 7. PnL Calculation (SELL trades only)
    └── realized_pnl = (sell_price - avg_buy_price) * copy_size
@@ -171,11 +192,15 @@ Each cycle:
 
 ### Order Types
 
-| Type | Behavior | Use Case |
-|------|----------|----------|
-| FOK (Market) | Fill entire order immediately or cancel | Fast execution, accepts slippage |
-| GTC (Limit) | Sit in orderbook until filled or cancelled | Better price, may not fill |
-| GTC + FOK Fallback | Try limit first, fall back to market | Best of both worlds |
+<!-- AUTO-GENERATED: derived from bot/executor.py -->
+
+| Type | API Class | Behavior | Use Case |
+|------|-----------|----------|----------|
+| FOK BUY | `MarketOrderArgs` | Fill at market price (USDC amount, 2dp), cancel if not filled | Fast execution, accepts slippage |
+| GTC BUY | `OrderArgs` | Sit in orderbook at limit price (shares floored to 2dp) until filled or cancelled | Better price, may not fill |
+| FOK SELL | `OrderArgs` | Fill entire SELL order at price (shares floored to 2dp), cancel if not filled | Fast exit |
+| GTC SELL | `OrderArgs` | Sit in orderbook at limit floor price until filled or cancelled | Better exit price |
+| GTC + FOK Fallback | Per-side fallback toggle | Try limit first, retry as FOK on timeout | Best of both worlds |
 
 ### Fill Price Backfill Problem
 
@@ -192,37 +217,47 @@ FOK orders don't persist in the CLOB — `client.get_order(id)` returns nothing 
 
 **File: `bot/risk.py`**
 
-### Architecture: Cap then Reject
+<!-- AUTO-GENERATED: derived from bot/risk.py cap_and_check() -->
 
-Unlike traditional risk systems that simply accept/reject, this engine **caps** trade sizes down to limits before deciding to reject. This maximizes trade execution while staying within risk bounds.
+### Architecture: Cap then Reject (with Buy-at-Min Bump)
+
+Unlike traditional risk systems that simply accept/reject, this engine **caps** trade sizes down to limits before deciding to reject. This maximizes trade execution while staying within risk bounds. The optional `buy_at_min` mode additionally **bumps** trades that fall below `min_per_trade` up to the minimum (as long as the bump doesn't exceed any cap ceiling).
 
 ```
-Input: copy_size = $50
+Input: copy_size = $50, order_price used for all cap calculations
 
 Step 1 - Hard Rejects (binary pass/fail):
   ├── ignore_trades_under: target trade < $5? → REJECT
-  └── price_filter: price outside [0.05, 0.95]? → REJECT
+  └── price_filter: price outside [min_price, max_price]? → REJECT
 
 Step 2 - Soft Caps (reduce size, don't reject):
-  ├── max_per_trade: $50 > $10 limit → cap to $10
+  ├── max_per_trade: $50 > $10 limit → cap to $10 (cap_ceiling = $10)
   ├── total_spend: already spent $90 of $100 → cap to $10
   ├── max_per_market: already $8 in market, limit $15 → cap to $7
   ├── max_per_yes_no: already $5 on Yes, limit $10 → cap to $5
   └── position_limit: net position $3, limit $8 → cap to $5
 
-Step 3 - Minimum Check:
-  └── capped result $5 < min_per_trade $1? → OK, proceed
+Step 3 - Minimum / Bump Check (BUY only):
+  ├── capped result $5 * price < min_per_trade $1? → OK, proceed
+  ├── buy_at_min=False: reject if below min_per_trade
+  └── buy_at_min=True:
+      ├── min_shares = min_per_trade / price
+      ├── min_shares ≤ cap_ceiling? → BUMP up to min_shares
+      └── min_shares > cap_ceiling? → REJECT (bump would exceed limits)
 
-Step 4 - Hard Floor:
-  └── order value < $1? → REJECT
+Step 4 - Hard Floor $1 USD:
+  ├── order value < $1? → same bump/reject logic as Step 3
+  └── buy_at_min=True: bump to $1 / price (if within cap ceiling)
 
-Step 5 - Slippage Check:
-  └── |best_price - expected_price| / expected_price > 3%? → REJECT
+Step 5 - Slippage Check (all trades):
+  └── |best_price - expected_price| / expected_price > max_slippage%? → REJECT
 
-Output: (capped_copy_size=$5, rejection=None)  → EXECUTE
+Output: (capped_copy_size, rejection_status)
 ```
 
 ### All 9 Checks
+
+<!-- AUTO-GENERATED: derived from bot/risk.py -->
 
 | # | Check | Type | Applies To |
 |---|-------|------|-----------|
@@ -233,12 +268,71 @@ Output: (capped_copy_size=$5, rejection=None)  → EXECUTE
 | 5 | `max_per_market` | Cap | BUY only |
 | 6 | `max_per_yes_no` | Cap | BUY only |
 | 7 | `max_position_limit` | Cap | BUY only |
-| 8 | `min_per_trade` | Reject | After caps |
+| 8 | `min_per_trade` | Reject or Bump (`buy_at_min`) | After caps, BUY only |
 | 9 | `slippage_check` | Reject | All trades |
+
+### `buy_at_min` Flag
+
+When `buy_at_min=True` on a trader and a trade would be rejected as below `min_per_trade`, the engine bumps the size up to `min_per_trade / price` shares — provided that size does not exceed the `cap_ceiling` established by the soft caps. If the bump would violate a limit, the trade is rejected instead. This prevents the common case where proportional sizing produces tiny sub-minimum trades on large tracked positions.
 
 ---
 
-## 5. Trade Tracking & API Integration
+## 5. Fill Aggregation
+
+**File: `bot/fill_buffer.py`**
+
+<!-- AUTO-GENERATED: derived from bot/fill_buffer.py and bot/main.py -->
+
+### Problem
+
+Large limit orders on Polymarket often execute as many small partial fills. Each fill appears as a separate entry in the wallet's activity feed. Without aggregation, every sub-threshold fill would be rejected individually by `ignore_trades_under`, causing the bot to miss the trade entirely.
+
+### Solution: FillBuffer with Sliding Window
+
+```
+For each incoming fill:
+
+  fill_value = size * price
+
+  If fill_value >= ignore_trades_under:
+    → "immediate": execute right away (no buffering)
+
+  Else (sub-threshold fill):
+    → Prune fills older than window_seconds from this slot
+    → Add fill to slot (trader_id, token_id, side)
+    → If total_value >= ignore_trades_under:
+        → "execute": build aggregated trade dict (VWAP, combined size)
+        → Delete slot
+    → Else:
+        → "buffered": record individual fill in DB with status="buffered"
+                       wait for more fills
+
+On buffer expiry (flush_expired):
+  → Slots with no activity for > window_seconds are expired
+  → Buffered DB records updated to status="below_threshold"
+```
+
+### Aggregated Trade Dict
+
+When a slot triggers, `FillBuffer` builds a synthetic trade dict:
+- `size`: sum of all fill sizes
+- `price`: VWAP — `sum(size * price) / total_size`
+- `trade_id`: `agg_<first_trade_id>_<fill_count>`
+- `_agg_fill_count`, `_agg_total_value`: persisted to `CopyTrade.agg_fill_count` / `agg_total_value`
+
+### Configuration
+
+| Column | Default | Description |
+|--------|---------|-------------|
+| `buy_agg_window_seconds` | 30 | Sliding window for BUY fills (0 = disabled) |
+| `sell_agg_window_seconds` | 0 | Sliding window for SELL fills (0 = disabled by default) |
+| `ignore_trades_under` | 0.0 | Aggregation threshold in USD |
+
+Aggregation only activates when both `ignore_trades_under > 0` and `agg_window_seconds > 0`. A window of 0 means every fill is treated as immediate regardless of size.
+
+---
+
+## 6. Trade Tracking & API Integration
 
 **File: `bot/tracker.py`**
 
@@ -282,7 +376,7 @@ Output: (capped_copy_size=$5, rejection=None)  → EXECUTE
 
 ---
 
-## 6. Auto-Sell Strategy
+## 7. Auto-Sell Strategy
 
 **File: `bot/executor.py` — `auto_sell_winning_positions()`**
 
@@ -310,16 +404,16 @@ Final price = max(source1, source2, source3, source4)
 ### Selling Logic
 
 ```
-If max_price >= threshold (0.999):
-  ├── Attempt sell at best_price
-  ├── If rejected, try 0.999
-  ├── If rejected, try 0.99
-  └── If all fail, wait for next cycle
+If effective >= threshold (0.999):
+  ├── sell_price = threshold (or funder_price if >= 0.995)
+  ├── Attempt FOK SELL with OrderArgs at sell_price
+  ├── If price rejected (> 0.999 bounds) → retry at 0.999
+  └── If all fail → wait for next cycle
 
-If max_price >= 0.95 but < threshold:
+If effective >= 0.95 but < threshold:
   └── Apply 30s cooldown before retrying (avoid FOK spam)
 
-If max_price < 0.95:
+If effective < 0.95:
   └── Skip (not close enough to threshold)
 ```
 
@@ -329,10 +423,60 @@ Uses the **wallet's actual holdings** (not just DB records) as source of truth:
 - Includes pre-existing positions (before bot started)
 - Includes bot-copied positions
 - Prevents selling more than actually held
+- For dry-run traders: falls back to DB-recorded net holdings
 
 ---
 
-## 7. On-Chain Redemption
+## 8. Tiered Take-Profit
+
+**File: `bot/executor.py` — `take_profit_monitor()`**
+
+<!-- AUTO-GENERATED: derived from bot/executor.py take_profit_monitor() and _parse_tp_rules() -->
+
+### Overview
+
+Tiered take-profit allows different exit targets based on the average entry price. For example: trades entered below $0.30 should exit at $0.80, while trades entered above $0.30 should exit at $0.90.
+
+### Configuration
+
+`tp_rules` on the `Trader` model stores a JSON array:
+
+```json
+[
+  {"max_entry": 0.30, "target": 0.80},
+  {"max_entry": 1.00, "target": 0.90}
+]
+```
+
+Rules are sorted by `max_entry` ascending. The first rule where `avg_buy_price <= max_entry` matches.
+
+### Algorithm
+
+```
+Every 5 poll cycles:
+
+For each trader with tp_rules configured:
+  For each (trader_id, token_id) with open BUY positions:
+    1. Compute avg_buy_price (weighted average across BUY trades)
+    2. Match against tp_rules → target price (or skip if no match)
+    3. Fetch current effective price (same 4-source logic as auto_sell)
+    4. If effective >= target:
+       ├── Apply 30s cooldown per (trader, token)
+       ├── Live: FOK SELL with OrderArgs at min(target, 0.999)
+       │         Record SELL trade and realized PnL
+       └── Dry run: simulate SELL at effective price
+```
+
+### Relationship to Auto-Sell
+
+Both systems run independently per poll cycle:
+- **Auto-sell** (`auto_sell_winning_positions`) checks every cycle against the global `AUTO_SELL_THRESHOLD`
+- **Tiered TP** (`take_profit_monitor`) checks every 5 cycles against per-trader, per-entry-price targets
+- A position can be sold by either; whichever fires first wins
+
+---
+
+## 9. On-Chain Redemption
 
 **File: `bot/redeemer.py`**
 
@@ -401,7 +545,7 @@ Each creates a synthetic SELL record in the database with appropriate PnL.
 
 ---
 
-## 8. PnL Calculation
+## 10. PnL Calculation
 
 ### Split Model: Realized vs Unrealized
 
@@ -444,7 +588,7 @@ Win rate = count(pnl > 0) / count(decisive trades) * 100
 
 ---
 
-## 9. Watermark & De-duplication
+## 11. Watermark & De-duplication
 
 **File: `bot/watermark.py`**
 
@@ -478,46 +622,63 @@ Invariant:
 
 ---
 
-## 10. Database Schema
+## 12. Database Schema
 
 **File: `db/models.py`**
 
 ### Tables
 
+<!-- AUTO-GENERATED: derived from db/models.py -->
+
 **`traders`** — tracked wallet configuration
 ```
-id              INTEGER PRIMARY KEY
-wallet_address  VARCHAR UNIQUE        -- 0x-prefixed Polygon address
-label           VARCHAR               -- display name
-is_active       BOOLEAN               -- enable/disable without deleting
-sell_only       BOOLEAN               -- skip BUY trades
-sizing_mode     VARCHAR               -- "fixed" or "proportional"
-fixed_amount    FLOAT                 -- USD per trade (fixed mode)
-proportional_pct FLOAT                -- % of original (proportional mode)
-buy_order_type  VARCHAR               -- "market" (FOK) or "limit" (GTC)
-sell_order_type VARCHAR               -- "market" or "limit"
-buy_slippage    FLOAT                 -- max slippage %
-sell_slippage   FLOAT                 -- max slippage %
-limit_timeout_seconds INTEGER         -- GTC timeout before cancel
-limit_fallback_market BOOLEAN         -- fallback to FOK on GTC timeout
-ignore_trades_under   FLOAT           -- skip target trades below this
-min_price       FLOAT                 -- price filter lower bound
-max_price       FLOAT                 -- price filter upper bound
-min_per_trade   FLOAT                 -- minimum per trade after caps
-max_per_trade   FLOAT                 -- maximum per trade (cap target)
-total_spend_limit     FLOAT           -- cumulative spend cap
-max_per_market  FLOAT                 -- per-market exposure cap
-max_per_yes_no  FLOAT                 -- per-outcome cap
-watermark_timestamp   DATETIME        -- last processed trade time
-created_at      DATETIME
-updated_at      DATETIME
+id                      INTEGER PRIMARY KEY
+wallet_address          VARCHAR UNIQUE        -- 0x-prefixed Polygon address
+label                   VARCHAR               -- display name
+is_active               BOOLEAN               -- enable/disable without deleting
+sell_only               BOOLEAN               -- skip BUY trades
+dry_run                 BOOLEAN               -- per-trader dry run mode
+sizing_mode             VARCHAR               -- "fixed" or "proportional"
+fixed_amount            FLOAT                 -- USD per trade (fixed mode)
+proportional_pct        FLOAT                 -- % of original (proportional mode)
+buy_order_type          VARCHAR               -- "market" (FOK) or "limit" (GTC)
+sell_order_type         VARCHAR               -- "market" or "limit"
+buy_slippage            FLOAT                 -- max slippage % for FOK BUY
+sell_slippage           FLOAT                 -- max slippage % for FOK SELL
+buy_price_offset_pct    FLOAT                 -- GTC BUY limit ceiling offset %
+sell_price_offset_pct   FLOAT                 -- GTC SELL limit floor offset %
+limit_timeout_seconds   INTEGER               -- GTC timeout before cancel
+limit_fallback_market   BOOLEAN               -- legacy shared fallback toggle
+buy_limit_fallback      BOOLEAN               -- per-side: retry BUY as FOK on timeout
+sell_limit_fallback     BOOLEAN               -- per-side: retry SELL as FOK on timeout
+buy_agg_window_seconds  INTEGER               -- BUY fill aggregation window (0=disabled)
+sell_agg_window_seconds INTEGER               -- SELL fill aggregation window (0=disabled)
+tp_pct                  FLOAT                 -- simple take-profit % (fallback)
+sl_pct                  FLOAT                 -- stop-loss % (0=disabled)
+tp_rules                VARCHAR               -- JSON tiered TP rules array
+buy_at_min              BOOLEAN               -- bump sub-minimum trades up to min_per_trade
+ignore_trades_under     FLOAT                 -- skip/aggregate fills below this USD
+min_price               FLOAT                 -- price filter lower bound
+max_price               FLOAT                 -- price filter upper bound
+min_per_trade           FLOAT                 -- minimum per trade after caps
+max_per_trade           FLOAT                 -- maximum per trade (cap target)
+total_spend_limit       FLOAT                 -- cumulative spend cap
+max_per_market          FLOAT                 -- per-market exposure cap
+max_per_yes_no          FLOAT                 -- per-outcome cap
+max_position_limit      FLOAT                 -- max net position per token
+max_holder_market_number INTEGER              -- max markets with open positions (0=unlimited)
+max_slippage            FLOAT                 -- legacy alias for slippage checks
+min_trade_threshold     FLOAT                 -- legacy alias for min_per_trade
+watermark_timestamp     DATETIME              -- last processed trade time
+created_at              DATETIME
+updated_at              DATETIME
 ```
 
 **`copy_trades`** — every trade attempt (success, fail, dry run)
 ```
 id                INTEGER PRIMARY KEY
 trader_id         INTEGER FK(traders.id)
-original_trade_id VARCHAR             -- source trade identifier
+original_trade_id VARCHAR             -- source trade identifier (or synthetic key for agg/auto-sell)
 original_market   VARCHAR             -- condition_id
 original_token_id VARCHAR             -- asset_id (76+ digit number)
 market_title      VARCHAR             -- human-readable market name
@@ -526,11 +687,15 @@ original_side     VARCHAR             -- "BUY" or "SELL"
 original_size     FLOAT               -- target wallet's share count
 original_price    FLOAT               -- target wallet's fill price
 original_timestamp DATETIME           -- when target traded
-copy_size         FLOAT               -- our share count (may be capped)
-copy_price        FLOAT               -- our actual fill price
-status            VARCHAR             -- success|failed|dry_run|slippage_exceeded|below_threshold|position_limit
-error_message     VARCHAR             -- reason for non-success
+copy_size         FLOAT               -- our share count (may be capped or bumped)
+copy_price        FLOAT               -- our actual fill price (backfilled from activity)
+status            VARCHAR             -- success|failed|dry_run|slippage_exceeded|
+                                      -- below_threshold|position_limit|buffered|
+                                      -- skipped_sell_only|below_minimum_order
+error_message     VARCHAR             -- reason for non-success or aggregation annotation
 order_id          VARCHAR             -- CLOB order ID or synthetic key
+agg_fill_count    INTEGER             -- number of fills aggregated (non-null for agg trades)
+agg_total_value   FLOAT               -- total USD value of aggregated fills
 pnl               FLOAT               -- unrealized (BUY) or realized (SELL)
 executed_at       DATETIME            -- when we executed
 ```
@@ -555,7 +720,7 @@ key (PK), value, updated_at
 
 ---
 
-## 11. Dashboard Architecture
+## 13. Dashboard Architecture
 
 **File: `dashboard/app.py`**
 
@@ -579,7 +744,7 @@ key (PK), value, updated_at
 
 ---
 
-## 12. Infrastructure & Security
+## 14. Infrastructure & Security
 
 ### Docker Compose Services
 
@@ -620,7 +785,7 @@ The dashboard container never sees private keys or API secrets.
 
 ---
 
-## 13. Data Flow Diagram
+## 15. Data Flow Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -685,7 +850,7 @@ The dashboard container never sees private keys or API secrets.
 
 ---
 
-## 14. Key Design Decisions
+## 16. Key Design Decisions
 
 ### Why Watermark Instead of Trade ID Dedup?
 
@@ -694,6 +859,18 @@ Trade IDs from the Data API are not guaranteed to be stable across API versions.
 ### Why Cap Instead of Reject for Risk Checks?
 
 Rejecting a $50 trade because the limit is $10 wastes the trading signal. By capping to $10, the bot still participates in the trade at a safe size. Only hard constraints (price filters, slippage) should reject outright.
+
+### Why `buy_at_min` Bumps Instead of Just Rejects?
+
+Proportional sizing on a small tracked trade often produces sub-minimum amounts (e.g. 5% of a $20 trade = $1). A pure reject wastes the signal. `buy_at_min` bumps the size to the configured minimum — provided the bump doesn't violate any cap ceiling — so the bot always places the smallest allowed meaningful order.
+
+### Why `MarketOrderArgs` for FOK BUY Instead of `OrderArgs`?
+
+The Polymarket CLOB enforces different precision requirements per order type. For FOK (taker) BUY orders, `OrderArgs` requires the taker amount (shares) ≤ 4dp but the maker amount (USDC) must also be representable. `MarketOrderArgs` accepts USDC directly and handles precision internally, avoiding rounding errors that cause order rejection.
+
+### Why a Sliding Window Instead of Fixed Window for Fill Aggregation?
+
+A fixed window (e.g. "aggregate fills within the same minute") causes fills at minute boundaries to fall into different windows, splitting orders that belong together. A sliding window relative to the current fill time ensures all fills within `window_seconds` of each other are always grouped, regardless of when they arrive.
 
 ### Why 4 Price Sources for Auto-Sell?
 
@@ -728,23 +905,30 @@ Using the maximum across all four ensures the most accurate price discovery.
 
 ---
 
-## 15. Edge Cases & Solutions
+## 17. Edge Cases & Solutions
+
+<!-- AUTO-GENERATED: derived from bot/ source analysis -->
 
 | Edge Case | Problem | Solution |
 |-----------|---------|----------|
 | Resolved market (Gamma 422) | `_get_market_info()` returns None, skips redemption | Fallback to `fetch_prices_by_token_ids()`; if price >= 0.99, treat as resolved |
-| FOK order not in CLOB history | `client.get_order()` returns None | Backfill from wallet activity by token_id + timestamp matching |
+| FOK order not in CLOB history | `client.get_order()` returns None after execution | Backfill from wallet activity by token_id + timestamp (120s window, 20% size tolerance) |
 | Losing tokens remain in wallet | Token has size > 0 but price = 0 | `detect_expired_losses` checks `wallet_price < 0.02` |
-| Dust positions | Remaining value < $1 after partial sell | "Dust closeout" — sell entire remaining position |
+| Dust positions | Remaining value < $1.50 after partial sell | "Dust closeout" — sell entire remaining position |
 | Rounding residuals | Net holdings = 0.005 after full sell | Filter `net < 0.1` to skip rounding noise |
 | Bot restart during trade | Trade fetched but not yet executed | Watermark not advanced until after execution; trade retried on restart |
 | Manual redemption via UI | Bot doesn't know about the redemption | `detect_manual_redemptions` scans wallet activity for REDEEM entries |
-| GTC order never fills | Limit price too aggressive | Timeout + FOK fallback (configurable per trader) |
+| GTC order never fills | Limit price too aggressive | Timeout + per-side FOK fallback (`buy_limit_fallback` / `sell_limit_fallback`) |
+| GTC fill in cancel race window | Order fills between last poll and cancel call | Re-check order status after cancel attempt before marking failed |
 | Multiple traders same market | Risk limits should be per-trader, not global | All risk checks filter by `trader_id` |
+| Fragmented fills below threshold | Each sub-threshold fill rejected individually | `FillBuffer` accumulates fills in sliding window; executes when combined value ≥ threshold |
+| Proportional trade too small for `min_per_trade` | Small % of small trade falls below minimum | `buy_at_min=True` bumps trade up to minimum if within cap ceiling |
+| BUY precision on FOK orders | `py-clob-client` requires USDC maker amount ≤ 2dp | `MarketOrderArgs(amount=floor(copy_size * price * 100)/100)` |
+| GTC limit order precision | CLOB requires taker (shares) ≤ 2dp for limit orders | `_snap_size_2dp()` floors shares to 2dp before `OrderArgs` |
 
 ---
 
-## 16. Performance Characteristics
+## 18. Performance Characteristics
 
 ### Latency
 
