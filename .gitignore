@@ -43,3 +43,6 @@ CLAUDE.md
 
 # Local-only scripts
 scripts/analyze_trader.py
+
+# Exported logs
+logs/
