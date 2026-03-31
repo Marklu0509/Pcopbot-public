@@ -399,6 +399,34 @@ def _enrich_holdings_with_prices(holdings_df: pd.DataFrame) -> pd.DataFrame:
     return enriched
 
 
+def _refresh_trader_positions(trader_id: int, wallet_address: str) -> None:
+    """Fetch latest positions from Polymarket API and update DB."""
+    from bot.tracker import fetch_positions
+    try:
+        positions = fetch_positions(wallet_address)
+    except Exception as exc:
+        _logger.error("Failed to refresh positions for trader %d: %s", trader_id, exc)
+        return
+    with _SessionLocal() as session:
+        session.query(Position).filter(Position.trader_id == trader_id).delete()
+        for p in positions:
+            session.add(Position(
+                trader_id=trader_id,
+                condition_id=p["condition_id"],
+                asset_id=p["asset_id"],
+                market_title=p["market_title"],
+                outcome=p["outcome"],
+                size=p["size"],
+                avg_price=p["avg_price"],
+                initial_value=p["initial_value"],
+                current_value=p["current_value"],
+                pnl=p["pnl"],
+                pnl_pct=p["pnl_pct"],
+                cur_price=p["cur_price"],
+            ))
+        session.commit()
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _load_trader_positions(trader_id: int) -> pd.DataFrame:
     """Load pre-existing positions (fetched on startup) for a trader."""
@@ -794,6 +822,10 @@ def _render_trader_detail(t) -> None:
 
     # ── Pre-existing Positions (target trader's own holdings) ──
     st.subheader("📌 Trader's Current Positions")
+    if st.button("Refresh Positions", key=f"refresh_pos_{t.id}"):
+        _refresh_trader_positions(t.id, t.wallet_address)
+        _load_trader_positions.clear()
+        st.rerun()
     pos_df = _load_trader_positions(t.id)
     if pos_df.empty:
         st.info("No pre-existing positions found.")
