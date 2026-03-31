@@ -43,6 +43,9 @@ def is_trader_dry_run(trader: Trader, session: Session) -> bool:
 # If a SELL would leave less than this USD value, close out the full position.
 SELL_DUST_CLOSEOUT_USD = 1.5
 
+# Residual positions below this share count are auto-cleared from DB.
+DUST_CLEAR_THRESHOLD_SHARES = 0.1
+
 # Polymarket contract addresses on Polygon (chain_id=137).
 _CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # ConditionalTokens (ERC-1155)
 _EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  # Regular
@@ -895,6 +898,77 @@ def auto_sell_winning_positions(session: Session, threshold: float | None = None
             sold += 1
 
     return sold
+
+
+# ── Dust Position Cleanup ─────────────────────────────────────────────
+
+def clear_dust_positions(session: Session) -> int:
+    """Write synthetic SELL records to zero out residual positions < threshold.
+
+    These tiny leftovers (e.g. 0.006 shares) are caused by 2dp precision
+    flooring on SELL orders. Writing a dust_cleared SELL zeroes net holdings
+    so the position no longer appears in the dashboard.
+
+    Returns count of positions cleared.
+    """
+    open_buys = (
+        session.query(CopyTrade)
+        .filter(
+            CopyTrade.original_side == "BUY",
+            CopyTrade.status.in_(["success", "dry_run"]),
+        )
+        .all()
+    )
+    if not open_buys:
+        return 0
+
+    # Group by (trader_id, token_id, status)
+    groups: dict[tuple[int, str, str], list[CopyTrade]] = {}
+    for ct in open_buys:
+        if ct.original_token_id:
+            key = (ct.trader_id, ct.original_token_id, ct.status)
+            groups.setdefault(key, []).append(ct)
+
+    cleared = 0
+    for (trader_id, token_id, status), buys in groups.items():
+        status_f = [status]
+        net = _get_net_holdings(session, trader_id, token_id, status_filter=status_f)
+
+        if net <= 0 or net >= DUST_CLEAR_THRESHOLD_SHARES:
+            continue
+
+        avg_buy = _get_avg_buy_price(session, trader_id, token_id, status_filter=status_f)
+        sample = buys[0]
+
+        sell_record = CopyTrade(
+            trader_id=trader_id,
+            original_trade_id=f"dust_clear:{token_id[:24]}",
+            original_market=sample.original_market or "",
+            original_token_id=token_id,
+            market_title=sample.market_title or "",
+            outcome=sample.outcome or "",
+            original_side="SELL",
+            original_size=net,
+            original_price=avg_buy,
+            original_timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+            copy_size=net,
+            copy_price=avg_buy,
+            status=status,
+            order_id=None,
+            pnl=0.0,
+            error_message=f"Dust cleared: {net:.4f} shares < {DUST_CLEAR_THRESHOLD_SHARES}",
+            executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        session.add(sell_record)
+        logger.info(
+            "dust_clear: trader=%d token=%s cleared %.4f shares (%s)",
+            trader_id, token_id[:16], net, status,
+        )
+        cleared += 1
+
+    if cleared:
+        session.commit()
+    return cleared
 
 
 # ── Tiered Take-Profit ────────────────────────────────────────────────

@@ -627,6 +627,15 @@ def run() -> None:
                 except Exception as exc:
                     logger.error("Error detecting expired losses: %s", exc)
 
+                # Clear tiny residual positions (< 0.1 shares) from DB
+                try:
+                    from bot.executor import clear_dust_positions
+                    dust = clear_dust_positions(session)
+                    if dust:
+                        logger.info("Cleared %d dust position(s).", dust)
+                except Exception as exc:
+                    logger.error("Error clearing dust positions: %s", exc)
+
         logger.debug("Sleeping %s seconds…", poll_interval)
         time.sleep(poll_interval)
 
