@@ -1264,6 +1264,7 @@ def take_profit_monitor(session: Session) -> int:
                     status="success",
                     order_id=order_id,
                     pnl=pnl,
+                    error_message=tp_note,
                     executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
                 session.add(sell_record)
