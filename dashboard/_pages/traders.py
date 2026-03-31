@@ -338,6 +338,7 @@ def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = Non
         )
         token_id = buy_rows["TokenId"].iloc[0] if not buy_rows.empty else ""
         cost_basis = avg_price * net_size
+        first_buy = buy_rows["ExecutedAt"].dropna().min()
         last_trade = group["ExecutedAt"].dropna().max()
         holdings.append({
             "Market": market,
@@ -349,6 +350,7 @@ def _load_trader_holdings(trader_id: int, statuses: tuple[str, ...] | None = Non
             "Value": 0.0,
             "Unrealized": 0.0,
             "Change %": 0.0,
+            "First Buy": first_buy,
             "Last Trade": last_trade,
             "Trades": len(group),
             "_token_id": token_id,  # internal, hidden in display
@@ -856,6 +858,7 @@ def _render_trader_detail(t) -> None:
         "Value": st.column_config.NumberColumn(format="$%.2f"),
         "Unrealized": st.column_config.NumberColumn(format="$%.2f"),
         "Change %": st.column_config.NumberColumn(format="%.1f%%"),
+        "First Buy": st.column_config.DatetimeColumn(format="MM/DD HH:mm"),
         "Last Trade": st.column_config.DatetimeColumn(format="MM/DD HH:mm"),
     }
     _hidden_cols = ["_token_id", "_condition_id"]
